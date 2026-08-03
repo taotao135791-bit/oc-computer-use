@@ -1,0 +1,22 @@
+[package]
+name = "cu-driver-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cu-core = { path = "../cu-core" }
+cu-driver = { path = "../cu-driver" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+image = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+
+[build-dependencies]

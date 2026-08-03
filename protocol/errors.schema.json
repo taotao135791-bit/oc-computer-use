@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://computer-use.local/protocol/errors.schema.json",
+  "title": "Computer Use Runtime Error Protocol",
+  "description": "Structured error payloads returned by the Computer Use daemon. The JSON-RPC 'error.code' field carries the application code, and 'error.data' carries the structured detail below.",
+  "definitions": {
+    "error_data": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "PARSE_ERROR",
+            "INVALID_REQUEST",
+            "INVALID_PARAMS",
+            "METHOD_NOT_FOUND",
+            "INTERNAL",
+            "NOT_READY",
+            "PERMISSION",
+            "STALE_FRAME",
+            "CONTROL_LOCKED",
+            "PAUSED",
+            "USER_TAKEOVER",
+            "OUT_OF_BOUNDS",
+            "UNKNOWN_FRAME",
+            "SESSION_NOT_FOUND",
+            "INVALID_SESSION_STATE",
+            "CONFIRMATION_REQUIRED",
+            "CANCELLED",
+            "TRACE_ERROR",
+            "DRIVER_ERROR",
+            "UNSUPPORTED"
+          ]
+        },
+        "message": { "type": "string" },
+        "referenced_frame_id": { "type": "string" },
+        "current_frame_id": { "type": "string" },
+        "change_score": { "type": "number" },
+        "permission": {
+          "type": "object",
+          "properties": {
+            "kind": { "type": "string", "enum": ["screen_recording", "accessibility"] },
+            "granted": { "type": "boolean" },
+            "guidance": { "type": "string" }
+          },
+          "required": ["kind", "granted", "guidance"]
+        },
+        "confirmation": {
+          "type": "object",
+          "properties": {
+            "reason": { "type": "string" },
+            "risk_level": { "type": "string", "enum": ["low", "medium", "high"] },
+            "requires_confirmation": { "type": "boolean" },
+            "policy_context": { "type": ["string", "null"] }
+          }
+        }
+      }
+    }
+  }
+}

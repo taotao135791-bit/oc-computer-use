@@ -1,0 +1,17 @@
+[package]
+name = "cu-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cu-core = { path = "../cu-core" }
+cu-runtime = { path = "../cu-runtime" }
+cu-trace = { path = "../cu-trace" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }

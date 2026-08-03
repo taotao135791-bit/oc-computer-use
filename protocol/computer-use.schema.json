@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://computer-use.local/protocol/computer-use.schema.json",
+  "title": "Computer Use Runtime Protocol",
+  "description": "The JSON-RPC 2.0 method and payload schema exposed by the Computer Use daemon over its local Unix domain socket.",
+  "definitions": {
+    "coordinate_space": {
+      "type": "string",
+      "enum": ["normalized_1000", "image_pixels"]
+    },
+    "point": {
+      "type": "object",
+      "required": ["x", "y"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" }
+      }
+    },
+    "mouse_button": {
+      "type": "string",
+      "enum": ["left", "right", "middle"]
+    },
+    "text_input_method": {
+      "type": "string",
+      "enum": ["keyboard", "clipboard"]
+    },
+    "computer_action": {
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        {
+          "properties": {
+            "type": { "const": "click" },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "button": { "$ref": "#/definitions/mouse_button" },
+            "coordinate_space": { "$ref": "#/definitions/coordinate_space" }
+          },
+          "required": ["type", "x", "y", "button", "coordinate_space"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "type": { "const": "double_click" },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "button": { "$ref": "#/definitions/mouse_button" },
+            "coordinate_space": { "$ref": "#/definitions/coordinate_space" }
+          },
+          "required": ["type", "x", "y", "button", "coordinate_space"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "type": { "const": "move" },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "coordinate_space": { "$ref": "#/definitions/coordinate_space" },
+            "duration_ms": { "type": ["number", "null"] }
+          },
+          "required": ["type", "x", "y", "coordinate_space"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "type": { "const": "type" },
+            "text": { "type": "string", "minLength": 0, "maxLength": 4096 },
+            "method": { "$ref": "#/definitions/text_input_method" }
+          },
+          "required": ["type", "text", "method"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "type": { "const": "key" },
+            "keys": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1,
+              "maxItems": 8
+            }
+          },
+          "required": ["type", "keys"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "type": { "const": "scroll" },
+            "x": { "type": ["number", "null"] },
+            "y": { "type": ["number", "null"] },
+            "delta_x": { "type": "number" },
+            "delta_y": { "type": "number" },
+            "coordinate_space": { "$ref": "#/definitions/coordinate_space" }
+          },
+          "required": ["type", "delta_x", "delta_y", "coordinate_space"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "type": { "const": "drag" },
+            "from": { "$ref": "#/definitions/point" },
+            "to": { "$ref": "#/definitions/point" },
+            "coordinate_space": { "$ref": "#/definitions/coordinate_space" },
+            "duration_ms": { "type": ["number", "null"] }
+          },
+          "required": ["type", "from", "to", "coordinate_space"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "type": { "const": "wait" },
+            "duration_ms": { "type": "integer", "minimum": 0, "maximum": 600000 }
+          },
+          "required": ["type", "duration_ms"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
+  "properties": {
+    "computer.observe": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "session_id": { "type": ["string", "null"] },
+          "target": { "type": "string", "enum": ["full_screen", "active_window"] },
+          "display_id": { "type": ["string", "null"] },
+          "include_cursor": { "type": "boolean" },
+          "max_width": { "type": "integer", "minimum": 32, "maximum": 8192 },
+          "image_format": { "type": "string", "enum": ["png", "jpeg"] },
+          "jpeg_quality": { "type": "integer", "minimum": 1, "maximum": 100 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "computer.act": {
+      "params": {
+        "type": "object",
+        "required": ["session_id", "frame_id", "actions"],
+        "properties": {
+          "session_id": { "type": "string" },
+          "frame_id": { "type": "string" },
+          "actions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "items": { "$ref": "#/definitions/computer_action" }
+          },
+          "wait_policy": { "type": "string", "enum": ["none", "fixed", "until_stable"] },
+          "fixed_wait_ms": { "type": ["integer", "null"], "minimum": 0 },
+          "return_screenshot": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "computer.inspect": {
+      "params": {
+        "type": "object",
+        "required": ["session_id", "frame_id", "region"],
+        "properties": {
+          "session_id": { "type": "string" },
+          "frame_id": { "type": "string" },
+          "region": {
+            "type": "object",
+            "required": ["x", "y", "width", "height", "coordinate_space"],
+            "properties": {
+              "x": { "type": "number" },
+              "y": { "type": "number" },
+              "width": { "type": "number", "minimum": 1 },
+              "height": { "type": "number", "minimum": 1 },
+              "coordinate_space": { "$ref": "#/definitions/coordinate_space" }
+            },
+            "additionalProperties": false
+          },
+          "scale": { "type": "integer", "minimum": 1, "maximum": 8 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "computer.session": {
+      "params": {
+        "type": "object",
+        "required": ["action"],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["start", "status", "pause", "resume", "stop", "takeover", "release"]
+          },
+          "session_id": { "type": ["string", "null"] },
+          "display_id": { "type": ["string", "null"] }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

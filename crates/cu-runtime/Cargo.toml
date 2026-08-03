@@ -1,0 +1,21 @@
+[package]
+name = "cu-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cu-core = { path = "../cu-core" }
+cu-driver = { path = "../cu-driver" }
+cu-policy = { path = "../cu-policy" }
+cu-trace = { path = "../cu-trace" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+image = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }

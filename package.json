@@ -1,0 +1,19 @@
+{
+  "name": "computer-use",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Model-agnostic, vision-first Computer Use runtime for macOS",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
