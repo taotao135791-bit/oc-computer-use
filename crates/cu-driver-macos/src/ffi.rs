@@ -51,7 +51,8 @@ extern "C" {
         point: CGPoint,
         button: i32,
     ) -> *mut c_void;
-    fn CGEventCreateKeyboardEvent(source: *mut c_void, keycode: u16, key_down: bool) -> *mut c_void;
+    fn CGEventCreateKeyboardEvent(source: *mut c_void, keycode: u16, key_down: bool)
+        -> *mut c_void;
     fn CGEventCreateScrollWheelEvent(
         source: *mut c_void,
         unit: u32,
@@ -158,15 +159,30 @@ unsafe impl Sync for CgSource {}
 
 pub fn shared_source() -> *mut c_void {
     static SOURCE: OnceLock<CgSource> = OnceLock::new();
-    SOURCE.get_or_init(|| CgSource(unsafe { CGEventSourceCreate(SOURCE_STATE_HID_SYSTEM) })).0
+    SOURCE
+        .get_or_init(|| CgSource(unsafe { CGEventSourceCreate(SOURCE_STATE_HID_SYSTEM) }))
+        .0
 }
 
 pub fn create_mouse_event(mouse_type: u32, point: CGPoint, button: i32) -> CgEvent {
-    unsafe { CgEvent(CGEventCreateMouseEvent(shared_source(), mouse_type, point, button)) }
+    unsafe {
+        CgEvent(CGEventCreateMouseEvent(
+            shared_source(),
+            mouse_type,
+            point,
+            button,
+        ))
+    }
 }
 
 pub fn create_keyboard_event(keycode: u16, key_down: bool) -> CgEvent {
-    unsafe { CgEvent(CGEventCreateKeyboardEvent(shared_source(), keycode, key_down)) }
+    unsafe {
+        CgEvent(CGEventCreateKeyboardEvent(
+            shared_source(),
+            keycode,
+            key_down,
+        ))
+    }
 }
 
 pub fn create_scroll_event(wheel1: i32, wheel2: i32, continuous: bool) -> CgEvent {

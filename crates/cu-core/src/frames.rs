@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::coordinates::DisplayBounds;
+
 /// A captured screen frame plus the metadata that makes it addressable.
 ///
 /// Raw image bytes have an explicit lifetime: the runtime keeps them in memory
@@ -23,6 +25,9 @@ pub struct ScreenFrame {
     pub width: u32,
     pub height: u32,
     pub display_id: String,
+    /// Logical bounds of the display in global desktop coordinates. Kept on the
+    /// frame so `act` can resolve model coordinates without another driver call.
+    pub bounds: DisplayBounds,
     pub scale_factor: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_application: Option<String>,
@@ -105,7 +110,10 @@ pub struct ThumbnailRequest {
 
 impl Default for ThumbnailRequest {
     fn default() -> Self {
-        Self { width: 64, height: 64 }
+        Self {
+            width: 64,
+            height: 64,
+        }
     }
 }
 

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>computer-use inspector</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font: 13px/1.5 -apple-system, "SF Mono", Menlo, monospace;
+      background: #101216; color: #d8dee9;
+      margin: 0; padding: 16px;
+    }
+    header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    h1 { font-size: 16px; margin: 0; color: #88c0d0; }
+    .muted { color: #6b7280; }
+    .status { font-weight: 600; padding: 1px 8px; border-radius: 10px; }
+    .status.ok { background: #1f3d2b; color: #7bd88f; }
+    .status.bad { background: #3d1f1f; color: #e88787; }
+    section { margin-top: 18px; }
+    h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #8a93a3; margin: 0 0 8px; }
+    pre { background: #171a21; border: 1px solid #262c38; border-radius: 6px; padding: 10px; overflow: auto; margin: 0; }
+    img#frame { max-width: 100%; border: 1px solid #262c38; border-radius: 6px; background: #000; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .card { flex: 1; min-width: 280px; }
+    #logs { height: 220px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: 4px 10px; border-bottom: 1px solid #262c38; white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>computer-use</h1>
+    <span class="status" id="ready">…</span>
+    <span class="muted" id="version">…</span>
+    <span class="muted" id="uptime"></span>
+  </header>
+
+  <div class="row">
+    <section class="card">
+      <h2>Session</h2>
+      <pre id="session">loading…</pre>
+    </section>
+    <section class="card">
+      <h2>Pointer</h2>
+      <pre id="pointer">…</pre>
+    </section>
+  </div>
+
+  <section>
+    <h2>Live frame <span class="muted" id="frame-meta"></span></h2>
+    <img id="frame" alt="latest capture" />
+  </section>
+
+  <div class="row">
+    <section class="card">
+      <h2>Traces</h2>
+      <table id="traces"><tbody></tbody></table>
+    </section>
+    <section class="card">
+      <h2>Event log <span class="muted">(from the daemon via SDK)</span></h2>
+      <pre id="logs">…</pre>
+    </section>
+  </div>
+
+  <script type="module" src="/app.mjs"></script>
+</body>
+</html>

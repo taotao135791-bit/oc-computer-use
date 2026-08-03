@@ -77,7 +77,10 @@ impl From<QuickSnapshot> for cu_core::ScreenSnapshot {
             thumb_width: q.thumb_width,
             thumb_height: q.thumb_height,
             active_application: q.active_application.as_ref().map(|a| a.name.clone()),
-            active_window_title: q.active_application.as_ref().and_then(|a| a.window_title.clone()),
+            active_window_title: q
+                .active_application
+                .as_ref()
+                .and_then(|a| a.window_title.clone()),
             display_id: q.display_id,
             captured_at: q.captured_at,
         }
@@ -154,9 +157,15 @@ mod tests {
 
     #[test]
     fn permission_status_all_granted() {
-        let p = PermissionStatus { screen_recording: true, accessibility: true };
+        let p = PermissionStatus {
+            screen_recording: true,
+            accessibility: true,
+        };
         assert!(p.all_granted());
-        let p = PermissionStatus { screen_recording: false, accessibility: true };
+        let p = PermissionStatus {
+            screen_recording: false,
+            accessibility: true,
+        };
         assert!(!p.all_granted());
     }
 }

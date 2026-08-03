@@ -112,8 +112,12 @@ impl ImageGeometry {
     /// coordinate inside the image.
     pub fn normalized_1000_to_image_pixel(&self, x: f64, y: f64) -> Result<(u32, u32), CuError> {
         self.check_normalized_1000_bounds(x, y)?;
-        let px = (x / 1000.0 * self.image_width_px as f64).round().clamp(0.0, self.image_width_px.saturating_sub(1) as f64);
-        let py = (y / 1000.0 * self.image_height_px as f64).round().clamp(0.0, self.image_height_px.saturating_sub(1) as f64);
+        let px = (x / 1000.0 * self.image_width_px as f64)
+            .round()
+            .clamp(0.0, self.image_width_px.saturating_sub(1) as f64);
+        let py = (y / 1000.0 * self.image_height_px as f64)
+            .round()
+            .clamp(0.0, self.image_height_px.saturating_sub(1) as f64);
         Ok((px as u32, py as u32))
     }
 
@@ -149,7 +153,11 @@ impl ImageGeometry {
         let s = self.scale_factor().max(f64::EPSILON);
         let px = ((g.x - self.display_bounds.x) * s).round();
         let py = ((g.y - self.display_bounds.y) * s).round();
-        if px < 0.0 || py < 0.0 || px >= self.image_width_px as f64 || py >= self.image_height_px as f64 {
+        if px < 0.0
+            || py < 0.0
+            || px >= self.image_width_px as f64
+            || py >= self.image_height_px as f64
+        {
             return None;
         }
         Some((px as u32, py as u32))
@@ -162,7 +170,11 @@ impl ImageGeometry {
             CoordinateSpace::ImagePixels => {
                 let px = p.x.round() as i64;
                 let py = p.y.round() as i64;
-                if px < 0 || py < 0 || px >= self.image_width_px as i64 || py >= self.image_height_px as i64 {
+                if px < 0
+                    || py < 0
+                    || px >= self.image_width_px as i64
+                    || py >= self.image_height_px as i64
+                {
                     return Err(CuError::OutOfBounds(BoundsDetail {
                         coordinate_space: space.as_str().into(),
                         x: p.x,
@@ -209,11 +221,15 @@ pub struct Region {
 impl Region {
     /// Convert the region to image pixel space, clamping so it stays inside
     /// the image. Returns the pixel rectangle.
-    pub fn to_image_pixels(&self, geometry: &ImageGeometry) -> Result<(u32, u32, u32, u32), CuError> {
+    pub fn to_image_pixels(
+        &self,
+        geometry: &ImageGeometry,
+    ) -> Result<(u32, u32, u32, u32), CuError> {
         let (x, y, w, h) = match self.coordinate_space {
             CoordinateSpace::Normalized1000 => {
                 if !geometry.normalized_1000_in_bounds(self.x, self.y)
-                    || !geometry.normalized_1000_in_bounds(self.x + self.width, self.y + self.height)
+                    || !geometry
+                        .normalized_1000_in_bounds(self.x + self.width, self.y + self.height)
                 {
                     return Err(CuError::OutOfBounds(BoundsDetail {
                         coordinate_space: self.coordinate_space.as_str().into(),
@@ -224,8 +240,8 @@ impl Region {
                     }));
                 }
                 let (px, py) = geometry.normalized_1000_to_image_pixel(self.x, self.y)?;
-                let (px2, py2) =
-                    geometry.normalized_1000_to_image_pixel(self.x + self.width, self.y + self.height)?;
+                let (px2, py2) = geometry
+                    .normalized_1000_to_image_pixel(self.x + self.width, self.y + self.height)?;
                 let w = px2.saturating_sub(px).max(1);
                 let h = py2.saturating_sub(py).max(1);
                 (px, py, w, h)
@@ -235,7 +251,11 @@ impl Region {
                 let y = self.y.round() as i64;
                 let w = self.width.round().max(1.0) as i64;
                 let h = self.height.round().max(1.0) as i64;
-                if x < 0 || y < 0 || x + w > geometry.image_width_px as i64 || y + h > geometry.image_height_px as i64 {
+                if x < 0
+                    || y < 0
+                    || x + w > geometry.image_width_px as i64
+                    || y + h > geometry.image_height_px as i64
+                {
                     return Err(CuError::OutOfBounds(BoundsDetail {
                         coordinate_space: self.coordinate_space.as_str().into(),
                         x: self.x,
@@ -253,7 +273,12 @@ impl Region {
 
 /// A linear drag path: `from` → `to` sampled into `steps + 1` points.
 /// Steps are chosen from the travel distance so the motion looks smooth.
-pub fn drag_path(from: Point, to: Point, duration_ms: u64, steps_per_second: f64) -> Vec<(Point, u64)> {
+pub fn drag_path(
+    from: Point,
+    to: Point,
+    duration_ms: u64,
+    steps_per_second: f64,
+) -> Vec<(Point, u64)> {
     let dist = ((to.x - from.x).powi(2) + (to.y - from.y).powi(2)).sqrt();
     let n = ((dist / 8.0).ceil() as u64).clamp(4, 200);
     let n = n.max((duration_ms as f64 * steps_per_second / 1000.0).ceil() as u64);
@@ -261,8 +286,15 @@ pub fn drag_path(from: Point, to: Point, duration_ms: u64, steps_per_second: f64
     for i in 0..=n {
         let t = i as f64 / n as f64;
         // Ease-in-out cubic for a natural drag start/stop.
-        let ease = if t < 0.5 { 2.0 * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(2) / 2.0 };
-        let p = Point::new(from.x + (to.x - from.x) * ease, from.y + (to.y - from.y) * ease);
+        let ease = if t < 0.5 {
+            2.0 * t * t
+        } else {
+            1.0 - (-2.0 * t + 2.0).powi(2) / 2.0
+        };
+        let p = Point::new(
+            from.x + (to.x - from.x) * ease,
+            from.y + (to.y - from.y) * ease,
+        );
         out.push((p, duration_ms / n));
     }
     out
@@ -281,7 +313,12 @@ mod tests {
         ImageGeometry {
             image_width_px: 2560,
             image_height_px: 1600,
-            display_bounds: DisplayBounds { x: 0.0, y: 0.0, width: 1280.0, height: 800.0 },
+            display_bounds: DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1280.0,
+                height: 800.0,
+            },
         }
     }
 
@@ -289,7 +326,12 @@ mod tests {
         ImageGeometry {
             image_width_px: 1920,
             image_height_px: 1080,
-            display_bounds: DisplayBounds { x: -1920.0, y: -120.0, width: 1920.0, height: 1080.0 },
+            display_bounds: DisplayBounds {
+                x: -1920.0,
+                y: -120.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
         }
     }
 
@@ -322,7 +364,12 @@ mod tests {
         let g = ImageGeometry {
             image_width_px: 1920,
             image_height_px: 1080,
-            display_bounds: DisplayBounds { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 },
+            display_bounds: DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
         };
         let p = g.normalized_1000_to_global(500.0, 500.0).unwrap();
         assert!((p.x - 960.0).abs() < 0.001);
@@ -376,14 +423,20 @@ mod tests {
     #[test]
     fn image_pixels_out_of_bounds_rejected() {
         let g = retina_geometry();
-        assert!(g.to_global(CoordinateSpace::ImagePixels, Point::new(3000.0, 500.0)).is_err());
-        assert!(g.to_global(CoordinateSpace::ImagePixels, Point::new(-1.0, 500.0)).is_err());
+        assert!(g
+            .to_global(CoordinateSpace::ImagePixels, Point::new(3000.0, 500.0))
+            .is_err());
+        assert!(g
+            .to_global(CoordinateSpace::ImagePixels, Point::new(-1.0, 500.0))
+            .is_err());
     }
 
     #[test]
     fn to_global_image_pixels_ok() {
         let g = retina_geometry();
-        let p = g.to_global(CoordinateSpace::ImagePixels, Point::new(1280.0, 800.0)).unwrap();
+        let p = g
+            .to_global(CoordinateSpace::ImagePixels, Point::new(1280.0, 800.0))
+            .unwrap();
         assert!((p.x - 640.0).abs() < 0.001);
     }
 
@@ -413,7 +466,10 @@ mod tests {
 
     #[test]
     fn coordinate_space_from_str() {
-        assert_eq!("normalized_1000".parse::<CoordinateSpace>().unwrap(), CoordinateSpace::Normalized1000);
+        assert_eq!(
+            "normalized_1000".parse::<CoordinateSpace>().unwrap(),
+            CoordinateSpace::Normalized1000
+        );
         assert!("bogus".parse::<CoordinateSpace>().is_err());
     }
 

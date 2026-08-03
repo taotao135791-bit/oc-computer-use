@@ -121,6 +121,14 @@ func getShareableContent() throws -> SCShareableContent {
 func captureDisplay(displayId: CGDirectDisplayID, outputPath: String,
                     showsCursor: Bool, maxWidth: Int, format: String,
                     quality: Int) throws -> [String: Any] {
+    // ScreenCaptureKit silently hangs (no error, no completion callback) when
+    // the calling process lacks Screen Recording permission. Fail fast with a
+    // clear message instead. The permission is bound to the executable's
+    // ad-hoc signature (cdhash), so rebuilding cubridge resets it — see README.
+    guard CGPreflightScreenCaptureAccess() else {
+        throw NSError(domain: "CUBridge", code: 5,
+                      userInfo: [NSLocalizedDescriptionKey: "Screen Recording permission is not granted for cubridge. Open System Settings > Privacy & Security > Screen Recording and enable cubridge (~/.computer-use/bin/cubridge). Rebuilding cubridge resets this permission — re-grant it after any rebuild."])
+    }
     let content = try getShareableContent()
     guard let display = content.displays.first(where: { $0.displayID == displayId }) else {
         throw NSError(domain: "CUBridge", code: 2,

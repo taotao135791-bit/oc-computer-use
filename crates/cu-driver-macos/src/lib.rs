@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use cu_core::{CuError, DisplayBounds, ImageGeometry, Point, TextInputMethod};
 use cu_driver::{
-    ApplicationInfo, CaptureRequest, CapturedFrame, ComputerDriver, DesktopLayout, PermissionStatus,
-    PointerInfo, QuickSnapshot, ResolvedAction,
+    ApplicationInfo, CaptureRequest, CapturedFrame, ComputerDriver, DesktopLayout,
+    PermissionStatus, PointerInfo, QuickSnapshot, ResolvedAction,
 };
 use serde_json::Value;
 
@@ -41,7 +41,10 @@ impl Default for MacosDriver {
 
 impl MacosDriver {
     pub fn new() -> Self {
-        Self { bridge: Bridge::new(), layout: Mutex::new(None) }
+        Self {
+            bridge: Bridge::new(),
+            layout: Mutex::new(None),
+        }
     }
 
     /// Build a driver that uses a specific bridge binary (used by the CLI's
@@ -49,7 +52,10 @@ impl MacosDriver {
     pub fn with_bridge(path: std::path::PathBuf) -> Self {
         let mut b = Bridge::new();
         b.set_binary_path(path);
-        Self { bridge: b, layout: Mutex::new(None) }
+        Self {
+            bridge: b,
+            layout: Mutex::new(None),
+        }
     }
 
     /// Path to the Swift bridge binary, building it on first use if needed.
@@ -99,7 +105,11 @@ impl MacosDriver {
             .map(|id| {
                 let b = ffi::display_bounds(id);
                 let (pw, ph) = ffi::display_pixels(id);
-                let scale = if b.size.width > 0.0 { pw as f64 / b.size.width } else { 1.0 };
+                let scale = if b.size.width > 0.0 {
+                    pw as f64 / b.size.width
+                } else {
+                    1.0
+                };
                 cu_driver::DisplayInfo {
                     id: id.to_string(),
                     name: format!("Display {id}"),
@@ -142,18 +152,26 @@ impl ComputerDriver for MacosDriver {
         let width = data
             .get("width")
             .and_then(Value::as_u64)
-            .ok_or_else(|| CuError::Driver("capture returned no width".into()))? as u32;
+            .ok_or_else(|| CuError::Driver("capture returned no width".into()))?
+            as u32;
         let height = data
             .get("height")
             .and_then(Value::as_u64)
-            .ok_or_else(|| CuError::Driver("capture returned no height".into()))? as u32;
-        let scale = data.get("display_scale_factor").and_then(Value::as_f64).unwrap_or(1.0);
+            .ok_or_else(|| CuError::Driver("capture returned no height".into()))?
+            as u32;
+        let scale = data
+            .get("display_scale_factor")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
 
         // Permission failures from ScreenCaptureKit surface as a missing frame;
         // map them to a structured PERMISSION error with guidance.
         let perm = self.permission_status().await?;
         if !perm.screen_recording {
-            return Err(CuError::permission(cu_core::PermissionKind::ScreenRecording, false));
+            return Err(CuError::permission(
+                cu_core::PermissionKind::ScreenRecording,
+                false,
+            ));
         }
 
         let display = self.resolve_display(&request.display_id)?;
@@ -165,9 +183,8 @@ impl ComputerDriver for MacosDriver {
             scale_factor: scale,
             bounds: display.bounds,
             image_path: request.output_path.clone(),
-            image_bytes: std::fs::read(&request.output_path).map_err(|e| {
-                CuError::Driver(format!("cannot read captured image: {e}"))
-            })?,
+            image_bytes: std::fs::read(&request.output_path)
+                .map_err(|e| CuError::Driver(format!("cannot read captured image: {e}")))?,
             format: request.format,
             active_application: active,
             captured_at: chrono::Utc::now(),
@@ -204,7 +221,12 @@ impl ComputerDriver for MacosDriver {
     async fn execute(&self, action: &ResolvedAction) -> Result<cu_driver::ActionResult, CuError> {
         let started = Instant::now();
         let outcome = match action {
-            ResolvedAction::Click { x, y, button, double } => {
+            ResolvedAction::Click {
+                x,
+                y,
+                button,
+                double,
+            } => {
                 if *double {
                     mouse::double_click(*button, *x, *y);
                 } else {
@@ -212,7 +234,11 @@ impl ComputerDriver for MacosDriver {
                 }
                 Ok(())
             }
-            ResolvedAction::Move { from, to, duration_ms } => {
+            ResolvedAction::Move {
+                from,
+                to,
+                duration_ms,
+            } => {
                 mouse::move_pointer_smooth(*from, *to, *duration_ms).await;
                 Ok(())
             }
@@ -232,11 +258,19 @@ impl ComputerDriver for MacosDriver {
                 keyboard::post_combo(&combo);
                 Ok(())
             }
-            ResolvedAction::Scroll { at, delta_x, delta_y } => {
+            ResolvedAction::Scroll {
+                at,
+                delta_x,
+                delta_y,
+            } => {
                 mouse::scroll(*delta_x, *delta_y, *at).await;
                 Ok(())
             }
-            ResolvedAction::Drag { from, to, duration_ms } => {
+            ResolvedAction::Drag {
+                from,
+                to,
+                duration_ms,
+            } => {
                 mouse::drag(*from, *to, *duration_ms).await;
                 Ok(())
             }
@@ -275,9 +309,18 @@ impl ComputerDriver for MacosDriver {
 
     async fn active_application(&self) -> Result<Option<ApplicationInfo>, CuError> {
         let data = self.bridge.request("active", Value::Null)?;
-        let bundle_id = data.get("bundle_id").and_then(Value::as_str).unwrap_or("unknown");
-        let name = data.get("name").and_then(Value::as_str).unwrap_or("unknown");
-        let window_title = data.get("window_title").and_then(Value::as_str).map(|s| s.to_string());
+        let bundle_id = data
+            .get("bundle_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let name = data
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let window_title = data
+            .get("window_title")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string());
         if bundle_id == "unknown" && name == "unknown" {
             Ok(None)
         } else {
@@ -291,7 +334,10 @@ impl ComputerDriver for MacosDriver {
 
     async fn pointer_location(&self) -> Result<PointerInfo, CuError> {
         let p = ffi::current_mouse_location();
-        Ok(PointerInfo { location: Point::new(p.x, p.y), display_id: None })
+        Ok(PointerInfo {
+            location: Point::new(p.x, p.y),
+            display_id: None,
+        })
     }
 
     async fn shutdown(&self) -> Result<(), CuError> {
@@ -326,7 +372,10 @@ impl MacosDriver {
         }
 
         // 3. Paste via CMD+V.
-        keyboard::post_combo(&keyboard::parse_combo(&["CMD".to_string(), "V".to_string()])?);
+        keyboard::post_combo(&keyboard::parse_combo(&[
+            "CMD".to_string(),
+            "V".to_string(),
+        ])?);
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         // 4. Restore previous contents (best-effort; failure is logged, not fatal).
@@ -346,7 +395,11 @@ impl MacosDriver {
 }
 
 /// Helper to build an [`ImageGeometry`] for a captured frame.
-pub fn geometry_for(display: &cu_driver::DisplayInfo, image_width: u32, image_height: u32) -> ImageGeometry {
+pub fn geometry_for(
+    display: &cu_driver::DisplayInfo,
+    image_width: u32,
+    image_height: u32,
+) -> ImageGeometry {
     ImageGeometry {
         image_width_px: image_width,
         image_height_px: image_height,
@@ -363,7 +416,12 @@ mod tests {
         let d = cu_driver::DisplayInfo {
             id: "1".into(),
             name: "D".into(),
-            bounds: DisplayBounds { x: 0.0, y: 0.0, width: 1440.0, height: 900.0 },
+            bounds: DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            },
             pixel_width: 2880,
             pixel_height: 1800,
             scale_factor: 2.0,

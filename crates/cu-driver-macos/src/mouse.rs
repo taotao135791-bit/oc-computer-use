@@ -31,7 +31,11 @@ pub fn move_pointer(x: f64, y: f64) {
 }
 
 /// Move the pointer along a smooth path over `duration_ms` (0 = instant).
-pub async fn move_pointer_smooth(from: cu_core::Point, to: cu_core::Point, duration_ms: Option<u64>) {
+pub async fn move_pointer_smooth(
+    from: cu_core::Point,
+    to: cu_core::Point,
+    duration_ms: Option<u64>,
+) {
     let duration = duration_ms.unwrap_or(0).min(5000);
     if duration == 0 {
         move_pointer(to.x, to.y);
@@ -137,8 +141,17 @@ mod tests {
 
     #[test]
     fn drag_type_per_button() {
-        assert_eq!(move_type_for_button(MOUSE_BUTTON_LEFT), EVENT_LEFT_MOUSE_DRAGGED);
-        assert_eq!(move_type_for_button(MOUSE_BUTTON_RIGHT), EVENT_RIGHT_MOUSE_DRAGGED);
-        assert_eq!(move_type_for_button(MOUSE_BUTTON_MIDDLE), EVENT_OTHER_MOUSE_DRAGGED);
+        assert_eq!(
+            move_type_for_button(MOUSE_BUTTON_LEFT),
+            EVENT_LEFT_MOUSE_DRAGGED
+        );
+        assert_eq!(
+            move_type_for_button(MOUSE_BUTTON_RIGHT),
+            EVENT_RIGHT_MOUSE_DRAGGED
+        );
+        assert_eq!(
+            move_type_for_button(MOUSE_BUTTON_MIDDLE),
+            EVENT_OTHER_MOUSE_DRAGGED
+        );
     }
 }

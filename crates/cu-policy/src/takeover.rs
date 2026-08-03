@@ -9,19 +9,15 @@ use serde::{Deserialize, Serialize};
 /// Reaction when the physical user takes over the mouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TakeoverPolicy {
     /// Do nothing.
     Ignore,
     /// Pause the session (no new actions; can be resumed).
+    #[default]
     AutoPause,
     /// Immediately hand control back to the user.
     ImmediateTakeover,
-}
-
-impl Default for TakeoverPolicy {
-    fn default() -> Self {
-        TakeoverPolicy::AutoPause
-    }
 }
 
 /// Parameters for the pointer-motion takeover heuristic.
@@ -88,7 +84,10 @@ mod tests {
 
     #[test]
     fn repeated_large_jumps_trigger() {
-        let mut d = TakeoverDetector { required_jumps: 2, ..Default::default() };
+        let mut d = TakeoverDetector {
+            required_jumps: 2,
+            ..Default::default()
+        };
         assert!(!d.observe(200.0, 0.0));
         assert!(d.observe(0.0, 300.0));
     }

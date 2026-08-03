@@ -1,0 +1,178 @@
+//! The daemon server: a newline-delimited JSON-RPC 2.0 endpoint over a Unix
+//! domain socket owned by the current user.
+//!
+//! Security posture:
+//! - The socket lives under `~/.computer-use/`, whose parent directory and the
+//!   socket file itself are chmod 0700, so only the current user can connect.
+//! - A stale socket left by a crashed daemon is removed before binding.
+//! - Each request runs under a deadline; a timed-out request cancels the
+//!   in-flight action batch (cooperatively) and recycles the Swift bridge so no
+//!   stale response can desync later calls.
+//! - `runtime.shutdown` cancels the accept loop for a graceful stop.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use cu_core::{ErrorCode, RpcRequest, RpcResponse};
+use cu_driver::ComputerDriver;
+use cu_driver_macos::MacosDriver;
+use cu_runtime::{Runtime, RuntimeConfig};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio_util::sync::CancellationToken;
+
+use crate::jsonrpc::dispatch;
+
+/// Configuration for the daemon process.
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    pub socket_path: PathBuf,
+    /// Per-request deadline in seconds. Generous by default; session
+    /// pause/stop/cancel remain the responsive cancellation path.
+    pub request_timeout_secs: u64,
+    pub runtime_config: RuntimeConfig,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        let mut runtime_config = RuntimeConfig::default();
+        // Explicit opt-in to record full typed text in traces. Off by default:
+        // `type` actions are redacted to { text_redacted, character_count }
+        // unless the operator sets this. See docs/permissions.md.
+        if std::env::var("COMPUTER_USE_TRACE_DEV_MODE").as_deref() == Ok("1") {
+            runtime_config.trace_dev_mode = true;
+        }
+        Self {
+            socket_path: cu_core::config::socket_path(),
+            request_timeout_secs: 600,
+            runtime_config,
+        }
+    }
+}
+
+/// Run the daemon until `runtime.shutdown` or Ctrl-C. Returns after cleanup.
+pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
+    let driver: Arc<dyn ComputerDriver> = Arc::new(MacosDriver::new());
+    let runtime = Arc::new(Runtime::new(driver, config.runtime_config.clone()));
+
+    // Prune trace files older than the retention window on startup.
+    if let Ok(removed) = cu_trace::prune_old_traces(
+        runtime.traces_dir(),
+        cu_trace::storage::DEFAULT_RETENTION_DAYS,
+    ) {
+        if removed > 0 {
+            tracing::info!(removed, "pruned old trace files");
+        }
+    }
+
+    let socket = &config.socket_path;
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    if socket.exists() {
+        tracing::warn!(path = %socket.display(), "removing stale socket from previous run");
+        std::fs::remove_file(socket)?;
+    }
+
+    let listener =
+        UnixListener::bind(socket).map_err(|e| anyhow::anyhow!("cannot bind {socket:?}: {e}"))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o700))?;
+
+    let app_shutdown = CancellationToken::new();
+    let ctrl_c_shutdown = app_shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        ctrl_c_shutdown.cancel();
+    });
+
+    tracing::info!(path = %socket.display(), version = %cu_core::config::RUNTIME_VERSION, "computer-use daemon listening");
+
+    loop {
+        tokio::select! {
+            _ = app_shutdown.cancelled() => break,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        let runtime = runtime.clone();
+                        let shutdown = app_shutdown.clone();
+                        let timeout = config.request_timeout_secs;
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(stream, runtime, shutdown, timeout).await {
+                                tracing::debug!(error = %e, "connection handler ended");
+                            }
+                        });
+                    }
+                    Err(e) => tracing::error!(error = %e, "accept failed"),
+                }
+            }
+        }
+    }
+
+    tracing::info!("shutting down daemon");
+    let _ = runtime.shutdown().await;
+    let _ = std::fs::remove_file(socket);
+    Ok(())
+}
+
+/// Serve one connected client: read a JSON-RPC request per line, respond per
+/// line, until EOF.
+async fn handle_connection(
+    stream: UnixStream,
+    runtime: Arc<Runtime>,
+    app_shutdown: CancellationToken,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let request: RpcRequest = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = RpcResponse::err(None, -32700, format!("parse error: {e}"), None);
+                write_line(&mut write_half, &resp).await?;
+                continue;
+            }
+        };
+
+        let fut = dispatch(&runtime, &app_shutdown, request.clone());
+        let timeout = tokio::time::Duration::from_secs(timeout_secs);
+        let resp = match tokio::time::timeout(timeout, fut).await {
+            Ok(resp) => resp,
+            Err(_elapsed) => {
+                tracing::warn!(method = %request.method, "request timed out; recycling bridge");
+                // Recycle the Swift bridge in case the aborted request left a
+                // stale response in the pipe.
+                let _ = runtime.restart_bridge().await;
+                RpcResponse::err(
+                    request.id.clone(),
+                    ErrorCode::Cancelled.jsonrpc_code(),
+                    "request timed out".into(),
+                    Some(serde_json::json!({
+                        "code": "CANCELLED",
+                        "message": "request timed out",
+                        "method": request.method,
+                    })),
+                )
+            }
+        };
+        write_line(&mut write_half, &resp).await?;
+    }
+    Ok(())
+}
+
+async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, resp: &RpcResponse) -> anyhow::Result<()> {
+    let mut payload = serde_json::to_string(resp)?;
+    payload.push('\n');
+    w.write_all(payload.as_bytes()).await?;
+    w.flush().await?;
+    Ok(())
+}

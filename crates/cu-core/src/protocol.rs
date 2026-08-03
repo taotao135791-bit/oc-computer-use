@@ -46,15 +46,34 @@ pub struct RpcError {
 
 impl RpcResponse {
     pub fn ok(id: Option<serde_json::Value>, result: serde_json::Value) -> Self {
-        Self { jsonrpc: JSONRPC_VERSION.into(), id, result: Some(result), error: None }
+        Self {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
-    pub fn err(id: Option<serde_json::Value>, code: i64, message: String, data: Option<serde_json::Value>) -> Self {
-        Self { jsonrpc: JSONRPC_VERSION.into(), id, result: None, error: Some(RpcError { code, message, data }) }
+    pub fn err(
+        id: Option<serde_json::Value>,
+        code: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id,
+            result: None,
+            error: Some(RpcError {
+                code,
+                message,
+                data,
+            }),
+        }
     }
 }
 
 /// `computer.observe` request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ObserveParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -70,6 +89,11 @@ pub struct ObserveParams {
     pub image_format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jpeg_quality: Option<u8>,
+    /// When true, the response carries the image as base64. Off by default so a
+    /// plain `observe` stays cheap; adapters that need pixels (MCP, vision
+    /// harnesses) turn it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_image: Option<bool>,
 }
 
 /// `computer.observe` result.
@@ -298,7 +322,13 @@ mod tests {
 
     #[test]
     fn region_serializes_with_coordinate_space() {
-        let r = Region { x: 1.0, y: 2.0, width: 3.0, height: 4.0, coordinate_space: CoordinateSpace::ImagePixels };
+        let r = Region {
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+            coordinate_space: CoordinateSpace::ImagePixels,
+        };
         let v = serde_json::to_value(r).unwrap();
         assert_eq!(v["coordinate_space"], "image_pixels");
         let _ = Point::new(0.0, 0.0);
@@ -310,5 +340,13 @@ mod tests {
         let p: ObserveParams = serde_json::from_value(v).unwrap();
         assert_eq!(p.session_id, None);
         assert_eq!(p.max_width, None);
+        assert_eq!(p.include_image, None);
+    }
+
+    #[test]
+    fn observe_include_image_flag_round_trips() {
+        let v = serde_json::json!({ "include_image": true });
+        let p: ObserveParams = serde_json::from_value(v).unwrap();
+        assert_eq!(p.include_image, Some(true));
     }
 }

@@ -6,12 +6,18 @@ license.workspace = true
 
 [dependencies]
 cu-core = { path = "../cu-core" }
+cu-driver = { path = "../cu-driver" }
+cu-driver-macos = { path = "../cu-driver-macos" }
 cu-runtime = { path = "../cu-runtime" }
 cu-trace = { path = "../cu-trace" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-futures = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

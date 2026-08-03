@@ -12,12 +12,8 @@ pub fn to_grayscale_thumbnail(bytes: &[u8], width: u32, height: u32) -> Result<V
     let img = image::load_from_memory(bytes)
         .map_err(|e| CuError::Driver(format!("cannot decode captured image: {e}")))?
         .to_rgb8();
-    let resized = image::imageops::resize(
-        &img,
-        width,
-        height,
-        image::imageops::FilterType::Triangle,
-    );
+    let resized =
+        image::imageops::resize(&img, width, height, image::imageops::FilterType::Triangle);
     // Convert RGB to grayscale (Rec. 601 luma).
     let mut out = Vec::with_capacity((width * height) as usize);
     for px in resized.pixels() {
@@ -54,7 +50,6 @@ mod tests {
         let png = make_test_png(100, 50);
         let thumb = to_grayscale_thumbnail(&png, 64, 64).unwrap();
         assert_eq!(thumb.len(), 64 * 64);
-        assert!(thumb.iter().all(|&b| b <= 255));
         // Uniform gray image → uniform thumbnail.
         assert_eq!(thumb[0], 128);
     }

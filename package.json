@@ -5,7 +5,8 @@
   "description": "Model-agnostic, vision-first Computer Use runtime for macOS",
   "type": "module",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "apps/*"
   ],
   "scripts": {
     "build": "pnpm -r build",

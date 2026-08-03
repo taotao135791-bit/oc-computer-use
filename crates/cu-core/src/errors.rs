@@ -213,7 +213,10 @@ impl CuError {
         let code = self.code().as_str();
         let mut map = serde_json::Map::new();
         map.insert("code".into(), serde_json::Value::String(code.into()));
-        map.insert("message".into(), serde_json::Value::String(self.to_string()));
+        map.insert(
+            "message".into(),
+            serde_json::Value::String(self.to_string()),
+        );
         match self {
             CuError::Permission(issue) => {
                 map.insert(
@@ -222,13 +225,22 @@ impl CuError {
                 );
             }
             CuError::StaleFrame(detail) => {
-                map.insert("referenced_frame_id".into(), detail.referenced_frame_id.clone().into());
-                map.insert("current_frame_id".into(), detail.current_frame_id.clone().into());
+                map.insert(
+                    "referenced_frame_id".into(),
+                    detail.referenced_frame_id.clone().into(),
+                );
+                map.insert(
+                    "current_frame_id".into(),
+                    detail.current_frame_id.clone().into(),
+                );
                 map.insert("change_score".into(), detail.change_score.into());
                 map.insert("reason".into(), detail.reason.clone().into());
             }
             CuError::OutOfBounds(detail) => {
-                map.insert("bounds".into(), serde_json::to_value(detail).unwrap_or(serde_json::Value::Null));
+                map.insert(
+                    "bounds".into(),
+                    serde_json::to_value(detail).unwrap_or(serde_json::Value::Null),
+                );
             }
             CuError::ConfirmationRequired(detail) => {
                 map.insert(
@@ -314,7 +326,10 @@ mod tests {
         let data = err.to_error_data();
         assert_eq!(data["permission"]["kind"], "accessibility");
         assert_eq!(data["permission"]["granted"], false);
-        assert!(data["permission"]["guidance"].as_str().unwrap().contains("Accessibility"));
+        assert!(data["permission"]["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("Accessibility"));
     }
 
     #[test]
@@ -326,7 +341,10 @@ mod tests {
             ErrorCode::Cancelled,
         ] {
             let code = c.jsonrpc_code();
-            assert!((-32099..=-32000).contains(&code), "code {code} outside range");
+            assert!(
+                (-32099..=-32000).contains(&code),
+                "code {code} outside range"
+            );
         }
     }
 }

@@ -17,7 +17,7 @@ pub use actions::{
     ActionBatch, ComputerAction, MouseButton, RedactedText, TextInputMethod, WaitPolicy,
 };
 pub use coordinates::{CoordinateSpace, DisplayBounds, ImageGeometry, Point, Region};
-pub use errors::{CuError, ErrorCode, PermissionKind, PermissionIssue, StaleFrameDetail};
+pub use errors::{CuError, ErrorCode, PermissionIssue, PermissionKind, StaleFrameDetail};
 pub use frames::{ScreenFrame, ScreenSnapshot, StaleFrameVerdict};
 pub use protocol::{
     ActParams, ActResult, ActionResultReport, InspectMapping, InspectParams, InspectResult,

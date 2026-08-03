@@ -93,7 +93,10 @@ mod tests {
 
     #[test]
     fn session_action_from_str() {
-        assert_eq!("takeover".parse::<SessionAction>().unwrap(), SessionAction::Takeover);
+        assert_eq!(
+            "takeover".parse::<SessionAction>().unwrap(),
+            SessionAction::Takeover
+        );
         assert!("bogus".parse::<SessionAction>().is_err());
     }
 }

@@ -45,15 +45,11 @@ impl std::str::FromStr for MouseButton {
 /// fallback when synthetic key events are unreliable for CJK input).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TextInputMethod {
+    #[default]
     Keyboard,
     Clipboard,
-}
-
-impl Default for TextInputMethod {
-    fn default() -> Self {
-        TextInputMethod::Keyboard
-    }
 }
 
 impl std::str::FromStr for TextInputMethod {
@@ -146,7 +142,9 @@ impl ComputerAction {
             ComputerAction::Click { .. }
             | ComputerAction::DoubleClick { .. }
             | ComputerAction::Scroll { .. } => "medium",
-            ComputerAction::TypeText { .. } | ComputerAction::Key { .. } | ComputerAction::Drag { .. } => "medium",
+            ComputerAction::TypeText { .. }
+            | ComputerAction::Key { .. }
+            | ComputerAction::Drag { .. } => "medium",
         }
     }
 }
@@ -154,16 +152,12 @@ impl ComputerAction {
 /// What the runtime should do after executing an action batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WaitPolicy {
+    #[default]
     None,
     Fixed,
     UntilStable,
-}
-
-impl Default for WaitPolicy {
-    fn default() -> Self {
-        WaitPolicy::None
-    }
 }
 
 impl std::str::FromStr for WaitPolicy {
@@ -197,15 +191,21 @@ impl ActionBatch {
     pub fn validate(&self) -> Result<(), crate::errors::CuError> {
         use crate::errors::CuError;
         if self.actions.is_empty() {
-            return Err(CuError::InvalidParams("actions list must not be empty".into()));
+            return Err(CuError::InvalidParams(
+                "actions list must not be empty".into(),
+            ));
         }
         if self.actions.len() > 64 {
-            return Err(CuError::InvalidParams("too many actions in one batch (max 64)".into()));
+            return Err(CuError::InvalidParams(
+                "too many actions in one batch (max 64)".into(),
+            ));
         }
         for a in &self.actions {
             if let ComputerAction::TypeText { text, .. } = a {
                 if text.len() > 4096 {
-                    return Err(CuError::InvalidParams("type text exceeds 4096 characters".into()));
+                    return Err(CuError::InvalidParams(
+                        "type text exceeds 4096 characters".into(),
+                    ));
                 }
                 // NUL bytes and lone surrogates are never valid keyboard input.
                 if text.contains('\0') {
@@ -219,7 +219,9 @@ impl ActionBatch {
             }
             if let ComputerAction::Wait { duration_ms } = a {
                 if *duration_ms > 600_000 {
-                    return Err(CuError::InvalidParams("wait duration exceeds 10 minutes".into()));
+                    return Err(CuError::InvalidParams(
+                        "wait duration exceeds 10 minutes".into(),
+                    ));
                 }
             }
         }
@@ -266,13 +268,44 @@ mod tests {
     #[test]
     fn action_round_trip_all_variants() {
         let actions = vec![
-            ComputerAction::Click { x: 1.0, y: 2.0, button: MouseButton::Right, coordinate_space: CoordinateSpace::ImagePixels },
-            ComputerAction::DoubleClick { x: 3.0, y: 4.0, button: MouseButton::Middle, coordinate_space: CoordinateSpace::Normalized1000 },
-            ComputerAction::Move { x: 5.0, y: 6.0, coordinate_space: CoordinateSpace::Normalized1000, duration_ms: Some(120) },
-            ComputerAction::TypeText { text: "你好".into(), method: TextInputMethod::Keyboard },
-            ComputerAction::Key { keys: vec!["CMD".into(), "L".into()] },
-            ComputerAction::Scroll { x: None, y: None, delta_x: 0.0, delta_y: -300.0, coordinate_space: CoordinateSpace::Normalized1000 },
-            ComputerAction::Drag { from: Point::new(0.0, 0.0), to: Point::new(10.0, 10.0), coordinate_space: CoordinateSpace::Normalized1000, duration_ms: None },
+            ComputerAction::Click {
+                x: 1.0,
+                y: 2.0,
+                button: MouseButton::Right,
+                coordinate_space: CoordinateSpace::ImagePixels,
+            },
+            ComputerAction::DoubleClick {
+                x: 3.0,
+                y: 4.0,
+                button: MouseButton::Middle,
+                coordinate_space: CoordinateSpace::Normalized1000,
+            },
+            ComputerAction::Move {
+                x: 5.0,
+                y: 6.0,
+                coordinate_space: CoordinateSpace::Normalized1000,
+                duration_ms: Some(120),
+            },
+            ComputerAction::TypeText {
+                text: "你好".into(),
+                method: TextInputMethod::Keyboard,
+            },
+            ComputerAction::Key {
+                keys: vec!["CMD".into(), "L".into()],
+            },
+            ComputerAction::Scroll {
+                x: None,
+                y: None,
+                delta_x: 0.0,
+                delta_y: -300.0,
+                coordinate_space: CoordinateSpace::Normalized1000,
+            },
+            ComputerAction::Drag {
+                from: Point::new(0.0, 0.0),
+                to: Point::new(10.0, 10.0),
+                coordinate_space: CoordinateSpace::Normalized1000,
+                duration_ms: None,
+            },
             ComputerAction::Wait { duration_ms: 250 },
         ];
         for a in actions {
@@ -286,20 +319,41 @@ mod tests {
     fn parse_uses_defaults_when_omitted() {
         let v = serde_json::json!({"type":"type","text":"hi"});
         let a: ComputerAction = serde_json::from_value(v).unwrap();
-        assert_eq!(a, ComputerAction::TypeText { text: "hi".into(), method: TextInputMethod::Keyboard });
+        assert_eq!(
+            a,
+            ComputerAction::TypeText {
+                text: "hi".into(),
+                method: TextInputMethod::Keyboard
+            }
+        );
     }
 
     #[test]
     fn batch_validate_rejects_empty_and_oversize() {
-        let mut b = ActionBatch { actions: vec![], wait_policy: WaitPolicy::None, fixed_wait_ms: None, return_screenshot: false };
+        let mut b = ActionBatch {
+            actions: vec![],
+            wait_policy: WaitPolicy::None,
+            fixed_wait_ms: None,
+            return_screenshot: false,
+        };
         assert!(matches!(b.validate(), Err(CuError::InvalidParams(_))));
-        b.actions = vec![ComputerAction::Wait { duration_ms: 700_000 }];
+        b.actions = vec![ComputerAction::Wait {
+            duration_ms: 700_000,
+        }];
         assert!(matches!(b.validate(), Err(CuError::InvalidParams(_))));
     }
 
     #[test]
     fn batch_validate_rejects_nul() {
-        let b = ActionBatch { actions: vec![ComputerAction::TypeText { text: "a\0b".into(), method: TextInputMethod::Keyboard }], wait_policy: WaitPolicy::None, fixed_wait_ms: None, return_screenshot: false };
+        let b = ActionBatch {
+            actions: vec![ComputerAction::TypeText {
+                text: "a\0b".into(),
+                method: TextInputMethod::Keyboard,
+            }],
+            wait_policy: WaitPolicy::None,
+            fixed_wait_ms: None,
+            return_screenshot: false,
+        };
         assert!(b.validate().is_err());
     }
 

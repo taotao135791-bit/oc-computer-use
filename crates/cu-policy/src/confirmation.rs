@@ -78,10 +78,7 @@ pub enum Authorization {
 
 /// Decide authorization for a batch given a "confirmed" flag the harness may
 /// hold (e.g. the user already approved via takeover/release flow).
-pub fn authorize(
-    policy: &ConfirmationPolicy,
-    confirmed: bool,
-) -> Authorization {
+pub fn authorize(policy: &ConfirmationPolicy, confirmed: bool) -> Authorization {
     if policy.requires_confirmation && !confirmed {
         Authorization::RequiresConfirmation(policy.clone())
     } else {
@@ -107,7 +104,10 @@ mod tests {
     fn high_risk_auto_requires_confirmation() {
         let p = ConfirmationPolicy::from_caller(None, Some("high"), None, &[click()]);
         assert!(p.requires_confirmation);
-        assert!(matches!(authorize(&p, false), Authorization::RequiresConfirmation(_)));
+        assert!(matches!(
+            authorize(&p, false),
+            Authorization::RequiresConfirmation(_)
+        ));
         assert!(matches!(authorize(&p, true), Authorization::Allowed));
     }
 

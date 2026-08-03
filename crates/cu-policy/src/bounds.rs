@@ -13,35 +13,61 @@ pub fn resolve_action_points(
 ) -> Result<Vec<Point>, CuError> {
     let mut out = Vec::new();
     match action {
-        ComputerAction::Click { x, y, coordinate_space, .. }
-        | ComputerAction::DoubleClick { x, y, coordinate_space, .. } => {
+        ComputerAction::Click {
+            x,
+            y,
+            coordinate_space,
+            ..
+        }
+        | ComputerAction::DoubleClick {
+            x,
+            y,
+            coordinate_space,
+            ..
+        } => {
             out.push(geometry.to_global(*coordinate_space, Point::new(*x, *y))?);
         }
-        ComputerAction::Move { x, y, coordinate_space, .. } => {
+        ComputerAction::Move {
+            x,
+            y,
+            coordinate_space,
+            ..
+        } => {
             out.push(geometry.to_global(*coordinate_space, Point::new(*x, *y))?);
         }
-        ComputerAction::Scroll { x, y, coordinate_space, .. } => {
+        ComputerAction::Scroll {
+            x,
+            y,
+            coordinate_space,
+            ..
+        } => {
             let space = *coordinate_space;
             if let (Some(x), Some(y)) = (x, y) {
                 out.push(geometry.to_global(space, Point::new(*x, *y))?);
             }
         }
-        ComputerAction::Drag { from, to, coordinate_space, .. } => {
+        ComputerAction::Drag {
+            from,
+            to,
+            coordinate_space,
+            ..
+        } => {
             let space = *coordinate_space;
             out.push(geometry.to_global(space, *from)?);
             out.push(geometry.to_global(space, *to)?);
         }
-        ComputerAction::TypeText { .. } | ComputerAction::Key { .. } | ComputerAction::Wait { .. } => {}
+        ComputerAction::TypeText { .. }
+        | ComputerAction::Key { .. }
+        | ComputerAction::Wait { .. } => {}
     }
     Ok(out)
 }
 
 /// True if every location-bearing action in the batch is inside the image.
 pub fn batch_in_bounds(actions: &[ComputerAction], geometry: &ImageGeometry) -> bool {
-    actions.iter().all(|a| match resolve_action_points(a, geometry) {
-        Ok(_) => true,
-        Err(_) => false,
-    })
+    actions
+        .iter()
+        .all(|a| resolve_action_points(a, geometry).is_ok())
 }
 
 #[cfg(test)]
@@ -53,7 +79,12 @@ mod tests {
         ImageGeometry {
             image_width_px: 1000,
             image_height_px: 1000,
-            display_bounds: DisplayBounds { x: 0.0, y: 0.0, width: 1000.0, height: 1000.0 },
+            display_bounds: DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 1000.0,
+            },
         }
     }
 
@@ -94,7 +125,7 @@ mod tests {
             button: MouseButton::Right,
             coordinate_space: CoordinateSpace::Normalized1000,
         };
-        assert!(batch_in_bounds(&[ok.clone()], &geom()));
+        assert!(batch_in_bounds(std::slice::from_ref(&ok), &geom()));
         assert!(!batch_in_bounds(&[bad], &geom()));
     }
 }
