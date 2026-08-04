@@ -124,6 +124,20 @@ export interface SessionParams {
   /** Optional for `status` (resolves the active session); required elsewhere. */
   session_id?: string;
   display_id?: string;
+  /** Identity recorded on the session when `start` creates it. */
+  client_id?: string;
+  client_name?: string;
+  client_instance_id?: string;
+}
+
+/**
+ * Identity of the client that started a session. The owner is the only client
+ * that may stop a session it created; other clients attach without stopping.
+ */
+export interface ClientInfo {
+  client_id: string;
+  client_name: string;
+  client_instance_id: string;
 }
 
 export interface SessionResult {
@@ -138,6 +152,10 @@ export interface SessionResult {
   current_frame_id?: string;
   trace_dir?: string;
   started_by: string;
+  /** Who created the session (absent on sessions started by anonymous clients). */
+  owner_client_id?: string;
+  owner_client_name?: string;
+  owner_instance_id?: string;
   message?: string;
 }
 

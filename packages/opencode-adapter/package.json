@@ -22,7 +22,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@computer-use/sdk": "workspace:*"
+    "@computer-use/sdk": "workspace:*",
+    "jsonc-parser": "^3.3.1"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

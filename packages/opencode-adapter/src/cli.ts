@@ -78,6 +78,8 @@ async function main(argv: string[]): Promise<void> {
       console.log(
         `${result.existed ? "updated" : "wrote"} ${result.path}${result.merged ? " (existing computer-use entry replaced)" : ""}`,
       );
+      if (result.backup) console.log(`backup: ${result.backup}`);
+      if (!result.changed) console.log("config already up to date (no changes, no backup created)");
       console.log("restart opencode (or run its MCP reload) to pick up the MCP server.");
       return;
     }

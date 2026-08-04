@@ -16,6 +16,7 @@ import type {
   ActParams,
   ActResult,
   ApplicationInfo,
+  ClientInfo,
   DesktopLayout,
   DisplayInfo,
   Health,
@@ -45,6 +46,12 @@ export interface ClientOptions {
   socketPath?: string;
   /** Per-request timeout in ms (default 30_000). */
   timeoutMs?: number;
+  /**
+   * Identity this client reports when it starts a session. The daemon records
+   * it on the session; the owner is the only client that may stop the session
+   * it created. Defaults to a per-process SDK identity.
+   */
+  clientInfo?: ClientInfo;
 }
 
 /** Per-call overrides for a single JSON-RPC request. */
@@ -68,16 +75,25 @@ interface PendingRequest {
 export class ComputerUseClient {
   readonly socketPath: string;
   readonly defaultTimeoutMs: number;
+  /** Identity used when this client starts a session. */
+  readonly clientInfo: ClientInfo;
 
   private socket: Socket | null = null;
   private buffer = "";
   private pending = new Map<number, PendingRequest>();
   private nextId = 1;
   private closed = false;
+  /** Single-flight guard: concurrent ensureSession() calls share one status→start. */
+  private ensureSessionPromise: Promise<SessionResult> | null = null;
 
   constructor(opts: ClientOptions = {}) {
     this.socketPath = opts.socketPath ?? defaultSocketPath();
     this.defaultTimeoutMs = opts.timeoutMs ?? 30_000;
+    this.clientInfo = opts.clientInfo ?? {
+      client_id: "sdk",
+      client_name: "TypeScript SDK",
+      client_instance_id: `${process.pid}-${Math.random().toString(36).slice(2, 10)}`,
+    };
   }
 
   /** Connect to the daemon socket. Rejects with TransportError on failure. */
@@ -174,6 +190,10 @@ export class ComputerUseClient {
       const onAbort = () => {
         clearTimeout(timer);
         this.pending.delete(id);
+        // The full cancel chain: an aborted request also tells the daemon to
+        // cancel the in-flight batch (fire-and-forget), so a long wait or
+        // stabilizer stops server-side, not just in this process.
+        if (method !== "computer.cancel") this.notifyCancel(params);
         reject(new AbortError(`request ${method} aborted by caller`));
       };
       opts.signal?.addEventListener("abort", onAbort, { once: true });
@@ -239,19 +259,56 @@ export class ComputerUseClient {
     params: Partial<SessionParams> = {},
     options?: RequestOptions,
   ): Promise<SessionResult> {
-    return this.request<SessionResult>("computer.session", { action, ...params }, options ?? {});
+    const p: Partial<SessionParams> = { action, ...params };
+    // A session start records its creator's identity (ownership). Callers that
+    // do not pin their own identity get this client's.
+    if (action === "start" && !p.client_id) {
+      p.client_id = this.clientInfo.client_id;
+      p.client_name = this.clientInfo.client_name;
+      p.client_instance_id = this.clientInfo.client_instance_id;
+    }
+    return this.request<SessionResult>("computer.session", p, options ?? {});
   }
 
   /**
    * Ensure an active session exists: resolves the current one, or starts a new
    * one. Returns the resulting SessionResult.
+   *
+   * Single-flight: concurrent callers share one resolution, so two simultaneous
+   * observe calls can never start two competing sessions.
    */
-  async ensureSession(displayId?: string, options?: RequestOptions): Promise<SessionResult> {
+  ensureSession(
+    displayId?: string,
+    options?: RequestOptions,
+    clientInfo?: ClientInfo,
+  ): Promise<SessionResult> {
+    if (!this.ensureSessionPromise) {
+      this.ensureSessionPromise = this.ensureSessionInner(displayId, options, clientInfo).finally(
+        () => {
+          this.ensureSessionPromise = null;
+        },
+      );
+    }
+    return this.ensureSessionPromise;
+  }
+
+  private async ensureSessionInner(
+    displayId?: string,
+    options?: RequestOptions,
+    clientInfo?: ClientInfo,
+  ): Promise<SessionResult> {
     try {
       return await this.session("status", {}, options);
     } catch (err) {
       if (err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND") {
-        return this.session("start", { display_id: displayId }, options);
+        return this.session(
+          "start",
+          {
+            display_id: displayId,
+            ...(clientInfo ? { ...clientInfo } : {}),
+          },
+          options,
+        );
       }
       throw err;
     }
@@ -333,6 +390,30 @@ export class ComputerUseClient {
     // include_image response legitimately carries a base64 screenshot.
     if (this.buffer.length > 64 * 1024 * 1024) {
       this.close();
+    }
+  }
+
+  /**
+   * Fire-and-forget `computer.cancel` for a session id found in request
+   * params. Used when a request is aborted locally: the daemon cancels the
+   * in-flight batch so a long wait/stabilizer stops server-side too. The
+   * daemon's late error response for the original request is dropped — the
+   * pending entry is already gone, and responses are matched by id.
+   */
+  private notifyCancel(params: unknown): void {
+    if (!this.socket || this.closed) return;
+    const sid = (params as { session_id?: unknown } | undefined)?.session_id;
+    if (typeof sid !== "string" || !sid) return;
+    const payload = {
+      jsonrpc: "2.0",
+      id: this.nextId++,
+      method: "computer.cancel",
+      params: { session_id: sid },
+    };
+    try {
+      this.socket.write(`${JSON.stringify(payload)}\n`);
+    } catch {
+      // Socket is gone; the daemon side is unreachable either way.
     }
   }
 

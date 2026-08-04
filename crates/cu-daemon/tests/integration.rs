@@ -160,12 +160,18 @@ async fn unknown_method_is_rejected() {
 }
 
 #[tokio::test]
-async fn session_status_without_session_is_rejected() {
-    // Without a session_id and with no active session, status is ambiguous:
-    // the daemon rejects it rather than guessing.
+async fn session_status_without_session_is_session_not_found() {
+    // The first-use contract: `status` with no active session is a *typed*
+    // SESSION_NOT_FOUND (jsonrpc -32009), never INVALID_PARAMS, so adapters
+    // can auto-start on the machine-readable code.
     let d = spawn_daemon().await;
     let err = request(&d.socket, "computer.session", json!({ "action": "status" })).await;
-    assert_eq!(err["code"], json!(-32602), "INVALID_PARAMS");
+    assert_eq!(err["code"], json!(-32009), "SESSION_NOT_FOUND jsonrpc code");
+    assert_eq!(err["data"]["code"], json!("SESSION_NOT_FOUND"));
+    assert_eq!(
+        err["data"]["message"],
+        json!("No active computer-use session exists.")
+    );
     shutdown_daemon(d).await;
 }
 

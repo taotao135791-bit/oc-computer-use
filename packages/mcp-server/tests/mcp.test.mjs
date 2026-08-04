@@ -16,12 +16,23 @@ const DIST_INDEX = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "
 const TINY_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-// --- Fake computer-use daemon ----------------------------------------------
+// --- Fake computer-use daemon (stateful) ------------------------------------
+// Mirrors the real runtime's session machine: no session at boot, `start`
+// creates one (recording the caller's identity as owner), `status` returns it
+// or SESSION_NOT_FOUND, so first-use auto-creation is observable.
+
+const NOT_FOUND_ERROR = {
+  code: -32009,
+  message: "SESSION_NOT_FOUND",
+  data: { code: "SESSION_NOT_FOUND", message: "No active computer-use session exists." },
+};
 
 function startFakeDaemon() {
   const dir = mkdtempSync(join(tmpdir(), "cu-mcp-test-"));
   const socketPath = join(dir, "fake.sock");
   const conns = new Set();
+  const requests = [];
+  const state = { session: null, startCount: 0, startCalls: [] };
   const server = createServer((conn) => {
     conns.add(conn);
     conn.on("close", () => conns.delete(conn));
@@ -34,23 +45,34 @@ function startFakeDaemon() {
         buffer = buffer.slice(nl + 1);
         if (!line) continue;
         const req = JSON.parse(line);
+        requests.push(req);
         const respond = (obj) => conn.write(`${JSON.stringify(obj)}\n`);
         if (req.method === "computer.session") {
           const action = req.params?.action;
-          respond({
-            jsonrpc: "2.0",
-            id: req.id,
-            result: {
-              session_id: action === "start" ? "s_started" : "s_active",
+          if (action === "start") {
+            state.startCount += 1;
+            state.startCalls.push(req.params);
+            state.session = {
+              session_id: "s_started",
               state: "active",
               paused: false,
               user_takeover: false,
               lock_held: true,
               display_id: "1",
               created_at: "2026-08-03T00:00:00Z",
-              started_by: "mcp-test",
-            },
-          });
+              started_by: req.params?.client_name ?? "JSON-RPC client",
+              owner_client_id: req.params?.client_id ?? "jsonrpc",
+              owner_client_name: req.params?.client_name ?? "JSON-RPC client",
+              owner_instance_id: req.params?.client_instance_id ?? "unknown",
+            };
+            respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+          } else if (action === "status") {
+            if (!state.session) respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
+            else respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+          } else {
+            if (!state.session) respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
+            else respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+          }
         } else if (req.method === "computer.observe") {
           respond({
             jsonrpc: "2.0",
@@ -118,7 +140,7 @@ function startFakeDaemon() {
     });
   });
   server.listen(socketPath);
-  return { socketPath, server, dir, conns };
+  return { socketPath, server, dir, conns, requests, state };
 }
 
 const stopFakeDaemon = (fake) => {
@@ -287,6 +309,31 @@ test("computer_observe without include_image still returns the image by default"
   }
 });
 
+test("first computer_observe auto-creates exactly one session with the MCP identity", { timeout: 15000 }, async () => {
+  const fake = startFakeDaemon();
+  const { proc, client } = spawnServer(fake);
+  try {
+    await client.initialize();
+    const result = await client.callTool("computer_observe", { include_image: true });
+    assert.equal(result.isError, undefined);
+    assert.equal(fake.state.startCount, 1, "exactly one session start on first observe");
+    // The start carried the MCP server's identity — the recorded owner.
+    assert.equal(fake.state.startCalls[0].client_id, "mcp-server");
+    assert.equal(fake.state.startCalls[0].client_name, "Computer Use MCP");
+    assert.match(fake.state.startCalls[0].client_instance_id, /^mcp-\d+-[a-z0-9]{6}$/);
+    assert.equal(fake.state.session.owner_client_id, "mcp-server");
+    // The observe ran against the auto-created session.
+    const observeReq = fake.requests.find((r) => r.method === "computer.observe");
+    assert.equal(observeReq.params.session_id, "s_started");
+    // A second observe reuses the session — no second start.
+    await client.callTool("computer_observe", { include_image: true });
+    assert.equal(fake.state.startCount, 1, "no second start for an existing session");
+  } finally {
+    proc.kill();
+    stopFakeDaemon(fake);
+  }
+});
+
 test("computer_act accepts a structured action array (not a JSON string)", { timeout: 15000 }, async () => {
   const fake = startFakeDaemon();
   const { proc, client } = spawnServer(fake);
@@ -346,16 +393,23 @@ test("computer_act validates every action shape with field-level errors", { time
   }
 });
 
-test("computer_session status and start round-trip", { timeout: 15000 }, async () => {
+test("computer_session start then status round-trip", { timeout: 15000 }, async () => {
   const fake = startFakeDaemon();
   const { proc, client } = spawnServer(fake);
   try {
     await client.initialize();
-    const status = await client.callTool("computer_session", { action: "status" });
-    assert.match(status.content[0].text, /session_id: s_active/);
-    assert.match(status.content[0].text, /state: active/);
+    // No session yet: status is a typed SESSION_NOT_FOUND error.
+    const none = await client.callTool("computer_session", { action: "status" });
+    assert.equal(none.isError, true);
+    assert.match(none.content[0].text, /SESSION_NOT_FOUND/);
+    // Start creates the session (with the MCP server as recorded owner).
     const started = await client.callTool("computer_session", { action: "start" });
     assert.match(started.content[0].text, /session_id: s_started/);
+    assert.match(started.content[0].text, /state: active/);
+    assert.equal(fake.state.startCount, 1);
+    // Status now resolves it.
+    const status = await client.callTool("computer_session", { action: "status" });
+    assert.match(status.content[0].text, /session_id: s_started/);
   } finally {
     proc.kill();
     stopFakeDaemon(fake);

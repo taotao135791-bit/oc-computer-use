@@ -23,9 +23,17 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { copyFile, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import {
+  applyEdits,
+  modify,
+  parse,
+  type ModificationOptions,
+  type ParseError,
+} from "jsonc-parser";
 
 import {
   connect,
@@ -56,6 +64,8 @@ export function mcpConfigFragment(): Record<string, unknown> {
  * Build an opencode config object with the computer-use MCP server merged
  * in. Existing keys (other MCP servers, tools, agent config, ...) are kept;
  * an existing `computer-use` entry is replaced with the current fragment.
+ * (For writing real config files use `writeOpenCodeConfig`, which preserves
+ * comments and trailing commas; this object form backs `--print`.)
  */
 export function generateOpenCodeConfig(existing: Record<string, unknown> = {}): Record<string, unknown> {
   const mcp = { ...(typeof existing.mcp === "object" && existing.mcp !== null ? (existing.mcp as Record<string, unknown>) : {}) };
@@ -63,31 +73,74 @@ export function generateOpenCodeConfig(existing: Record<string, unknown> = {}): 
   return { ...existing, mcp };
 }
 
+/** New nodes are inserted with 2-space indentation; the file's own style for
+ * everything else is left untouched. */
+const MODIFY_OPTIONS: ModificationOptions = {
+  formattingOptions: { insertSpaces: true, tabSize: 2 },
+};
+
 /**
- * Write (or merge into) an OpenCode config file. Returns the path written
- * and whether the file existed before.
+ * Merge the computer-use MCP entry into a JSONC config document. Works on
+ * text via jsonc-parser's edit API, so comments, trailing commas and the
+ * surrounding formatting all survive. Only `mcp["computer-use"]` is created
+ * or replaced — other MCP servers, providers, models, plugins, permissions,
+ * agents and tools are never touched.
+ *
+ * Returns the merged text, whether it actually changed, and whether an
+ * entry already existed. Throws on unparseable input (a corrupt config is
+ * never silently rewritten).
+ */
+export function mergeOpenCodeConfigText(
+  configText: string,
+): { text: string; changed: boolean; hadEntry: boolean } {
+  const errors: ParseError[] = [];
+  const root: unknown = parse(configText, errors, {
+    disallowComments: false,
+    allowTrailingComma: true,
+    allowEmptyContent: true,
+  });
+  if (errors.length > 0) {
+    throw new Error(
+      `cannot parse existing config (not valid JSON/JSONC): ${errors.map((e) => e.error).join("; ")}`,
+    );
+  }
+  const mcp = (root as { mcp?: Record<string, unknown> } | undefined)?.mcp;
+  const hadEntry = Boolean(mcp?.["computer-use"]);
+  // jsonc-parser inserts into an empty document as if it were `{}`.
+  const edits = modify(configText || "{}", ["mcp", "computer-use"], mcpConfigFragment(), MODIFY_OPTIONS);
+  const text = applyEdits(configText || "{}", edits);
+  return { text, changed: text !== (configText || "{}"), hadEntry };
+}
+
+/** Backup filename: `<config>.backup-<timestamp>`. */
+function backupTimestamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+/**
+ * Write (or merge into) an OpenCode config file. Comments and trailing
+ * commas in an existing JSONC file survive; only the computer-use MCP entry
+ * is created/updated. The original file is backed up to
+ * `<path>.backup-<timestamp>` before the first actual change (never for a
+ * no-op or a brand-new file).
  */
 export async function writeOpenCodeConfig(
   path: string,
-  existing?: Record<string, unknown>,
-): Promise<{ path: string; existed: boolean; merged: boolean }> {
+): Promise<{ path: string; existed: boolean; merged: boolean; changed: boolean; backup: string | null }> {
   const existed = existsSync(path);
-  let base: Record<string, unknown>;
-  if (existing) {
-    base = existing;
-  } else if (existed) {
-    try {
-      base = JSON.parse(await readFile(path, "utf8"));
-    } catch {
-      throw new Error(`cannot parse existing config at ${path}`);
-    }
-  } else {
-    base = {};
+  const original = existed ? await readFile(path, "utf8") : "";
+  const { text, changed, hadEntry } = mergeOpenCodeConfigText(original);
+  if (!changed) {
+    // Nothing to do — in particular, no backup for a no-op write.
+    return { path, existed, merged: hadEntry, changed: false, backup: null };
   }
-  const hadEntry = Boolean((base.mcp as Record<string, unknown> | undefined)?.["computer-use"]);
-  const config = generateOpenCodeConfig(base);
-  await writeFile(path, `${JSON.stringify(config, null, 2)}\n`);
-  return { path, existed, merged: hadEntry };
+  let backup: string | null = null;
+  if (existed) {
+    backup = `${path}.backup-${backupTimestamp()}`;
+    await copyFile(path, backup);
+  }
+  await writeFile(path, text);
+  return { path, existed, merged: hadEntry, changed: true, backup };
 }
 
 // ---------------------------------------------------------------------------

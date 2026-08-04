@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use chrono::Utc;
 use cu_core::{
-    ActParams, ActResult, CoordinateSpace, CuError, ErrorCode, ImageGeometry, InspectMapping,
-    InspectParams, InspectResult, ObserveParams, ObserveResult, Region, ScreenFrame,
-    ScreenSnapshot, SessionAction, SessionResult, SessionState, StabilizationInfo, TraceReport,
-    WaitPolicy,
+    ActParams, ActResult, ClientInfo, CoordinateSpace, CuError, ErrorCode, ImageGeometry,
+    InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult, Region,
+    ScreenFrame, ScreenSnapshot, SessionAction, SessionResult, SessionState, StabilizationInfo,
+    TraceReport, WaitPolicy,
 };
 use cu_driver::{
     ApplicationInfo, CaptureRequest, ComputerDriver, DesktopLayout, DisplayInfo, PermissionStatus,
@@ -189,7 +189,7 @@ impl Runtime {
     pub async fn session_start(
         &self,
         display_id: Option<String>,
-        started_by: String,
+        client: ClientInfo,
     ) -> Result<SessionResult, CuError> {
         let id = format!("s_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
         let display_id = match display_id {
@@ -226,7 +226,8 @@ impl Runtime {
         let session = SharedSession::new(Session::new(
             id.clone(),
             display_id,
-            started_by.clone(),
+            client.client_name.clone(),
+            Some(client),
             trace,
         ));
 
@@ -247,7 +248,13 @@ impl Runtime {
             let _ = t
                 .record_event(
                     "session.start",
-                    serde_json::json!({ "display_id": session.display_id, "started_by": started_by }),
+                    serde_json::json!({
+                        "display_id": session.display_id,
+                        "started_by": session.started_by,
+                        "client_id": session.owner.as_ref().map(|c| c.client_id.clone()),
+                        "client_name": session.owner.as_ref().map(|c| c.client_name.clone()),
+                        "client_instance_id": session.owner.as_ref().map(|c| c.client_instance_id.clone()),
+                    }),
                 )
                 .await;
         }
@@ -355,15 +362,18 @@ impl Runtime {
         action: SessionAction,
         session_id: Option<&str>,
         display_id: Option<String>,
-        started_by: String,
+        client: ClientInfo,
     ) -> Result<SessionResult, CuError> {
         match action {
-            SessionAction::Start => self.session_start(display_id, started_by).await,
+            SessionAction::Start => self.session_start(display_id, client).await,
             SessionAction::Status => match session_id {
                 Some(id) => self.session_status(id).await,
                 None => {
+                    // No active session is a *typed* error, not a malformed
+                    // request: adapters auto-start on SESSION_NOT_FOUND and
+                    // must not have to sniff an INVALID_PARAMS message.
                     let holder = self.active_session_id().ok_or_else(|| {
-                        CuError::InvalidParams("no active session; start one first".into())
+                        CuError::SessionNotFound("No active computer-use session exists.".into())
                     })?;
                     self.session_status(&holder).await
                 }
@@ -664,9 +674,23 @@ impl Runtime {
         match batch.wait_policy {
             WaitPolicy::None => {}
             WaitPolicy::Fixed => {
+                // Cancellation-aware: a cancel/stop during the fixed wait stops
+                // it at the next tick instead of sleeping it out.
                 let ms = batch.fixed_wait_ms.unwrap_or(0);
                 if ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    let deadline = Instant::now() + Duration::from_millis(ms);
+                    while Instant::now() < deadline {
+                        if token.is_cancelled() {
+                            return Err(CuError::Cancelled);
+                        }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        tokio::select! {
+                            () = token.cancelled() => {
+                                return Err(CuError::Cancelled);
+                            }
+                            () = tokio::time::sleep(remaining.min(Duration::from_millis(50))) => {}
+                        }
+                    }
                 }
             }
             WaitPolicy::UntilStable => {
@@ -855,7 +879,7 @@ impl Runtime {
             .unwrap()
             .get(id)
             .cloned()
-            .ok_or_else(|| CuError::SessionNotFound(id.to_string()))
+            .ok_or_else(|| CuError::SessionNotFound(format!("session not found: {id}")))
     }
 
     fn gate_active(&self, session: &Session) -> Result<(), CuError> {
@@ -886,6 +910,9 @@ impl Runtime {
                 .as_ref()
                 .map(|t| t.path().to_string_lossy().into_owned()),
             started_by: session.started_by.clone(),
+            owner_client_id: session.owner.as_ref().map(|c| c.client_id.clone()),
+            owner_client_name: session.owner.as_ref().map(|c| c.client_name.clone()),
+            owner_instance_id: session.owner.as_ref().map(|c| c.client_instance_id.clone()),
             message: None,
         }
     }
@@ -902,6 +929,15 @@ mod tests {
     use super::*;
     use cu_core::{ComputerAction, Point};
     use std::sync::Arc;
+
+    /// Identity used by tests when starting sessions.
+    fn test_client() -> ClientInfo {
+        ClientInfo {
+            client_id: "test".into(),
+            client_name: "Test client".into(),
+            client_instance_id: "test-1".into(),
+        }
+    }
 
     /// A deterministic in-memory driver that lets us exercise every gate
     /// without a real display. `Wait` actions actually sleep (so in-flight
@@ -1046,12 +1082,12 @@ mod tests {
     #[tokio::test]
     async fn session_lifecycle_and_lock() {
         let rt = runtime().await;
-        let started = rt.session_start(None, "test".into()).await.unwrap();
+        let started = rt.session_start(None, test_client()).await.unwrap();
         assert_eq!(started.state, SessionState::Active);
         assert!(started.lock_held);
 
         // A second session must be rejected by the control lock.
-        let err = rt.session_start(None, "test".into()).await.unwrap_err();
+        let err = rt.session_start(None, test_client()).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ControlLocked);
 
         // Pause gates act.
@@ -1078,6 +1114,40 @@ mod tests {
         assert!(!status.lock_held);
     }
 
+    /// The first-use contract: `session status` with no active session is a
+    /// typed SESSION_NOT_FOUND (never INVALID_PARAMS), so adapters can
+    /// auto-start without sniffing error strings.
+    #[tokio::test]
+    async fn status_without_session_returns_session_not_found() {
+        let rt = runtime().await;
+        let err = rt
+            .session(SessionAction::Status, None, None, test_client())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SessionNotFound);
+        assert_eq!(err.to_string(), "No active computer-use session exists.");
+        let data = err.to_error_data();
+        assert_eq!(data["code"], "SESSION_NOT_FOUND");
+    }
+
+    /// The session records who started it, and the owner is reported back —
+    /// ownership lets a client decide whether it may stop a session it found
+    /// (never) versus one it created (yes).
+    #[tokio::test]
+    async fn session_records_owner_identity() {
+        let rt = runtime().await;
+        let started = rt.session_start(None, test_client()).await.unwrap();
+        assert_eq!(started.owner_client_id.as_deref(), Some("test"));
+        assert_eq!(started.owner_client_name.as_deref(), Some("Test client"));
+        assert_eq!(started.owner_instance_id.as_deref(), Some("test-1"));
+        assert_eq!(started.started_by, "Test client");
+
+        // A second client starting (or querying) sees the same owner — it
+        // never becomes the owner by observing.
+        let status = rt.session_status(&started.session_id).await.unwrap();
+        assert_eq!(status.owner_client_id.as_deref(), Some("test"));
+    }
+
     fn wait_params(session_id: &str, frame_id: &str) -> ActParams {
         ActParams {
             session_id: session_id.into(),
@@ -1099,7 +1169,7 @@ mod tests {
     #[tokio::test]
     async fn takeover_cannot_be_bypassed_by_resume() {
         let rt = runtime().await;
-        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let s = rt.session_start(None, test_client()).await.unwrap();
         let sid = s.session_id.clone();
 
         // 1. Pause → act rejected.
@@ -1170,7 +1240,7 @@ mod tests {
     #[tokio::test]
     async fn takeover_cancels_in_flight_actions() {
         let (rt, fake) = runtime_with_driver().await;
-        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let s = rt.session_start(None, test_client()).await.unwrap();
         let sid = s.session_id.clone();
         let obs = rt
             .observe(
@@ -1187,7 +1257,14 @@ mod tests {
             session_id: sid.clone(),
             frame_id: obs.frame_id.clone(),
             actions: vec![
-                ComputerAction::Wait { duration_ms: 200 },
+                // The first action completes before the takeover: it must be
+                // reported as done. The waits are what the takeover interrupts.
+                ComputerAction::Move {
+                    x: 400.0,
+                    y: 400.0,
+                    coordinate_space: cu_core::CoordinateSpace::Normalized1000,
+                    duration_ms: None,
+                },
                 ComputerAction::Wait { duration_ms: 200 },
                 ComputerAction::Wait { duration_ms: 200 },
             ],
@@ -1234,7 +1311,7 @@ mod tests {
     #[tokio::test]
     async fn act_rejects_unknown_frame_and_stale() {
         let rt = runtime().await;
-        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let s = rt.session_start(None, test_client()).await.unwrap();
         let params = |frame: &str| ActParams {
             session_id: s.session_id.clone(),
             frame_id: frame.into(),
@@ -1280,7 +1357,7 @@ mod tests {
         // Default policy is Strict: only the session's current frame is
         // actionable, even when the older frame's pixels still match.
         let rt = runtime().await;
-        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let s = rt.session_start(None, test_client()).await.unwrap();
         let obs1 = rt
             .observe(
                 ObserveParams {
@@ -1321,7 +1398,7 @@ mod tests {
         let mut cfg = test_config();
         cfg.stale.policy = crate::stale_frame::StaleFramePolicy::VisualMatch;
         let rt = runtime_with_config(cfg).await;
-        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let s = rt.session_start(None, test_client()).await.unwrap();
         let obs1 = rt
             .observe(
                 ObserveParams {
@@ -1362,7 +1439,7 @@ mod tests {
         cfg.trace_mode = cu_trace::TraceMode::Required;
         cfg.traces_dir = file.clone();
         let rt = runtime_with_config(cfg).await;
-        let err = rt.session_start(None, "test".into()).await.unwrap_err();
+        let err = rt.session_start(None, test_client()).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::TraceError);
         std::fs::remove_file(&file).unwrap();
     }
@@ -1371,7 +1448,7 @@ mod tests {
     async fn act_reports_trace_mode_and_degradation() {
         // Best-effort (default): act carries a trace report, mode best_effort.
         let rt = runtime().await;
-        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let s = rt.session_start(None, test_client()).await.unwrap();
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1396,7 +1473,7 @@ mod tests {
         let mut cfg = test_config();
         cfg.trace_mode = cu_trace::TraceMode::Disabled;
         let rt2 = runtime_with_config(cfg).await;
-        let s2 = rt2.session_start(None, "test".into()).await.unwrap();
+        let s2 = rt2.session_start(None, test_client()).await.unwrap();
         let obs2 = rt2
             .observe(
                 ObserveParams {
@@ -1418,7 +1495,7 @@ mod tests {
     #[tokio::test]
     async fn act_out_of_bounds_rejected() {
         let rt = runtime().await;
-        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let s = rt.session_start(None, test_client()).await.unwrap();
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1453,7 +1530,7 @@ mod tests {
     #[tokio::test]
     async fn confirmation_required_is_enforced() {
         let rt = runtime().await;
-        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let s = rt.session_start(None, test_client()).await.unwrap();
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1488,7 +1565,7 @@ mod tests {
     #[tokio::test]
     async fn inspect_crops_and_maps() {
         let rt = runtime().await;
-        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let s = rt.session_start(None, test_client()).await.unwrap();
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1519,5 +1596,187 @@ mod tests {
         assert!(!res.image_base64.is_empty());
         assert_eq!(res.mapping.source_image_rect.x, 0.0);
         rt.session_stop(&s.session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_a_long_wait_fast_with_per_action_reports() {
+        // The full cancel chain (SDK abort → computer.cancel → batch token):
+        // a 10s wait action inside a batch must stop within ~1s of the cancel,
+        // and the report marks the interrupted wait (and everything after it)
+        // `cancelled` — not `failed`, and not an internal error.
+        let (rt, _driver) = runtime_with_driver().await;
+        let s = rt.session_start(None, test_client()).await.unwrap();
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let sid = s.session_id.clone();
+        let frame = obs.frame_id.clone();
+        let rt2 = rt.clone();
+        let handle = tokio::spawn(async move {
+            rt2.act(
+                ActParams {
+                    session_id: sid,
+                    frame_id: frame,
+                    actions: vec![
+                        ComputerAction::Move {
+                            x: 100.0,
+                            y: 100.0,
+                            coordinate_space: CoordinateSpace::Normalized1000,
+                            duration_ms: None,
+                        },
+                        ComputerAction::Wait {
+                            duration_ms: 10_000,
+                        },
+                        ComputerAction::Key {
+                            keys: vec!["return".into()],
+                        },
+                    ],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                },
+                None,
+            )
+            .await
+        });
+        // Let the first action run and the wait begin, then cancel.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        rt.cancel_in_flight(&s.session_id).unwrap();
+        let started = Instant::now();
+        let res = handle.await.unwrap().unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel must stop the 10s wait fast, took {elapsed:?}"
+        );
+        assert!(res.executed);
+        assert_eq!(res.action_results.len(), 3);
+        assert_eq!(res.action_results[0].status, "success");
+        assert_eq!(res.action_results[1].status, "cancelled");
+        assert_eq!(res.action_results[2].status, "cancelled");
+        assert!(
+            res.action_results[1].error.is_none(),
+            "cancelled is not an error"
+        );
+        rt.session_stop(&s.session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_a_fixed_wait_fast_as_an_explicit_cancellation() {
+        // wait_policy=fixed with a long duration must also stop quickly on
+        // cancel, surfacing CANCELLED (not ACTION_TIMEOUT / internal error).
+        let (rt, _driver) = runtime_with_driver().await;
+        let s = rt.session_start(None, test_client()).await.unwrap();
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let sid = s.session_id.clone();
+        let frame = obs.frame_id.clone();
+        let rt2 = rt.clone();
+        let handle = tokio::spawn(async move {
+            rt2.act(
+                ActParams {
+                    session_id: sid,
+                    frame_id: frame,
+                    actions: vec![ComputerAction::Move {
+                        x: 50.0,
+                        y: 50.0,
+                        coordinate_space: CoordinateSpace::Normalized1000,
+                        duration_ms: None,
+                    }],
+                    wait_policy: Some(WaitPolicy::Fixed),
+                    fixed_wait_ms: Some(60_000),
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                },
+                None,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        rt.cancel_in_flight(&s.session_id).unwrap();
+        let started = Instant::now();
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancel must stop the 60s fixed wait fast, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.code(), ErrorCode::Cancelled);
+        rt.session_stop(&s.session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_during_until_stable_returns_immediately() {
+        // The stabilizer's own cancellation: stopping the session mid
+        // until_stable must abort the wait (session.stop cancels the batch
+        // token). The act call errors with CANCELLED rather than hanging.
+        let (rt, _driver) = runtime_with_driver().await;
+        let s = rt.session_start(None, test_client()).await.unwrap();
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let sid = s.session_id.clone();
+        let frame = obs.frame_id.clone();
+        let rt2 = rt.clone();
+        let handle = tokio::spawn(async move {
+            rt2.act(
+                ActParams {
+                    session_id: sid,
+                    frame_id: frame,
+                    actions: vec![ComputerAction::Move {
+                        x: 80.0,
+                        y: 80.0,
+                        coordinate_space: CoordinateSpace::Normalized1000,
+                        duration_ms: None,
+                    }],
+                    wait_policy: Some(WaitPolicy::UntilStable),
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                },
+                None,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Stopping the session cancels its in-flight batch token.
+        rt.session_stop(&s.session_id).await.unwrap();
+        let started = Instant::now();
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stop must abort until_stable fast, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.code(), ErrorCode::Cancelled);
     }
 }

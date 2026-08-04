@@ -14,7 +14,7 @@ as an OpenCode plugin — MCP is the single supported wiring.
 
 | Command | What it does |
 |---|---|
-| `cu-opencode setup` | adds the computer-use MCP server to `~/.config/opencode/opencode.json` (merges with existing config) |
+| `cu-opencode setup` | adds the computer-use MCP server to `~/.config/opencode/opencode.json` (JSONC-aware merge, see below) |
 | `cu-opencode setup --print` | prints the config fragment to stdout |
 | `cu-opencode status` | daemon health (version, permissions, active sessions) + current session state |
 | `cu-opencode session cleanup` | stops the active session (idempotent) |
@@ -23,6 +23,26 @@ as an OpenCode plugin — MCP is the single supported wiring.
 
 Also ships `config/opencode.config.json` — a ready-to-copy config with the
 MCP entry.
+
+## JSONC-aware config writes
+
+OpenCode's config is JSONC — comments and trailing commas are legal and
+commonly present. `cu-opencode setup` therefore:
+
+- parses and edits with **`jsonc-parser`'s edit API** (never
+  parse→modify→stringify, which would drop comments);
+- **only touches the `mcp.computer-use` entry** — every other key
+  (`$schema`, `model`, `provider`, `permission`, plugins, other MCP
+  servers…) is left byte-for-byte untouched, comments and trailing commas
+  included;
+- writes a backup `opencode.json.backup-<timestamp>` **only when the file
+  actually changes** (an up-to-date config produces no backup and a
+  "config already up to date" message);
+- is idempotent — repeated runs converge.
+
+Covered by 20 tests, including plain JSON, line/block comments, trailing
+commas, pre-existing MCP entries, corrupt configs (never overwritten), and
+idempotency.
 
 ## Install
 
@@ -69,9 +89,16 @@ Equivalent hand-written config (`config/opencode.config.json` in this repo):
 ```
 
 Restart OpenCode after changing the config. The MCP server registers the
-four tools — `computer_session`, `computer_observe`, `computer_act`,
-`computer_inspect` — with structured zod schemas (actions are a
-discriminated union, `region` is an object; no JSON-string-inside-JSON).
+tools — `computer_session`, `computer_observe`, `computer_act`,
+`computer_inspect`, `computer_cancel`, `trace_list`, `trace_get` — with
+structured zod schemas (actions are a discriminated union, `region` is an
+object; no JSON-string-inside-JSON).
+
+**Session ownership.** The session started by OpenCode's first tool call is
+owned by the MCP server (`mcp-server` / "Computer Use MCP"); OpenCode is the
+only client that stops it. A Pi extension or other client attempting to use
+that session gets `CONTROL_LOCKED` by default and will not stop it — see
+[packages/pi-extension](../pi-extension/README.md).
 
 ## Smoke test (OpenCode)
 
@@ -81,10 +108,14 @@ cu-opencode status            # daemon ready, no session
 opencode                      # start an agent session
 ```
 
+The steps below need a working model provider in OpenCode (the MCP wiring
+itself does not — see the acceptance script below for the model-free path).
+
 1. Ask: "use computer_session to start a session" → expect the session state
    and a `session_id`.
 2. Ask: "use computer_observe to look at the screen" → expect a real
-   screenshot image (not a path or a file download).
+   screenshot image (not a path or a file download). The first observe
+   auto-creates the session.
 3. Ask: "use computer_act to move the mouse to (500, 500) normalized" →
    expect success with a post-batch screenshot.
 4. Ask: "use computer_inspect on region (0,0,200,200)" → expect a cropped
@@ -96,6 +127,13 @@ opencode                      # start an agent session
    fails with `SESSION_NOT_FOUND` (clean, not stale).
 7. Quit OpenCode → `cu-opencode status` shows no session.
 
+**Model-free acceptance:** `node scripts/opencode-mcp-acceptance.mjs` (repo
+root) drives the same `computer-use-mcp` binary OpenCode launches, speaking
+MCP over stdio against the real daemon and screen — 17 checks, no model
+needed. Steps above that depend on a model are marked NOT VERIFIED when the
+provider plan is unavailable (see [docs/acceptance-manual.md](../../docs/acceptance-manual.md)
+for the round-2 record).
+
 ## Library use
 
 All functionality is exported from `dist/index.js` as plain async functions
@@ -106,5 +144,6 @@ scripts and tests can drive it without spawning the CLI.
 ## Tests
 
 ```bash
-pnpm test   # 10 tests (fake daemon)
+pnpm test   # 20 tests: JSONC merge scenarios (comments, trailing commas,
+            # pre-existing entries, corrupt config, idempotency) + fake-daemon wiring
 ```

@@ -92,10 +92,21 @@ export function createComputerUseServer(client?: ComputerUseClient): McpServer {
 
   let lazyClient: ComputerUseClient | undefined = client;
 
+  /**
+   * Identity this server reports when it starts a session. The daemon records
+   * it on the session as the owner — the only client allowed to stop it.
+   */
+  const MCP_CLIENT_INFO = {
+    client_id: "mcp-server",
+    client_name: "Computer Use MCP",
+    client_instance_id: `mcp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`,
+  };
+
   async function getClient(): Promise<ComputerUseClient> {
     if (lazyClient) return lazyClient;
     lazyClient = await connect({
       socketPath: process.env.COMPUTER_USE_SOCKET,
+      clientInfo: MCP_CLIENT_INFO,
     });
     return lazyClient;
   }
@@ -448,7 +459,7 @@ export function createComputerUseServer(client?: ComputerUseClient): McpServer {
 }
 
 /** Entry point: run on stdio until the parent closes the pipe. */
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const server = createComputerUseServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);

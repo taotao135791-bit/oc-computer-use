@@ -18,11 +18,42 @@ import {
 } from "../dist/index.js";
 
 // --- Fake daemon -----------------------------------------------------------
+//
+// The fake daemon maintains real session state — the same shape as the real
+// runtime: no session initially, `start` creates one (recording the caller's
+// client identity), `status` reports it or SESSION_NOT_FOUND, `stop` removes
+// it, and pause/resume/takeover/release mutate the state. This is what makes
+// the first-use path (status → SESSION_NOT_FOUND → start) testable at all: a
+// fake that always answers "there is an active session" would mask it.
 
-function startFakeDaemon({ outOfOrder = false } = {}) {
+function mkSession(id, over = {}) {
+  return {
+    session_id: id,
+    state: "active",
+    paused: false,
+    user_takeover: false,
+    lock_held: true,
+    display_id: "1",
+    created_at: "2026-08-03T00:00:00Z",
+    started_by: "fake",
+    ...over,
+  };
+}
+
+const NOT_FOUND_ERROR = {
+  code: -32009,
+  message: "SESSION_NOT_FOUND",
+  data: { code: "SESSION_NOT_FOUND", message: "No active computer-use session exists." },
+};
+
+function startFakeDaemon({ outOfOrder = false, statusError = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "cu-sdk-test-"));
   const socketPath = join(dir, "fake.sock");
   const conns = new Set();
+  // Stateful session store: { session, startCount, startCalls }; every
+  // received request is recorded so cancel notifications are observable.
+  const state = { session: null, startCount: 0, startCalls: [] };
+  const requests = [];
   const server = createServer((conn) => {
     conns.add(conn);
     conn.on("close", () => conns.delete(conn));
@@ -35,6 +66,7 @@ function startFakeDaemon({ outOfOrder = false } = {}) {
         buffer = buffer.slice(nl + 1);
         if (!line) continue;
         const req = JSON.parse(line);
+        requests.push(req);
         const respond = (obj) => conn.write(`${JSON.stringify(obj)}\n`);
         if (outOfOrder) {
           // Reply after a delay so responses land out of order relative to ids.
@@ -50,7 +82,7 @@ function startFakeDaemon({ outOfOrder = false } = {}) {
         } else if (req.method === "paused") {
           respond({ jsonrpc: "2.0", id: req.id, error: { code: -32005, message: "PAUSED", data: { code: "PAUSED", message: "session paused" } } });
         } else if (req.method === "not_found") {
-          respond({ jsonrpc: "2.0", id: req.id, error: { code: -32009, message: "SESSION_NOT_FOUND", data: { code: "SESSION_NOT_FOUND", message: "no active session" } } });
+          respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
         } else if (req.method === "takeover_active") {
           respond({ jsonrpc: "2.0", id: req.id, error: { code: -32016, message: "USER_TAKEOVER_ACTIVE", data: { code: "USER_TAKEOVER_ACTIVE", message: "The user has taken control. Call release before resuming agent control." } } });
         } else if (req.method === "timeout") {
@@ -76,12 +108,47 @@ function startFakeDaemon({ outOfOrder = false } = {}) {
         } else if (req.method === "computer.session") {
           const action = req.params?.action;
           if (action === "start") {
-            respond({ jsonrpc: "2.0", id: req.id, result: { session_id: req.params?.session_id ?? "s9", state: "active", paused: false, user_takeover: false, lock_held: true, display_id: "1", created_at: "2026-08-03T00:00:00Z", started_by: "test" } });
+            state.startCount += 1;
+            state.startCalls.push(req.params);
+            const id = `s${state.startCount}`;
+            state.session = mkSession(id, {
+              started_by: req.params?.client_name ?? "fake",
+              owner_client_id: req.params?.client_id ?? "fake",
+              owner_client_name: req.params?.client_name,
+              owner_instance_id: req.params?.client_instance_id,
+            });
+            respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+          } else if (action === "status") {
+            if (statusError) {
+              respond({ jsonrpc: "2.0", id: req.id, error: statusError });
+            } else if (!state.session) {
+              respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
+            } else {
+              respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+            }
+          } else if (action === "stop") {
+            if (!state.session) {
+              respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
+            } else {
+              const stopped = { ...state.session, state: "stopped", paused: false, user_takeover: false, lock_held: false };
+              state.session = null;
+              respond({ jsonrpc: "2.0", id: req.id, result: stopped });
+            }
           } else {
-            respond({ jsonrpc: "2.0", id: req.id, result: { session_id: "s1", state: "active", paused: false, user_takeover: false, lock_held: true, display_id: "1", created_at: "2026-08-03T00:00:00Z", started_by: "test" } });
+            // pause / resume / takeover / release mutate the stored session.
+            if (!state.session) {
+              respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
+            } else {
+              const s = state.session;
+              if (action === "pause") state.session = { ...s, state: "paused", paused: true };
+              if (action === "resume") state.session = { ...s, state: "active", paused: false };
+              if (action === "takeover") state.session = { ...s, state: "user_takeover", user_takeover: true, paused: false };
+              if (action === "release") state.session = { ...s, state: "active", user_takeover: false };
+              respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+            }
           }
         } else if (req.method === "runtime.health") {
-          respond({ jsonrpc: "2.0", id: req.id, result: { version: "0.1.0", ready: true, permissions: { screen_recording: true, accessibility: true }, active_sessions: 1, uptime_secs: 5, frame_cache: 2 } });
+          respond({ jsonrpc: "2.0", id: req.id, result: { version: "0.1.0", ready: true, permissions: { screen_recording: true, accessibility: true }, active_sessions: state.session ? 1 : 0, uptime_secs: 5, frame_cache: 2 } });
         } else {
           respond({ jsonrpc: "2.0", id: req.id, result: null });
         }
@@ -90,7 +157,7 @@ function startFakeDaemon({ outOfOrder = false } = {}) {
   });
   const fakeResult = (req, id) => ({ jsonrpc: "2.0", id, result: { echo: req.method, id } });
   server.listen(socketPath);
-  return { socketPath, server, dir, conns };
+  return { socketPath, server, dir, conns, state, requests };
 }
 
 const stopFakeDaemon = (fake) => {
@@ -193,6 +260,29 @@ test("a pre-aborted signal rejects immediately", async () => {
   }
 });
 
+test("aborting an in-flight request notifies the daemon with computer.cancel", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 20);
+    const err = await client.request("hang", { session_id: "s1" }, { signal: ac.signal }).catch((e) => e);
+    assert.ok(err instanceof AbortError);
+    // The full cancel chain: the daemon must receive a fire-and-forget
+    // computer.cancel for the session so the server-side batch stops too.
+    await new Promise((r) => setTimeout(r, 50));
+    const cancelReq = fake.requests.find((r) => r.method === "computer.cancel");
+    assert.ok(cancelReq, "expected a computer.cancel notify after abort");
+    assert.equal(cancelReq.params.session_id, "s1");
+    // The client stays usable after the abort.
+    const echoed = await client.request("echo", { ok: true });
+    assert.deepEqual(echoed.echoed, { ok: true });
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
 test("request timeout rejects with TransportError", async () => {
   const fake = startFakeDaemon();
   const client = await connect({ socketPath: fake.socketPath });
@@ -217,12 +307,16 @@ test("connect to a missing socket rejects with TransportError", async () => {
   }
 });
 
-test("ensureSession resolves the active session", async () => {
+test("ensureSession resolves the active session without starting another", async () => {
   const fake = startFakeDaemon();
   const client = await connect({ socketPath: fake.socketPath });
   try {
+    const created = await client.session("start");
+    assert.equal(fake.state.startCount, 1);
     const s = await client.ensureSession();
-    assert.equal(s.session_id, "s1");
+    assert.equal(s.session_id, created.session_id);
+    // The existing session is reused; no second start happened.
+    assert.equal(fake.state.startCount, 1);
     assert.equal(s.state, "active");
   } finally {
     client.close();
@@ -230,26 +324,58 @@ test("ensureSession resolves the active session", async () => {
   }
 });
 
-test("ensureSession starts one when none exists", async () => {
+test("ensureSession auto-starts when the daemon has no active session", async () => {
   const fake = startFakeDaemon();
   const client = await connect({ socketPath: fake.socketPath });
   try {
-    // First call (status) reports no active session; the retry (start)
-    // delegates to the real transport.
-    const realRequest = client.request.bind(client);
-    let calls = 0;
-    client.request = (method, params) => {
-      calls += 1;
-      if (calls === 1) {
-        return Promise.reject(
-          new ComputerUseError(-32009, "SESSION_NOT_FOUND", { code: "SESSION_NOT_FOUND", message: "no active session" }),
-        );
-      }
-      return realRequest(method, params);
-    };
-    const started = await client.ensureSession();
-    assert.equal(started.session_id, "s9");
-    assert.equal(calls, 2);
+    // Daemon starts with no session (stateful fake).
+    const s = await client.ensureSession();
+    assert.equal(s.session_id, "s1");
+    assert.equal(s.state, "active");
+    // Exactly one start request happened, carrying this client's identity.
+    assert.equal(fake.state.startCount, 1);
+    assert.equal(fake.state.startCalls[0].client_id, "sdk");
+    assert.equal(fake.state.startCalls[0].client_name, "TypeScript SDK");
+    assert.ok(fake.state.startCalls[0].client_instance_id);
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("concurrent ensureSession calls start exactly one session", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const [a, b, c] = await Promise.all([
+      client.ensureSession(),
+      client.ensureSession(),
+      client.ensureSession(),
+    ]);
+    assert.equal(fake.state.startCount, 1, "single-flight: one start for three callers");
+    assert.equal(a.session_id, "s1");
+    assert.equal(b.session_id, a.session_id);
+    assert.equal(c.session_id, a.session_id);
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("ensureSession rethrows non-SESSION_NOT_FOUND errors without starting", async () => {
+  const fake = startFakeDaemon({
+    statusError: {
+      code: -32002,
+      message: "PERMISSION",
+      data: { code: "PERMISSION", message: "screen recording permission missing" },
+    },
+  });
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const err = await client.ensureSession().catch((e) => e);
+    assert.ok(err instanceof ComputerUseError);
+    assert.equal(err.code, "PERMISSION");
+    assert.equal(fake.state.startCount, 0, "a permission failure must not trigger start");
   } finally {
     client.close();
     stopFakeDaemon(fake);
@@ -351,10 +477,37 @@ test("convenience wrappers pass params through", async () => {
     const health = await client.health();
     assert.equal(health.ready, true);
     assert.equal(health.permissions.screen_recording, true);
+    assert.equal(health.active_sessions, 0, "stateful daemon starts without a session");
+    const started = await client.session("start");
+    assert.equal(started.session_id, "s1");
+    assert.equal(started.owner_client_id, "sdk");
     const status = await client.session("status");
     assert.equal(status.state, "active");
-    const started = await client.session("start", { session_id: "s9" });
-    assert.equal(started.session_id, "s9");
+    assert.equal(status.session_id, started.session_id);
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("session lifecycle actions mutate state on the stateful fake", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const started = await client.session("start");
+    assert.equal(started.state, "active");
+    const paused = await client.session("pause", { session_id: started.session_id });
+    assert.equal(paused.paused, true);
+    const resumed = await client.session("resume", { session_id: started.session_id });
+    assert.equal(resumed.paused, false);
+    const takeover = await client.session("takeover", { session_id: started.session_id });
+    assert.equal(takeover.user_takeover, true);
+    const released = await client.session("release", { session_id: started.session_id });
+    assert.equal(released.user_takeover, false);
+    await client.session("stop", { session_id: started.session_id });
+    const notFound = await client.session("status").catch((e) => e);
+    assert.ok(notFound instanceof ComputerUseError);
+    assert.equal(notFound.code, "SESSION_NOT_FOUND");
   } finally {
     client.close();
     stopFakeDaemon(fake);

@@ -52,17 +52,17 @@ referenced `frame_id` itself is checked (`COMPUTER_USE_STALE_POLICY`):
 | -32602 | `INVALID_PARAMS` | missing/wrong params (e.g. observe without `session_id`) |
 | -32000 | `INTERNAL` | internal failure |
 | -32003 | `STALE_FRAME` | acted on a stale/out-of-date frame |
+| -32004 | `CONTROL_LOCKED` | session already active and owned by another client (or control lock held elsewhere) |
 | -32005 | `PAUSED` | session is paused |
 | -32006 | `USER_TAKEOVER` | user is driving the machine |
-| -32009 | `SESSION_NOT_FOUND` | unknown session id |
+| -32009 | `SESSION_NOT_FOUND` | no active session (status with no session → `"No active computer-use session exists."`) |
 | -32010 | `INVALID_SESSION_STATE` | session already stopped, or transition invalid |
+| -32012 | `CANCELLED` | action cancelled (computer.cancel / abort) |
 | -32015 | `UNSUPPORTED` | feature not supported (e.g. on this macOS) |
 | -32016 | `USER_TAKEOVER_ACTIVE` | `resume` while the user holds control — call `release` first |
 | -32017 | `ACTION_TIMEOUT` | request exceeded the daemon deadline (batch still running) |
 | -32018 | `CAPTURE_FAILED` | screen capture failed (driver/capture failure) |
 | — | `OUT_OF_BOUNDS` | coordinate outside the display |
-| — | `CONTROL_LOCKED` | control lock held elsewhere |
-| — | `CANCELLED` | action cancelled (computer.cancel) |
 | — | `DRIVER_ERROR` | bridge/driver failure (e.g. Screen Recording permission missing) |
 | — | `PERMISSION` | macOS permission missing |
 | — | `CONFIRMATION_REQUIRED` | confirmation gating enabled |
@@ -106,10 +106,37 @@ daemon runs with `COMPUTER_USE_TRACE_DEV_MODE=1`.
 
 Actions: `start`, `status`, `pause`, `resume`, `takeover`, `release`, `stop`.
 Result: `{session_id, state, paused, user_takeover, lock_held, display_id,
-created_at, last_action_at, current_frame_id, trace_dir}`.
+created_at, last_action_at, current_frame_id, trace_dir, owner_client_id,
+owner_client_name, owner_instance_id}`.
+
+#### Session behavior
+
+- **Auto-create on first use.** Clients that expect a session (SDK
+  `ensureSession`, CLI, MCP, Pi extension) resolve the active session with
+  `status` first and start one **only** when `status` fails with
+  `SESSION_NOT_FOUND` — other errors are rethrown, never masked. The resolve
+  is single-flight, so concurrent first calls start exactly one session.
+- **Ownership.** `start` takes optional identity params
+  `{client_id, client_name, client_instance_id}`; the daemon records them on
+  the session and returns them on every `session_result` (`owner_*` fields).
+  A session is meant to be stopped by the client that created it: clients
+  track ownership locally (e.g. the Pi extension stops a session only when it
+  started it, and refuses a foreign session with `CONTROL_LOCKED` under its
+  default `reject` policy — `attach` allows use without stop). The runtime
+  itself allows only **one active session** — a second `start` while one is
+  active fails with `CONTROL_LOCKED` regardless of identity.
+- **`status` with no session** returns `SESSION_NOT_FOUND` (code -32009)
+  with `"No active computer-use session exists."` — this is the
+  signal to create.
 
 `computer.cancel` — params `{session_id}`. Cancels the in-flight action
-(if any) and returns `{cancelled, session_id}`.
+batch (if any) and returns `{cancelled, session_id}`. The cancelled batch
+stops at the next safe boundary (a long `wait` exits immediately) and its
+response reports the already-executed actions as `success` and the rest as
+`cancelled` — a cancelled `wait` is never reported as an internal error.
+Clients may also abort over the connection: the SDK maps an `AbortSignal`
+to a `computer.cancel` notification, so Pi/OpenCode cancellation reaches the
+daemon through the same path.
 
 ### computer.observe
 

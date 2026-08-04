@@ -48,13 +48,22 @@ cu daemon start
 
 # 4. drive it
 cu doctor
-cu session start
-cu observe --include-image --image-out /tmp/screen.jpg
+cu observe --include-image --image-out /tmp/screen.jpg   # first observe auto-creates a session
 cu move 500 400
 cu click 500 400
 cu type "hello"            # text is redacted in traces
-cu session stop
+cu session stop            # only the client that started the session may stop it
 ```
+
+**Sessions are created on first use.** The first `observe`/`act` from any
+client auto-starts a session when none is active (the CLI resolves the active
+session first and only starts when the daemon reports `SESSION_NOT_FOUND`).
+The daemon records **who** started it — every client sends its identity
+(`client_id` / `client_name` / `client_instance_id`) with `session start`, and
+`session status` returns the owner. Ownership matters: a session may be
+stopped by the client that created it (a second client trying to use it gets
+`CONTROL_LOCKED` under the default policy — see the Pi extension's
+`COMPUTER_USE_EXISTING_SESSION_POLICY`).
 
 Type actions are **redacted by default**: traces record `text_redacted: true`
 and a character count, never the text itself. To log full text (e.g. a
@@ -82,9 +91,13 @@ not by the client, so every adapter gets the same guarantees.
 
 - **Socket**: Unix domain socket at `~/.computer-use/runtime.sock`, mode `0700`
   — only your user can connect.
-- **Sessions**: one active session at a time; every observe/act carries a
-  `session_id`. Actions on a stale, paused, taken-over, or stopped session are
-  rejected with a specific error code.
+- **Sessions**: one active session at a time (control lock). The first
+  client request auto-creates a session; the creator is recorded as its
+  **owner** and is the only client that stops it. A session owned by another
+  client is refused with `CONTROL_LOCKED` (the Pi extension can opt into
+  `attach` mode to use, but never stop, a foreign session). Every
+  observe/act carries a `session_id`. Actions on a stale, paused,
+  taken-over, or stopped session are rejected with a specific error code.
 - **Stale frames**: acting on anything but the session's current frame is
   rejected (`STALE_FRAME`) under the default `strict` policy; the
   `visual_match` policy (env `COMPUTER_USE_STALE_POLICY`) additionally
@@ -131,19 +144,31 @@ the trace cannot be recorded), or `disabled` (no recorder).
 ## Tests
 
 ```bash
-cargo test --workspace                    # 140 tests (Rust: core, driver, runtime, daemon protocol)
+cargo test --workspace                    # 145 tests (Rust: core, driver, runtime, daemon protocol)
 cargo test -p cu-daemon --test integration -- --ignored   # live security-matrix test
-pnpm install && pnpm -r build && pnpm -r test             # 47 tests: SDK (17), MCP (9), Pi (9), OpenCode (10), inspector (2)
+pnpm install && pnpm -r build && pnpm -r test             # 67 tests: SDK (21), Pi (14), OpenCode (20), MCP (10), inspector (2)
 ./scripts/smoke.sh                        # automated smoke: gates + Pi/OpenCode wiring snapshots
-./scripts/acceptance.sh                   # 18-step manual acceptance (needs a GUI session)
 ```
+
+Real-environment acceptance (needs a logged-in GUI session, Screen
+Recording + Accessibility permissions, daemon running, no active session):
+
+```bash
+node scripts/pi-host-acceptance.mjs       # Pi extension, real code, real daemon/screen — 31 checks
+node scripts/opencode-mcp-acceptance.mjs  # real computer-use-mcp binary over stdio, real daemon/screen — 17 checks
+node scripts/ownership-scenario-a.mjs     # ownership: MCP-owned session vs. the Pi extension — 6 checks
+```
+
+See [docs/acceptance-manual.md](docs/acceptance-manual.md) for the full
+manual checklists (Pi 20 steps, OpenCode 14 steps, ownership A/B/C) and the
+results recorded during the round-2 acceptance run.
 
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — components, threads, data flow
-- [docs/protocol.md](docs/protocol.md) — JSON-RPC surface, methods, error codes
+- [docs/protocol.md](docs/protocol.md) — JSON-RPC surface, methods, error codes, session behavior (auto-create, ownership, cancel)
 - [docs/permissions.md](docs/permissions.md) — Screen Recording / Accessibility setup & troubleshooting
-- [docs/acceptance-manual.md](docs/acceptance-manual.md) — Pi (15 steps) + OpenCode (11 steps) manual acceptance checklist
+- [docs/acceptance-manual.md](docs/acceptance-manual.md) — Pi (20 steps) + OpenCode (14 steps) manual acceptance checklist, with round-2 results
 - [docs/uninstall.md](docs/uninstall.md) — clean removal
 - [packages/sdk-typescript/README.md](packages/sdk-typescript/README.md)
 - [packages/mcp-server/README.md](packages/mcp-server/README.md)

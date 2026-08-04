@@ -55,6 +55,13 @@ cu permissions     # reports screen_recording / accessibility + guidance
 | typing goes nowhere | Accessibility missing for the process that posts events |
 | `daemon start` says unhealthy | check `~/.computer-use/daemon.log`; usually a permission issue surfaced on first observe |
 | screen captures are black/blank | Screen Recording granted to a different app; re-check the entry for `cubridge` |
+| `cu: command not found` (or the command opens a modem/serial session) | **macOS ships its own `/usr/bin/cu`** (the serial-port tool). Ensure the repo's `cu` comes first in `PATH` (e.g. `export PATH="$HOME/.cargo/bin:$PATH"` after `cargo build --release`), or call the full path to `target/release/cu` |
+| tools fail with `CONTROL_LOCKED` — "Another client owns the active computer-use session." | another client (CLI / OpenCode MCP / Pi) created the active session. Only the owning client may stop it; the Pi extension can opt into observing it with `COMPUTER_USE_EXISTING_SESSION_POLICY=attach` (still cannot stop it) |
+| `SESSION_NOT_FOUND` on the very first call | expected if you run `status` before any session exists — the **first `observe`/`act` auto-creates** one, so you never need an explicit start |
+| `STALE_FRAME` right after switching windows / apps | acting on the last frame after the screen changed is rejected by design (strict policy, plus live visual comparison). Re-`observe` to get a current frame |
+| `/computer-observe` saved screenshot "missing" from the working directory | screenshots are written to the **system temp dir** (`oc-computer-use-<session>-<frame>.jpg|png`, `0600`) and cleaned on age/session stop/extension exit — they never land in your repo |
+| OpenCode: "model not found" for `glm-4.6` | the zhipuai model id for this OpenCode build is `glm-4.6v` (OpenCode 1.18 renamed vision models); update `model` in `~/.config/opencode/opencode.json` (the JSONC merge in `cu-opencode setup` never touches `model`) |
+| OpenCode MCP server shows "failed" in `opencode mcp list` | `computer-use-mcp` not on the PATH OpenCode sees, or a leftover placeholder entry in `mcp` — run `cu-opencode setup` (rewrites only the `computer-use` entry), then restart OpenCode |
 
 ## Rebuilding the bridge by hand
 

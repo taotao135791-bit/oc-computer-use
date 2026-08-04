@@ -230,6 +230,17 @@ pub struct InspectResult {
     pub mapping: InspectMapping,
 }
 
+/// Identity of the client that started a session. Recorded on the session so
+/// owners can be told apart: a client must not stop a session it did not
+/// start. `client_instance_id` distinguishes multiple processes of the same
+/// client (e.g. two Pi instances).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub client_id: String,
+    pub client_name: String,
+    pub client_instance_id: String,
+}
+
 /// `computer.session` request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionParams {
@@ -238,6 +249,13 @@ pub struct SessionParams {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_id: Option<String>,
+    /// Identity of the client performing the action; recorded on `start`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_instance_id: Option<String>,
 }
 
 /// `computer.session` result (shape depends on `action`).
@@ -257,6 +275,15 @@ pub struct SessionResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_dir: Option<String>,
     pub started_by: String,
+    /// Who created this session (backward-compatible name of the starting
+    /// client). The owner_* fields carry the structured identity; only the
+    /// creating client may stop the session on exit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }

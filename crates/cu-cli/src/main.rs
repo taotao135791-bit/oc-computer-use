@@ -326,10 +326,21 @@ async fn main() {
                     message,
                     code,
                 } => {
-                    // Render the machine-readable data.code if present.
+                    // Render the machine-readable data.code if present, with
+                    // the human-readable data.message when the daemon
+                    // supplied one (the JSON-RPC message itself is the code
+                    // name, e.g. SESSION_NOT_FOUND).
                     if let Some(Value::String(code_str)) = data.as_ref().and_then(|d| d.get("code"))
                     {
-                        eprintln!("cu: {code_str} — {message}");
+                        let human = data
+                            .as_ref()
+                            .and_then(|d| d.get("message"))
+                            .and_then(Value::as_str)
+                            .filter(|m| *m != code_str);
+                        match human {
+                            Some(m) => eprintln!("cu: {code_str} — {m}"),
+                            None => eprintln!("cu: {code_str} — {message}"),
+                        }
                     } else if data.is_some() {
                         eprintln!("cu: [{code}] {message}: {data:?}");
                     } else {
@@ -414,21 +425,58 @@ fn human_action_result(value: &Value) {
 // shared plumbing
 // ---------------------------------------------------------------------------
 
+/// Whether a daemon RPC error carries the given `data.code`.
+fn rpc_code_is(data: &Option<Value>, code: &str) -> bool {
+    matches!(
+        data.as_ref().and_then(|d| d.get("code")).and_then(Value::as_str),
+        Some(c) if c == code
+    )
+}
+
 /// Resolve a session: the one named by `session_id`, or the currently active
-/// one when the caller left it unspecified.
+/// one when the caller left it unspecified. First use auto-creates: when the
+/// daemon has no active session (SESSION_NOT_FOUND), one is started with this
+/// CLI's identity, so `cu observe` / `cu click` work straight after
+/// `cu daemon start`.
 async fn resolve_session(session_id: &Option<String>) -> Result<String, ClientError> {
     if let Some(id) = session_id {
         return Ok(id.clone());
     }
-    let resp = request("computer.session", json!({"action": "status"})).await?;
-    resp.get("session_id")
+    let resp = request("computer.session", json!({"action": "status"})).await;
+    let value = match resp {
+        Ok(v) => v,
+        Err(ClientError::Rpc { data, .. }) if rpc_code_is(&data, "SESSION_NOT_FOUND") => {
+            request("computer.session", session_start_params(Value::Null)).await?
+        }
+        Err(e) => return Err(e),
+    };
+    value
+        .get("session_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| ClientError::Rpc {
             code: -32602,
-            message: "no active session; start one with `cu session start`".into(),
-            data: Some(json!({"code": "NO_ACTIVE_SESSION"})),
+            message: "daemon did not return a session_id".into(),
+            data: None,
         })
+}
+
+/// Params for `computer.session start`: identity is always attached so the
+/// session's owner is this CLI instance.
+fn session_start_params(display_id: Value) -> Value {
+    let mut params = json!({"action": "start"});
+    if let Some(m) = params.as_object_mut() {
+        m.insert("client_id".into(), json!("cu-cli"));
+        m.insert("client_name".into(), json!("cu"));
+        m.insert(
+            "client_instance_id".into(),
+            json!(format!("cu-{}", std::process::id())),
+        );
+    }
+    if !display_id.is_null() {
+        params["display_id"] = display_id;
+    }
+    params
 }
 
 /// Frame id for an action. When the caller did not pin a specific stored
@@ -696,13 +744,38 @@ async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
             })
         }
     }
-    let mut params = json!({"action": args.action});
-    if let Some(id) = &args.session_id {
-        params["session_id"] = json!(id);
-    }
-    if let Some(d) = &args.display_id {
-        params["display_id"] = json!(d);
-    }
+    let params = if args.action == "start" {
+        session_start_params(json!(args.display_id))
+    } else if args.action == "status" {
+        // status resolves the active session daemon-side; without one it is
+        // a typed SESSION_NOT_FOUND, which adapters rely on.
+        let mut p = json!({"action": "status"});
+        if let Some(id) = &args.session_id {
+            p["session_id"] = json!(id);
+        }
+        p
+    } else {
+        // pause / resume / takeover / release / stop act on the session the
+        // user is operating — resolve the active one when none is named.
+        let session_id = match &args.session_id {
+            Some(id) => Some(id.clone()),
+            None => match request("computer.session", json!({"action": "status"})).await {
+                Ok(v) => v
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                Err(_) => None,
+            },
+        };
+        let mut p = json!({"action": args.action});
+        if let Some(id) = session_id {
+            p["session_id"] = json!(id);
+        }
+        if let Some(d) = &args.display_id {
+            p["display_id"] = json!(d);
+        }
+        p
+    };
     let resp = request("computer.session", params).await?;
     emit(&resp, args.json);
     Ok(())

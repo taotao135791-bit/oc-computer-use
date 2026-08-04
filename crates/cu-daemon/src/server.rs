@@ -124,16 +124,24 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Serve one connected client: read a JSON-RPC request per line, respond per
-/// line, until EOF.
+/// Serve one connected client: read a JSON-RPC request per line, dispatch
+/// each request concurrently, respond per line, until EOF.
+///
+/// Dispatch is concurrent (not serial) so a request is *not* blocked behind a
+/// long-running predecessor on the same connection — in particular,
+/// `computer.cancel` can reach the runtime while a `computer.act` batch is
+/// still executing. Responses may arrive out of order; clients match them by
+/// JSON-RPC id.
 async fn handle_connection(
     stream: UnixStream,
     runtime: Arc<Runtime>,
     app_shutdown: CancellationToken,
     timeout_secs: u64,
 ) -> anyhow::Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
+    let writer = Arc::new(tokio::sync::Mutex::new(write_half));
+    let mut inflight = Vec::new();
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
@@ -144,36 +152,49 @@ async fn handle_connection(
         let request: RpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
+                // A malformed line is answered immediately, inline.
                 let resp = RpcResponse::err(None, -32700, format!("parse error: {e}"), None);
-                write_line(&mut write_half, &resp).await?;
+                let mut w = writer.lock().await;
+                write_line(&mut *w, &resp).await?;
                 continue;
             }
         };
 
-        let fut = dispatch(&runtime, &app_shutdown, request.clone());
-        let timeout = tokio::time::Duration::from_secs(timeout_secs);
-        let resp = match tokio::time::timeout(timeout, fut).await {
-            Ok(resp) => resp,
-            Err(_elapsed) => {
-                tracing::warn!(method = %request.method, "request timed out; recycling bridge");
-                // Recycle the Swift bridge in case the aborted request left a
-                // stale response in the pipe.
-                let _ = runtime.restart_bridge().await;
-                // A deadline hit is a timeout, not an explicit cancellation:
-                // ACTION_TIMEOUT tells callers the batch was still running.
-                RpcResponse::err(
-                    request.id.clone(),
-                    ErrorCode::ActionTimeout.jsonrpc_code(),
-                    "request timed out".into(),
-                    Some(serde_json::json!({
-                        "code": "ACTION_TIMEOUT",
-                        "message": "request timed out",
-                        "method": request.method,
-                    })),
-                )
-            }
-        };
-        write_line(&mut write_half, &resp).await?;
+        let runtime = runtime.clone();
+        let shutdown = app_shutdown.clone();
+        let writer = writer.clone();
+        inflight.push(tokio::spawn(async move {
+            let fut = dispatch(&runtime, &shutdown, request.clone());
+            let timeout = tokio::time::Duration::from_secs(timeout_secs);
+            let resp = match tokio::time::timeout(timeout, fut).await {
+                Ok(resp) => resp,
+                Err(_elapsed) => {
+                    tracing::warn!(method = %request.method, "request timed out; recycling bridge");
+                    // Recycle the Swift bridge in case the aborted request left a
+                    // stale response in the pipe.
+                    let _ = runtime.restart_bridge().await;
+                    // A deadline hit is a timeout, not an explicit cancellation:
+                    // ACTION_TIMEOUT tells callers the batch was still running.
+                    RpcResponse::err(
+                        request.id.clone(),
+                        ErrorCode::ActionTimeout.jsonrpc_code(),
+                        "request timed out".into(),
+                        Some(serde_json::json!({
+                            "code": "ACTION_TIMEOUT",
+                            "message": "request timed out",
+                            "method": request.method,
+                        })),
+                    )
+                }
+            };
+            let mut w = writer.lock().await;
+            let _ = write_line(&mut *w, &resp).await;
+        }));
+    }
+
+    // Wait for every in-flight response before dropping the write half.
+    for task in inflight {
+        let _ = task.await;
     }
     Ok(())
 }

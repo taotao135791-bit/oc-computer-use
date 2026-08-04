@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use cu_core::{CuError, SessionState};
+use cu_core::{ClientInfo, CuError, SessionState};
 
 /// The runtime-level session object (not the wire-level [`cu_core::SessionStatus`]).
 pub struct Session {
@@ -17,6 +17,10 @@ pub struct Session {
     pub display_id: String,
     pub created_at: DateTime<Utc>,
     pub started_by: String,
+    /// The client that created this session. Ownership matters on exit: only
+    /// the creating client may stop the session it started; other clients must
+    /// attach without stopping it.
+    pub owner: Option<ClientInfo>,
     state: Mutex<SessionState>,
     paused: AtomicBool,
     user_takeover: AtomicBool,
@@ -38,6 +42,7 @@ impl Session {
         id: String,
         display_id: String,
         started_by: String,
+        owner: Option<ClientInfo>,
         trace: Option<cu_trace::TraceRecorder>,
     ) -> Self {
         Self {
@@ -45,6 +50,7 @@ impl Session {
             display_id,
             created_at: Utc::now(),
             started_by,
+            owner,
             state: Mutex::new(SessionState::Active),
             paused: AtomicBool::new(false),
             user_takeover: AtomicBool::new(false),
@@ -209,7 +215,13 @@ mod tests {
 
     #[test]
     fn session_transitions_are_legal() {
-        let s = Arc::new(Session::new("s".into(), "1".into(), "test".into(), None));
+        let s = Arc::new(Session::new(
+            "s".into(),
+            "1".into(),
+            "test".into(),
+            None,
+            None,
+        ));
         assert_eq!(s.state(), SessionState::Active);
         s.transition(SessionState::Paused).unwrap();
         assert!(s.is_paused());
@@ -224,7 +236,13 @@ mod tests {
 
     #[test]
     fn takeover_sets_takeover_flag_not_paused() {
-        let s = Arc::new(Session::new("s".into(), "1".into(), "test".into(), None));
+        let s = Arc::new(Session::new(
+            "s".into(),
+            "1".into(),
+            "test".into(),
+            None,
+            None,
+        ));
         s.transition(SessionState::UserTakeover).unwrap();
         assert!(s.is_user_takeover());
         assert!(
@@ -240,7 +258,13 @@ mod tests {
 
     #[test]
     fn takeover_from_paused_clears_paused() {
-        let s = Arc::new(Session::new("s".into(), "1".into(), "test".into(), None));
+        let s = Arc::new(Session::new(
+            "s".into(),
+            "1".into(),
+            "test".into(),
+            None,
+            None,
+        ));
         s.transition(SessionState::Paused).unwrap();
         s.transition(SessionState::UserTakeover).unwrap();
         assert!(s.is_user_takeover());
@@ -249,7 +273,13 @@ mod tests {
 
     #[test]
     fn takeover_cancels_in_flight() {
-        let s = Arc::new(Session::new("s".into(), "1".into(), "test".into(), None));
+        let s = Arc::new(Session::new(
+            "s".into(),
+            "1".into(),
+            "test".into(),
+            None,
+            None,
+        ));
         let batch = s.begin_batch();
         s.transition(SessionState::UserTakeover).unwrap();
         assert!(batch.is_cancelled());

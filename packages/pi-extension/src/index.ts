@@ -15,6 +15,8 @@
 // (project-local), then `/reload` in Pi. The daemon socket is read from
 // `COMPUTER_USE_SOCKET` (default `~/.computer-use/runtime.sock`).
 
+import { unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -38,12 +40,38 @@ import {
 
 let client: ComputerUseClient | null = null;
 let sessionId: string | null = null;
+/** True when we started the current session — only then may we stop it. */
+let ownsSession = false;
+
+/**
+ * Identity this extension reports when it starts a session. The daemon
+ * records it on the session; the owner is the only client allowed to stop it.
+ */
+const PI_CLIENT_INFO = {
+  client_id: "pi-extension",
+  client_name: "Pi",
+  client_instance_id: `pi-${process.pid}-${Math.random().toString(36).slice(2, 8)}`,
+};
 
 async function getClient(): Promise<ComputerUseClient> {
   if (!client) {
     client = await connect({ socketPath: process.env.COMPUTER_USE_SOCKET });
   }
   return client;
+}
+
+/**
+ * What to do when a session owned by *another* client is already active.
+ * - `reject` (default): refuse to use it (CONTROL_LOCKED).
+ * - `attach`: observe/act on it, without the ability to stop it.
+ * A `start_new` policy is deliberately not implemented: the runtime holds a
+ * single active-session control lock, so a second session cannot exist.
+ */
+type ExistingSessionPolicy = "reject" | "attach";
+
+function existingSessionPolicy(): ExistingSessionPolicy {
+  const v = process.env.COMPUTER_USE_EXISTING_SESSION_POLICY;
+  return v === "attach" ? "attach" : "reject";
 }
 
 /** Resolve the current session, starting one if none exists. */
@@ -55,10 +83,29 @@ async function ensureSession(options?: RequestOptions): Promise<string> {
     s = await c.session("status", {}, options);
   } catch (err) {
     if (err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND") {
-      s = await c.session("start", {}, options);
-    } else {
-      throw err;
+      // First use: we create the session, so we own it.
+      s = await c.session("start", { ...PI_CLIENT_INFO }, options);
+      ownsSession = true;
+      sessionId = s.session_id;
+      return sessionId;
     }
+    throw err;
+  }
+  // A session already exists — who owns it?
+  if (s.owner_client_id && s.owner_client_id !== PI_CLIENT_INFO.client_id) {
+    if (existingSessionPolicy() === "reject") {
+      throw new ComputerUseError(-32004, "Another client owns the active computer-use session.", {
+        code: "CONTROL_LOCKED",
+        message: "Another client owns the active computer-use session.",
+        owner_client_id: s.owner_client_id,
+        owner_client_name: s.owner_client_name ?? null,
+      });
+    }
+    // attach: use the session, but never stop it.
+    ownsSession = false;
+  } else {
+    // Owned by us (or started before ownership was recorded — adopt it).
+    ownsSession = true;
   }
   sessionId = s.session_id;
   return sessionId;
@@ -74,6 +121,68 @@ function toToolError(err: unknown): Error {
 function cancelledResult() {
   return { content: [{ type: "text" as const, text: "Cancelled by user" }], details: {} };
 }
+
+// ---------------------------------------------------------------------------
+// Screenshot storage for the /computer-observe command
+// ---------------------------------------------------------------------------
+
+/** Map an image MIME type to a file extension. Throws for unknown MIME types. */
+export function extensionForMime(mimeType: string): string {
+  if (mimeType === "image/png") return "png";
+  if (mimeType === "image/jpeg") return "jpg";
+  throw new Error(`unsupported image MIME type: ${mimeType}`);
+}
+
+/**
+ * Temporary screenshots written by the /computer-observe command. Files go to
+ * the system temp directory (never the project/cwd), are readable only by the
+ * current user, and are removed on session shutdown or when they age out.
+ * Traces reference the daemon's own frames directory, not these copies, so
+ * cleaning them up never breaks a trace.
+ */
+class TempImageStore {
+  private files: { path: string; createdMs: number }[] = [];
+
+  /** Write a screenshot and track it. Returns the destination path. */
+  save(sessionId: string, frameId: string, imageBase64: string, mimeType: string): string {
+    const extension = extensionForMime(mimeType);
+    const dest = join(tmpdir(), `oc-computer-use-${sessionId}-${frameId}.${extension}`);
+    writeFileSync(dest, Buffer.from(imageBase64, "base64"), { mode: 0o600 });
+    this.files.push({ path: dest, createdMs: Date.now() });
+    this.prune(60 * 60 * 1000); // age out screenshots older than 1h
+    return dest;
+  }
+
+  /** Remove tracked screenshots older than `maxAgeMs`. */
+  prune(maxAgeMs: number): void {
+    const now = Date.now();
+    this.files = this.files.filter((f) => {
+      if (now - f.createdMs > maxAgeMs) {
+        try {
+          unlinkSync(f.path);
+        } catch {
+          // already gone
+        }
+        return false;
+      }
+      return true;
+    });
+  }
+
+  /** Remove every tracked screenshot (session shutdown / extension exit). */
+  cleanup(): void {
+    for (const f of this.files) {
+      try {
+        unlinkSync(f.path);
+      } catch {
+        // already gone
+      }
+    }
+    this.files = [];
+  }
+}
+
+const imageStore = new TempImageStore();
 
 // ---------------------------------------------------------------------------
 // Schemas (TypeBox — the official Pi schema library)
@@ -162,10 +271,17 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
       const c = await getClient();
       const result = await c.session(
         params.action as SessionAction,
-        { session_id: params.session_id ?? undefined, display_id: params.display_id ?? undefined },
+        {
+          session_id: params.session_id ?? undefined,
+          display_id: params.display_id ?? undefined,
+          // Record our identity when we create the session (ownership).
+          ...(params.action === "start" ? { ...PI_CLIENT_INFO } : {}),
+        },
         { signal },
       );
       sessionId = result.session_id;
+      if (params.action === "start") ownsSession = true;
+      if (params.action === "stop") ownsSession = false;
       const lines = [
         `session_id: ${result.session_id}`,
         `state: ${result.state}`,
@@ -404,8 +520,17 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
       handler: async (_args: string, ctx: ExtensionContext) => {
         try {
           const c = await getClient();
-          const s = await c.session(action, sessionId ? { session_id: sessionId } : {});
+          const s = await c.session(action, {
+            ...(sessionId ? { session_id: sessionId } : {}),
+            // Record our identity when we create the session (ownership).
+            ...(action === "start" ? { ...PI_CLIENT_INFO } : {}),
+          });
           sessionId = s.session_id;
+          if (action === "start") ownsSession = true;
+          if (action === "stop") {
+            ownsSession = false;
+            sessionId = null;
+          }
           ctx.ui.notify(
             `${verb}: ${s.session_id} state=${s.state} paused=${s.paused} takeover=${s.user_takeover} lock=${s.lock_held}`,
             "info",
@@ -431,8 +556,10 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
         let sessionLine = "session: none";
         try {
           const s = await c.session("status", {});
-          sessionId = s.session_id;
+          // Read-only: never adopt a foreign session here (that would bypass
+          // the existing-session policy for later observe/act calls).
           sessionLine = `session: ${s.session_id} state=${s.state} paused=${s.paused} takeover=${s.user_takeover} lock=${s.lock_held}`;
+          if (s.owner_client_name) sessionLine += ` owner=${s.owner_client_name}`;
           if (s.current_frame_id) sessionLine += ` frame=${s.current_frame_id}`;
           if (s.trace_dir) sessionLine += ` trace=${s.trace_dir}`;
         } catch (err) {
@@ -455,16 +582,15 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
   pi.registerCommand("computer-release", sessionCommand("release", "released"));
 
   pi.registerCommand("computer-observe", {
-    description: "Capture a screenshot of the desktop to a PNG file",
+    description: "Capture a screenshot of the desktop to a temporary file",
     handler: async (_args: string, ctx: ExtensionContext) => {
       try {
         const sid = await ensureSession();
         const c = await getClient();
         const frame = await c.observe({ session_id: sid, include_image: true });
         if (!frame.image_base64) throw new Error("daemon returned no image");
-        const dest = join(ctx.cwd, `computer-use-${frame.frame_id}.png`);
-        const { writeFileSync } = await import("node:fs");
-        writeFileSync(dest, Buffer.from(frame.image_base64, "base64"));
+        // Temp dir + MIME-derived extension, tracked for cleanup on shutdown.
+        const dest = imageStore.save(sid, frame.frame_id, frame.image_base64, frame.image_mime_type);
         ctx.ui.notify(`screenshot saved: ${dest} (${frame.width}x${frame.height}, frame ${frame.frame_id})`, "info");
       } catch (err) {
         ctx.ui.notify(`observe failed: ${toToolError(err).message}`, "error");
@@ -478,17 +604,21 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
   // control lock) and close the socket.
 
   pi.on("session_shutdown", async () => {
-    if (!sessionId) return;
     const c = client;
-    if (!c) return;
+    client = null;
     try {
-      await c.session("stop", { session_id: sessionId });
+      // Only stop a session we created. A session another client owns (attach
+      // policy) keeps running for its owner — we just let go of it.
+      if (c && ownsSession && sessionId) {
+        await c.session("stop", { session_id: sessionId });
+      }
     } catch {
       // The daemon may already be gone; nothing to clean up.
     } finally {
       sessionId = null;
-      c.close();
-      client = null;
+      ownsSession = false;
+      imageStore.cleanup();
+      c?.close();
     }
   });
 }

@@ -187,7 +187,7 @@ pub enum CuError {
     OutOfBounds(BoundsDetail),
     #[error("unknown frame: {0}")]
     UnknownFrame(String),
-    #[error("session not found: {0}")]
+    #[error("{0}")]
     SessionNotFound(String),
     #[error("invalid session state: {0}")]
     InvalidSessionState(String),

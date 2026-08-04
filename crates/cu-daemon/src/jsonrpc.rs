@@ -97,13 +97,22 @@ pub async fn dispatch(
                 Ok(p) => p,
                 Err(e) => return error_response(id, e),
             };
+            // Identity of the caller. Recorded on `start` so the session has
+            // an owner that (only) may stop it on exit. Callers that do not
+            // identify themselves are anonymous "jsonrpc" clients.
+            let client = cu_core::protocol::ClientInfo {
+                client_id: p.client_id.clone().unwrap_or_else(|| "jsonrpc".into()),
+                client_name: p
+                    .client_name
+                    .clone()
+                    .unwrap_or_else(|| "JSON-RPC client".into()),
+                client_instance_id: p
+                    .client_instance_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
+            };
             runtime
-                .session(
-                    p.action,
-                    p.session_id.as_deref(),
-                    p.display_id,
-                    "jsonrpc".into(),
-                )
+                .session(p.action, p.session_id.as_deref(), p.display_id, client)
                 .await
                 .and_then(to_result)
         }

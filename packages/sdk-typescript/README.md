@@ -45,7 +45,14 @@ client.close();
 - **Computer**: `observe(params)`, `act(params)`, `inspect(params)`, `cancel(params)`.
 - **Traces**: `traceList()`, `traceGet(sessionId)`, `traceExport(sessionId, dest)`, `traceReplay(sessionId)`.
 
-`observe()` auto-resolves the session: if none is active it starts one first.
+`observe()` auto-resolves the session: `ensureSession()` queries
+`session("status")` and starts one **only** when the daemon reports
+`SESSION_NOT_FOUND` (other errors are rethrown); concurrent callers share one
+single-flight resolution, so exactly one session is created. `connect({clientInfo})`
+sets the identity sent with `session start` (default `sdk` / "TypeScript
+SDK") — the daemon records it as the session owner, and the owner fields
+(`owner_client_id`, `owner_client_name`, `owner_instance_id`) are returned
+in every session result.
 
 ## Errors
 

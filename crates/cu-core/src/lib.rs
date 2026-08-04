@@ -20,8 +20,8 @@ pub use coordinates::{CoordinateSpace, DisplayBounds, ImageGeometry, Point, Regi
 pub use errors::{CuError, ErrorCode, PermissionIssue, PermissionKind, StaleFrameDetail};
 pub use frames::{ScreenFrame, ScreenSnapshot, StaleFrameVerdict};
 pub use protocol::{
-    ActParams, ActResult, ActionResultReport, InspectMapping, InspectParams, InspectResult,
-    ObserveParams, ObserveResult, RpcRequest, RpcResponse, SessionParams, SessionResult,
-    StabilizationInfo, TraceEntry, TraceExport, TraceReport, TraceSummary,
+    ActParams, ActResult, ActionResultReport, ClientInfo, InspectMapping, InspectParams,
+    InspectResult, ObserveParams, ObserveResult, RpcRequest, RpcResponse, SessionParams,
+    SessionResult, StabilizationInfo, TraceEntry, TraceExport, TraceReport, TraceSummary,
 };
 pub use sessions::{SessionAction, SessionState, SessionStatus};

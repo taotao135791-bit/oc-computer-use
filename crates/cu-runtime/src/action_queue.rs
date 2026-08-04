@@ -8,7 +8,7 @@
 //! a `Move` can start from the live pointer position (which is unknown until the
 //! previous action has run).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cu_core::{ComputerAction, CuError, ImageGeometry, Point};
 use cu_driver::ComputerDriver;
@@ -108,19 +108,63 @@ impl<'a> ActionQueue<'a> {
             };
 
             let started = Instant::now();
-            let outcome = self.driver.execute(&resolved).await;
+            let mut wait_interrupted = false;
+            let outcome = match &resolved {
+                // Cancellation-aware wait: a 10s wait must stop immediately
+                // when the batch token fires (cancel / stop) or the session
+                // aborts mid-wait (pause/takeover/stopped), not sleep it out.
+                cu_driver::ResolvedAction::Wait { duration_ms } => {
+                    let deadline = Instant::now() + Duration::from_millis(*duration_ms);
+                    while Instant::now() < deadline {
+                        if token.is_cancelled() || self.session_aborted(session) {
+                            wait_interrupted = true;
+                            break;
+                        }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        tokio::select! {
+                            () = token.cancelled() => {
+                                wait_interrupted = true;
+                                break;
+                            }
+                            () = tokio::time::sleep(remaining.min(Duration::from_millis(50))) => {}
+                        }
+                    }
+                    if wait_interrupted {
+                        Ok(cu_driver::ActionResult {
+                            success: false,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            detail: Some("wait interrupted by cancellation".into()),
+                        })
+                    } else {
+                        Ok(cu_driver::ActionResult {
+                            success: true,
+                            duration_ms: *duration_ms,
+                            detail: None,
+                        })
+                    }
+                }
+                _ => self.driver.execute(&resolved).await,
+            };
             let duration_ms = started.elapsed().as_millis() as u64;
 
-            let run = match outcome {
-                Ok(ar) if ar.success => ActionRun::success(i, duration_ms),
-                Ok(ar) => ActionRun::failed(
-                    i,
-                    duration_ms,
-                    ar.detail.unwrap_or_else(|| "action failed".into()),
-                ),
-                Err(e) => ActionRun::failed(i, duration_ms, e.to_string()),
+            let run = if wait_interrupted {
+                ActionRun::cancelled(i)
+            } else {
+                match outcome {
+                    Ok(ar) if ar.success => ActionRun::success(i, duration_ms),
+                    Ok(ar) => ActionRun::failed(
+                        i,
+                        duration_ms,
+                        ar.detail.unwrap_or_else(|| "action failed".into()),
+                    ),
+                    Err(e) => ActionRun::failed(i, duration_ms, e.to_string()),
+                }
             };
             reports.push(run);
+            if wait_interrupted {
+                self.fill_cancelled(&mut reports, i + 1, actions.len());
+                break;
+            }
 
             if let Some(t) = trace {
                 let result_json = serde_json::json!({
