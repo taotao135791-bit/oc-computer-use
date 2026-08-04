@@ -32,6 +32,16 @@ pub enum ErrorCode {
     TraceError,
     DriverError,
     Unsupported,
+    /// Attempted to `resume` a session that is in `UserTakeover`. The user
+    /// must `release` first; resume can only recover a paused session.
+    UserTakeoverActive,
+    /// A request/action batch exceeded the daemon's request deadline. This is
+    /// distinct from `Cancelled` (explicit cancellation): the batch was still
+    /// running when the deadline hit.
+    ActionTimeout,
+    /// Capturing the screen failed (driver/capture failure, e.g. the screen
+    /// recording session dropped).
+    CaptureFailed,
 }
 
 impl ErrorCode {
@@ -60,6 +70,9 @@ impl ErrorCode {
             TraceError => -32013,
             DriverError => -32014,
             Unsupported => -32015,
+            UserTakeoverActive => -32016,
+            ActionTimeout => -32017,
+            CaptureFailed => -32018,
         }
     }
 
@@ -86,6 +99,9 @@ impl ErrorCode {
             TraceError => "TRACE_ERROR",
             DriverError => "DRIVER_ERROR",
             Unsupported => "UNSUPPORTED",
+            UserTakeoverActive => "USER_TAKEOVER_ACTIVE",
+            ActionTimeout => "ACTION_TIMEOUT",
+            CaptureFailed => "CAPTURE_FAILED",
         }
     }
 }
@@ -160,6 +176,13 @@ pub enum CuError {
     Paused,
     #[error("user takeover is active")]
     UserTakeover,
+    /// `resume` while the user holds control. The agent must `release` first.
+    #[error("The user has taken control. Call release before resuming agent control.")]
+    UserTakeoverActive,
+    #[error("request timed out: {0}")]
+    ActionTimeout(String),
+    #[error("screen capture failed: {0}")]
+    CaptureFailed(String),
     #[error("action is out of bounds: {0:?}")]
     OutOfBounds(BoundsDetail),
     #[error("unknown frame: {0}")]
@@ -195,6 +218,9 @@ impl CuError {
             ControlLocked { .. } => ErrorCode::ControlLocked,
             Paused => ErrorCode::Paused,
             UserTakeover => ErrorCode::UserTakeover,
+            UserTakeoverActive => ErrorCode::UserTakeoverActive,
+            ActionTimeout(_) => ErrorCode::ActionTimeout,
+            CaptureFailed(_) => ErrorCode::CaptureFailed,
             OutOfBounds(_) => ErrorCode::OutOfBounds,
             UnknownFrame(_) => ErrorCode::UnknownFrame,
             SessionNotFound(_) => ErrorCode::SessionNotFound,
@@ -330,6 +356,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Accessibility"));
+    }
+
+    #[test]
+    fn timeout_and_capture_failed_have_codes() {
+        assert_eq!(ErrorCode::ActionTimeout.as_str(), "ACTION_TIMEOUT");
+        assert_eq!(ErrorCode::ActionTimeout.jsonrpc_code(), -32017);
+        assert_eq!(ErrorCode::CaptureFailed.as_str(), "CAPTURE_FAILED");
+        assert_eq!(ErrorCode::CaptureFailed.jsonrpc_code(), -32018);
+        let err = CuError::ActionTimeout("batch exceeded deadline".into());
+        let data = err.to_error_data();
+        assert_eq!(data["code"], "ACTION_TIMEOUT");
+        assert_eq!(err.code(), ErrorCode::ActionTimeout);
     }
 
     #[test]

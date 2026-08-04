@@ -201,6 +201,27 @@ export interface ActionResultReport {
   error?: string;
 }
 
+/**
+ * Outcome of the post-batch stabilization wait (`wait_policy: "until_stable"`).
+ * On timeout `change_score` is the **last measured** thumbnail difference —
+ * never a fabricated 0 — so the caller can tell a screen that nearly settled
+ * from one that kept animating.
+ */
+export interface StabilizationInfo {
+  outcome: "stable" | "timed_out";
+  change_score: number;
+  samples: number;
+  elapsed_ms?: number;
+}
+
+/** Trace-recording status for an act batch. */
+export interface TraceReport {
+  mode: "required" | "best_effort" | "disabled";
+  /** True when the trace could not be written (best-effort mode degraded). */
+  degraded: boolean;
+  warnings: string[];
+}
+
 export interface ActResult {
   executed: boolean;
   action_results: ActionResultReport[];
@@ -209,6 +230,10 @@ export interface ActResult {
   next_frame_id?: string;
   /** Only present when `return_screenshot` was requested. */
   screenshot?: ObserveResult;
+  /** Present when `wait_policy: "until_stable"` was requested. */
+  stabilization?: StabilizationInfo;
+  /** Present when the session records traces. */
+  trace?: TraceReport;
 }
 
 // ---------------------------------------------------------------------------

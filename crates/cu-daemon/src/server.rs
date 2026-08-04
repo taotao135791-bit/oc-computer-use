@@ -42,6 +42,13 @@ impl Default for DaemonConfig {
         if std::env::var("COMPUTER_USE_TRACE_DEV_MODE").as_deref() == Ok("1") {
             runtime_config.trace_dev_mode = true;
         }
+        // Trace recording policy: required | best_effort (default) | disabled.
+        runtime_config.trace_mode =
+            cu_trace::TraceMode::from_env(std::env::var("COMPUTER_USE_TRACE_MODE").ok().as_deref());
+        // Stale-frame policy: strict (default) | visual_match.
+        runtime_config.stale.policy = cu_runtime::stale_frame::StaleFramePolicy::from_env(
+            std::env::var("COMPUTER_USE_STALE_POLICY").ok().as_deref(),
+        );
         Self {
             socket_path: cu_core::config::socket_path(),
             request_timeout_secs: 600,
@@ -152,12 +159,14 @@ async fn handle_connection(
                 // Recycle the Swift bridge in case the aborted request left a
                 // stale response in the pipe.
                 let _ = runtime.restart_bridge().await;
+                // A deadline hit is a timeout, not an explicit cancellation:
+                // ACTION_TIMEOUT tells callers the batch was still running.
                 RpcResponse::err(
                     request.id.clone(),
-                    ErrorCode::Cancelled.jsonrpc_code(),
+                    ErrorCode::ActionTimeout.jsonrpc_code(),
                     "request timed out".into(),
                     Some(serde_json::json!({
-                        "code": "CANCELLED",
+                        "code": "ACTION_TIMEOUT",
                         "message": "request timed out",
                         "method": request.method,
                     })),

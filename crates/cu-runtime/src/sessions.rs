@@ -74,6 +74,13 @@ impl Session {
     }
 
     /// Transition to a new state, keeping the paused/takeover flags coherent.
+    ///
+    /// `UserTakeover -> Active` exists here **only** for `session_release` —
+    /// the runtime gates it: `session_resume` refuses to resume a session in
+    /// `UserTakeover` (`USER_TAKEOVER_ACTIVE`), so a plain `resume` can never
+    /// bypass the human's takeover. This table is the flag-coherence layer;
+    /// the semantics live in [`crate::runtime::Runtime::session_resume`] /
+    /// `session_release`.
     pub fn transition(&self, target: SessionState) -> Result<(), CuError> {
         let current = self.state();
         let legal = match (current, target) {
@@ -83,6 +90,7 @@ impl Session {
             (_, SessionState::UserTakeover) => {
                 matches!(current, SessionState::Active | SessionState::Paused)
             }
+            // release-only exit (runtime gates who may take it).
             (SessionState::UserTakeover, SessionState::Active) => true,
             (_, SessionState::Stopping | SessionState::Stopped) => true,
             (_, SessionState::Failed) => true,
@@ -101,7 +109,10 @@ impl Session {
             }
             SessionState::UserTakeover => {
                 self.user_takeover.store(true, Ordering::SeqCst);
-                self.paused.store(true, Ordering::SeqCst);
+                // A takeover is not a pause: entering it clears any paused
+                // flag (even if taken over *from* Paused). `resume` must not
+                // be able to recover this session — only `release` can.
+                self.paused.store(false, Ordering::SeqCst);
                 self.cancel_in_flight();
             }
             SessionState::Stopping | SessionState::Stopped | SessionState::Failed => {
@@ -202,15 +213,38 @@ mod tests {
         assert_eq!(s.state(), SessionState::Active);
         s.transition(SessionState::Paused).unwrap();
         assert!(s.is_paused());
+        // Transitioning twice into Paused is illegal (already paused).
+        assert!(s.transition(SessionState::Paused).is_err());
         s.transition(SessionState::Active).unwrap();
         assert!(!s.is_paused());
+        // Pausing a stopped session is illegal.
+        s.transition(SessionState::Stopped).unwrap();
+        assert!(s.transition(SessionState::Paused).is_err());
+    }
+
+    #[test]
+    fn takeover_sets_takeover_flag_not_paused() {
+        let s = Arc::new(Session::new("s".into(), "1".into(), "test".into(), None));
         s.transition(SessionState::UserTakeover).unwrap();
         assert!(s.is_user_takeover());
-        // Cannot go from Paused-ish takeover back to paused directly.
+        assert!(
+            !s.is_paused(),
+            "a takeover is not a pause — resume must not be able to recover it"
+        );
+        // The transition-table exit exists for `release` only; the runtime
+        // gates who may call it (resume refuses with USER_TAKEOVER_ACTIVE).
         s.transition(SessionState::Active).unwrap();
+        assert!(!s.is_user_takeover());
+        assert!(!s.is_paused());
+    }
+
+    #[test]
+    fn takeover_from_paused_clears_paused() {
+        let s = Arc::new(Session::new("s".into(), "1".into(), "test".into(), None));
         s.transition(SessionState::Paused).unwrap();
-        // Transitioning twice into Paused is illegal.
-        assert!(s.transition(SessionState::Paused).is_err());
+        s.transition(SessionState::UserTakeover).unwrap();
+        assert!(s.is_user_takeover());
+        assert!(!s.is_paused(), "takeover must clear the paused flag");
     }
 
     #[test]

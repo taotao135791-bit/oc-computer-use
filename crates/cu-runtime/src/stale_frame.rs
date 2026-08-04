@@ -14,6 +14,36 @@
 use chrono::Utc;
 use cu_core::{ScreenSnapshot, StaleFrameDetail, StaleFrameVerdict};
 
+/// How strictly a referenced `frame_id` must match the current screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StaleFramePolicy {
+    /// Only the **current** frame is actionable. Acting on any older
+    /// `frame_id` is `STALE_FRAME`, regardless of visual similarity. This is
+    /// the default: an agent must re-observe between action batches.
+    #[default]
+    Strict,
+    /// Older frames are acceptable as long as the live screen still matches
+    /// them (visual comparison + app change + age backstop).
+    VisualMatch,
+}
+
+impl StaleFramePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StaleFramePolicy::Strict => "strict",
+            StaleFramePolicy::VisualMatch => "visual_match",
+        }
+    }
+
+    /// Parse from the environment's `COMPUTER_USE_STALE_POLICY` value.
+    pub fn from_env(s: Option<&str>) -> Self {
+        match s {
+            Some("visual_match") => StaleFramePolicy::VisualMatch,
+            _ => StaleFramePolicy::Strict,
+        }
+    }
+}
+
 /// Tuning for the stale-frame check.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StaleFrameConfig {
@@ -23,6 +53,9 @@ pub struct StaleFrameConfig {
     pub max_age_secs: u64,
     /// Treat a change of active application as stale even if pixels look alike.
     pub app_change_is_stale: bool,
+    /// Which stale policy applies. Strict additionally rejects any referenced
+    /// frame that is not the current one.
+    pub policy: StaleFramePolicy,
 }
 
 impl Default for StaleFrameConfig {
@@ -31,6 +64,7 @@ impl Default for StaleFrameConfig {
             threshold: cu_core::config::DEFAULT_STALE_THRESHOLD,
             max_age_secs: cu_core::config::DEFAULT_MAX_FRAME_AGE_SECS,
             app_change_is_stale: cu_core::config::DEFAULT_APP_CHANGE_IS_STALE,
+            policy: StaleFramePolicy::Strict,
         }
     }
 }
@@ -53,6 +87,21 @@ impl StaleFrameChecker {
         referenced_frame_id: &str,
         current_frame_id: &str,
     ) -> StaleFrameVerdict {
+        // 0. Strict policy: only the current frame is actionable.
+        if self.config.policy == StaleFramePolicy::Strict && referenced_frame_id != current_frame_id
+        {
+            return StaleFrameVerdict {
+                is_stale: true,
+                change_score: 1.0,
+                referenced_frame_id: referenced_frame_id.into(),
+                current_frame_id: current_frame_id.into(),
+                reason: format!(
+                    "frame {referenced_frame_id} is not the current frame \
+                     ({current_frame_id}) under the strict stale-frame policy"
+                ),
+            };
+        }
+
         // 1. Display change (different display or no comparable snapshot).
         if referenced.display_id != current.display_id {
             return StaleFrameVerdict {
@@ -148,11 +197,48 @@ mod tests {
     }
 
     fn config() -> StaleFrameConfig {
+        // The visual-comparison tests below exercise the visual machinery;
+        // use VisualMatch so a differing id does not short-circuit them.
         StaleFrameConfig {
             threshold: 0.12,
             max_age_secs: 120,
             app_change_is_stale: true,
+            policy: StaleFramePolicy::VisualMatch,
         }
+    }
+
+    fn strict_config() -> StaleFrameConfig {
+        StaleFrameConfig {
+            policy: StaleFramePolicy::Strict,
+            ..config()
+        }
+    }
+
+    #[test]
+    fn strict_rejects_any_non_current_frame() {
+        let checker = StaleFrameChecker::new(strict_config());
+        // Identical pixels, but the ids differ → stale under strict.
+        let a = snap(vec![0u8; 16], Some("TextEdit"), "1");
+        let b = snap(vec![0u8; 16], Some("TextEdit"), "1");
+        let v = checker.check(&a, &b, "frame_1", "frame_2");
+        assert!(v.is_stale);
+        assert!(v.reason.contains("strict"));
+        assert_eq!(v.change_score, 1.0);
+        // The current frame is fresh.
+        let v2 = checker.check(&a, &b, "frame_2", "frame_2");
+        assert!(!v2.is_stale);
+    }
+
+    #[test]
+    fn visual_match_allows_older_identical_frames() {
+        let checker = StaleFrameChecker::new(config());
+        let a = snap(vec![0u8; 16], Some("TextEdit"), "1");
+        let b = snap(vec![0u8; 16], Some("TextEdit"), "1");
+        let v = checker.check(&a, &b, "frame_1", "frame_2");
+        assert!(
+            !v.is_stale,
+            "visual_match accepts an older frame that still matches"
+        );
     }
 
     #[test]

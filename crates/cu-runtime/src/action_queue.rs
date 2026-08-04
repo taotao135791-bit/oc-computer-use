@@ -127,17 +127,18 @@ impl<'a> ActionQueue<'a> {
                     "status": reports.last().map(|r| &r.status).cloned().unwrap_or_else(|| "unknown".into()),
                     "duration_ms": duration_ms,
                 });
-                let _ = t
-                    .record_action(
-                        request_id.map(|s| s.to_string()),
-                        Some(frame_id.to_string()),
-                        action,
-                        result_json,
-                        duration_ms,
-                        Some(display_id.to_string()),
-                        active_app.map(|s| s.to_string()),
-                    )
-                    .await;
+                // Required mode propagates trace-write failures (the batch
+                // fails); best-effort mode degrades inside the recorder.
+                t.record_action(
+                    request_id.map(|s| s.to_string()),
+                    Some(frame_id.to_string()),
+                    action,
+                    result_json,
+                    duration_ms,
+                    Some(display_id.to_string()),
+                    active_app.map(|s| s.to_string()),
+                )
+                .await?;
             }
 
             // Human-takeover probe. Only meaningful after an action that did

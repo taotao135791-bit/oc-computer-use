@@ -1,9 +1,15 @@
 // Error taxonomy of the computer-use protocol.
 //
 // The daemon speaks JSON-RPC 2.0. The top-level `error.code` is a numeric
-// JSON-RPC code (-32000..=-32015 for application errors); `error.data` carries
+// JSON-RPC code (-32000..=-32099 for application errors); `error.data` carries
 // a machine-readable `{ code: "STALE_FRAME", message: "...", ...detail }`
 // object built by cu-core's CuError. We surface both.
+//
+// The names below are the stable machine codes agents should program
+// against. A few codes alias the wire strings the daemon has always used
+// (e.g. `PERMISSION_DENIED` is the name agents should use for the daemon's
+// `PERMISSION`); aliases keep one canonical name per failure while
+// preserving the wire protocol.
 
 /** Machine-readable error codes as returned in `error.data.code`. */
 export const ERROR_CODES = {
@@ -13,18 +19,34 @@ export const ERROR_CODES = {
   INVALID_PARAMS: "INVALID_PARAMS",
   INTERNAL: "INTERNAL",
   NOT_READY: "NOT_READY",
+  // Daemon unreachable (connection-level; see TransportError).
+  DAEMON_UNAVAILABLE: "DAEMON_UNAVAILABLE",
   PERMISSION: "PERMISSION",
+  /** Canonical name for a missing macOS permission (wire code: PERMISSION). */
+  PERMISSION_DENIED: "PERMISSION",
   STALE_FRAME: "STALE_FRAME",
   CONTROL_LOCKED: "CONTROL_LOCKED",
   PAUSED: "PAUSED",
+  /** Canonical name for a paused session (wire code: PAUSED). */
+  SESSION_PAUSED: "PAUSED",
   USER_TAKEOVER: "USER_TAKEOVER",
+  /** Resume was attempted while the user holds control; call release first. */
+  USER_TAKEOVER_ACTIVE: "USER_TAKEOVER_ACTIVE",
   OUT_OF_BOUNDS: "OUT_OF_BOUNDS",
   UNKNOWN_FRAME: "UNKNOWN_FRAME",
   SESSION_NOT_FOUND: "SESSION_NOT_FOUND",
   INVALID_SESSION_STATE: "INVALID_SESSION_STATE",
   CONFIRMATION_REQUIRED: "CONFIRMATION_REQUIRED",
   CANCELLED: "CANCELLED",
+  /** Canonical name for a cancelled action (wire code: CANCELLED). */
+  ACTION_CANCELLED: "CANCELLED",
+  /** A request/batch exceeded the daemon's deadline (distinct from cancel). */
+  ACTION_TIMEOUT: "ACTION_TIMEOUT",
+  /** Screen capture failed (driver/capture failure). */
+  CAPTURE_FAILED: "CAPTURE_FAILED",
   TRACE_ERROR: "TRACE_ERROR",
+  /** Canonical name for trace unavailability (wire code: TRACE_ERROR). */
+  TRACE_UNAVAILABLE: "TRACE_ERROR",
   DRIVER_ERROR: "DRIVER_ERROR",
   UNSUPPORTED: "UNSUPPORTED",
 } as const;
@@ -52,6 +74,9 @@ const JSONRPC_CODE_TO_NAME: Record<number, ErrorCodeName> = {
   [-32013]: ERROR_CODES.TRACE_ERROR,
   [-32014]: ERROR_CODES.DRIVER_ERROR,
   [-32015]: ERROR_CODES.UNSUPPORTED,
+  [-32016]: ERROR_CODES.USER_TAKEOVER_ACTIVE,
+  [-32017]: ERROR_CODES.ACTION_TIMEOUT,
+  [-32018]: ERROR_CODES.CAPTURE_FAILED,
 };
 
 /** Map a numeric JSON-RPC code to its machine-readable name. */
@@ -86,8 +111,19 @@ export class ComputerUseError extends Error {
 
 /** Connection-level failures (socket, framing, timeouts). */
 export class TransportError extends Error {
+  /** Always `"DAEMON_UNAVAILABLE"` — the daemon could not be reached. */
+  readonly code: "DAEMON_UNAVAILABLE";
   constructor(message: string) {
     super(message);
     this.name = "TransportError";
+    this.code = "DAEMON_UNAVAILABLE";
+  }
+}
+
+/** The caller aborted the request via an AbortSignal (local cancellation, not a daemon error). */
+export class AbortError extends Error {
+  constructor(message = "The operation was aborted") {
+    super(message);
+    this.name = "AbortError";
   }
 }

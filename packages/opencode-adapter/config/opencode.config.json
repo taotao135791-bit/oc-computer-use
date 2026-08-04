@@ -1,7 +1,13 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "//": "Computer-use plugin for OpenCode. Copy this file to ~/.config/opencode/opencode.config.json and adjust the plugin path, or add the plugin line to your existing config.",
-  "plugin": [
-    "./node_modules/@computer-use/opencode-adapter/dist/index.js"
-  ]
+  "//": "Computer-use MCP server for OpenCode. Copy the mcp block into your OpenCode config (~/.config/opencode/opencode.json), or run `cu-opencode setup`. Requires @computer-use/mcp-server to be installed so the `computer-use-mcp` binary is on PATH (or point command at its absolute path).",
+  "mcp": {
+    "computer-use": {
+      "type": "local",
+      "command": [
+        "computer-use-mcp"
+      ],
+      "enabled": true
+    }
+  }
 }

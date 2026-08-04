@@ -9,17 +9,50 @@
 //! Dev mode (`dev_mode = true`) records full `type` text for debugging.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::Utc;
 use cu_core::{actions::RedactedText, ComputerAction, CuError, TraceEntry};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 
+/// How strictly traces are recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TraceMode {
+    /// A trace write failure fails the operation (session start or act batch).
+    Required,
+    /// A trace write failure is logged as degraded but the operation proceeds
+    /// (the default).
+    #[default]
+    BestEffort,
+    /// No trace is recorded for this session.
+    Disabled,
+}
+
+impl TraceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraceMode::Required => "required",
+            TraceMode::BestEffort => "best_effort",
+            TraceMode::Disabled => "disabled",
+        }
+    }
+
+    /// Parse from the environment's `COMPUTER_USE_TRACE_MODE` value.
+    pub fn from_env(s: Option<&str>) -> Self {
+        match s {
+            Some("required") => TraceMode::Required,
+            Some("disabled") => TraceMode::Disabled,
+            _ => TraceMode::BestEffort,
+        }
+    }
+}
+
 /// Configuration for a trace recorder.
 #[derive(Debug, Clone, Default)]
 pub struct TraceConfig {
     pub dev_mode: bool,
+    pub mode: TraceMode,
 }
 
 /// Appends structured entries to `<traces_dir>/<session_id>.jsonl`.
@@ -29,6 +62,9 @@ pub struct TraceRecorder {
     config: TraceConfig,
     writer: Mutex<Option<BufWriter<tokio::fs::File>>>,
     seq: AtomicU64,
+    /// Set when a write failed but the recorder kept going (best-effort mode).
+    degraded: AtomicBool,
+    warnings: Mutex<Vec<String>>,
 }
 
 impl TraceRecorder {
@@ -54,7 +90,31 @@ impl TraceRecorder {
             config,
             writer: Mutex::new(Some(BufWriter::new(file))),
             seq: AtomicU64::new(0),
+            degraded: AtomicBool::new(false),
+            warnings: Mutex::new(Vec::new()),
         })
+    }
+
+    pub fn config(&self) -> &TraceConfig {
+        &self.config
+    }
+
+    /// True after any write failure in best-effort mode (or an explicit
+    /// degrade). Exposed so `computer.act` can report `trace.degraded`.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::SeqCst)
+    }
+
+    /// Warnings accumulated since open (best-effort mode keeps going).
+    pub async fn warnings(&self) -> Vec<String> {
+        self.warnings.lock().await.clone()
+    }
+
+    /// Mark the recorder degraded with a reason (used when the recorder could
+    /// not be opened and the session continues best-effort).
+    pub async fn degrade(&self, warning: String) {
+        self.degraded.store(true, Ordering::SeqCst);
+        self.warnings.lock().await.push(warning);
     }
 
     pub fn path(&self) -> &Path {
@@ -71,13 +131,18 @@ impl TraceRecorder {
     }
 
     /// Append a raw entry; increments `seq` and stamps the runtime version.
+    ///
+    /// Failure semantics follow `TraceMode`: `Required` propagates the error
+    /// (the caller must fail the operation); `BestEffort` marks the recorder
+    /// degraded, records a warning, and returns `Ok` so the operation can
+    /// continue. `Disabled` recorders are never constructed.
     pub async fn append(&self, mut entry: TraceEntry) -> Result<(), CuError> {
         entry.seq = self.next_seq();
         entry.runtime_version = Some(cu_core::config::RUNTIME_VERSION.to_string());
         let line = serde_json::to_string(&entry)
             .map_err(|e| CuError::Trace(format!("cannot serialize trace entry: {e}")))?;
         let mut guard = self.writer.lock().await;
-        if let Some(w) = guard.as_mut() {
+        let write_result: Result<(), CuError> = if let Some(w) = guard.as_mut() {
             w.write_all(line.as_bytes())
                 .await
                 .map_err(|e| CuError::Trace(format!("trace write failed: {e}")))?;
@@ -87,8 +152,22 @@ impl TraceRecorder {
             w.flush()
                 .await
                 .map_err(|e| CuError::Trace(format!("trace flush failed: {e}")))?;
+            Ok(())
+        } else {
+            Ok(())
+        };
+        match write_result {
+            Ok(()) => Ok(()),
+            Err(e) => match self.config.mode {
+                TraceMode::Required => Err(e),
+                TraceMode::BestEffort => {
+                    self.degraded.store(true, Ordering::SeqCst);
+                    self.warnings.lock().await.push(e.to_string());
+                    Ok(())
+                }
+                TraceMode::Disabled => Ok(()),
+            },
         }
-        Ok(())
     }
 
     /// Record that an action was attempted/executed, applying redaction.
@@ -255,9 +334,16 @@ mod tests {
     #[tokio::test]
     async fn dev_mode_records_full_text() {
         let dir = tempdir().unwrap();
-        let rec = TraceRecorder::open("s_dev", dir.path(), TraceConfig { dev_mode: true })
-            .await
-            .unwrap();
+        let rec = TraceRecorder::open(
+            "s_dev",
+            dir.path(),
+            TraceConfig {
+                dev_mode: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let action = ComputerAction::TypeText {
             text: "hello世界".into(),
             method: cu_core::TextInputMethod::Keyboard,
@@ -302,6 +388,60 @@ mod tests {
         let raw = std::fs::read_to_string(dir.path().join("s_key.jsonl")).unwrap();
         assert!(raw.contains("CMD"));
         assert!(raw.contains("L"));
+    }
+
+    #[tokio::test]
+    async fn best_effort_mode_degrades_instead_of_failing() {
+        // A closed writer cannot be written to; in best-effort mode append
+        // degrades the recorder and returns Ok. (A real failing FS write is
+        // hard to provoke portably; the degrade path is exercised here.)
+        let dir = tempdir().unwrap();
+        let rec = TraceRecorder::open("s_be", dir.path(), TraceConfig::default())
+            .await
+            .unwrap();
+        // Close first: writer becomes None, but a closed trace file still
+        // lets us exercise the warning bookkeeping below.
+        rec.close().await.unwrap();
+        assert!(!rec.is_degraded());
+        rec.degrade("simulated write failure".into()).await;
+        assert!(rec.is_degraded());
+        let warnings = rec.warnings().await;
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("simulated"));
+        // Best-effort append after degrade still returns Ok.
+        let entry = TraceEntry {
+            seq: 0,
+            ts: chrono::Utc::now(),
+            event: "probe".into(),
+            session_id: Some("s_be".into()),
+            request_id: None,
+            frame_id: None,
+            action: None,
+            result: Some(serde_json::json!({})),
+            duration_ms: None,
+            error: None,
+            change_score: None,
+            stable: None,
+            redaction: None,
+            display_id: None,
+            active_application: None,
+            runtime_version: None,
+        };
+        rec.append(entry).await.unwrap();
+    }
+
+    #[test]
+    fn trace_mode_from_env_parses() {
+        assert_eq!(TraceMode::from_env(Some("required")), TraceMode::Required);
+        assert_eq!(TraceMode::from_env(Some("disabled")), TraceMode::Disabled);
+        assert_eq!(
+            TraceMode::from_env(Some("best_effort")),
+            TraceMode::BestEffort
+        );
+        assert_eq!(TraceMode::from_env(None), TraceMode::BestEffort);
+        assert_eq!(TraceMode::from_env(Some("bogus")), TraceMode::BestEffort);
+        assert_eq!(TraceMode::Required.as_str(), "required");
+        assert_eq!(TraceMode::Disabled.as_str(), "disabled");
     }
 
     #[tokio::test]

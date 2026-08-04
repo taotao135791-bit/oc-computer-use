@@ -1,246 +1,217 @@
-// OpenCode plugin for the computer-use runtime.
+// OpenCode companion tooling for the computer-use runtime.
 //
-// Target API: OpenCode (https://opencode.ai) >= 1.x plugin API. A plugin is a
-// TypeScript module whose default export is a function receiving
-// `(config, context)` and returning `{ tools }`, where each tool has a
-// description, a zod input schema, and an async `run` returning
-// `string | { content: ... } | object`.
+// OpenCode itself consumes the runtime through the **MCP server**
+// (packages/mcp-server, binary `computer-use-mcp`) using OpenCode's official
+// config format:
 //
-// The minimal API types are declared locally (instead of importing the
-// `opencode` package) so this package builds standalone; the shapes match
-// OpenCode's documented plugin contract.
-//
-// Usage: add to opencode config
 //   {
-//     "plugin": ["./node_modules/@computer-use/opencode-adapter/dist/index.js"]
+//     "$schema": "https://opencode.ai/config.json",
+//     "mcp": {
+//       "computer-use": {
+//         "type": "local",
+//         "command": ["computer-use-mcp"],
+//         "enabled": true
+//       }
+//     }
 //   }
-// or copy config/opencode.config.json as a starting point. The daemon socket
-// can be overridden with COMPUTER_USE_SOCKET.
+//
+// This package is the companion CLI (`cu-opencode`): it generates that
+// config (`setup`), inspects daemon health and the active session
+// (`status`), checks the environment (`doctor`), and cleans up stray
+// sessions (`session cleanup`). It deliberately does **not** re-implement
+// the tools as an OpenCode plugin — MCP is the single supported wiring.
+
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import {
   connect,
   ComputerUseError,
-  type ComputerAction,
+  defaultSocketPath,
   type ComputerUseClient,
+  type Health,
+  type SessionResult,
 } from "@computer-use/sdk";
 
 // ---------------------------------------------------------------------------
-// Minimal OpenCode plugin API types (match opencode >= 1.x).
+// Config generation
 // ---------------------------------------------------------------------------
 
-export interface OpenCodeToolArgs {
-  [key: string]: unknown;
-}
+/** The MCP server binary installed by @computer-use/mcp-server. */
+export const MCP_BIN = "computer-use-mcp";
 
-export interface OpenCodeTool {
-  description: string;
-  args: Record<string, unknown>; // zod schema object
-  run: (input: OpenCodeToolArgs, context: unknown) => Promise<unknown>;
-}
-
-export interface OpenCodePluginResult {
-  tools: Record<string, OpenCodeTool>;
-}
-
-export interface OpenCodeConfig {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  [key: string]: any;
-}
-
-export type OpenCodePlugin = (
-  config: OpenCodeConfig,
-  context: unknown,
-) => OpenCodePluginResult | Promise<OpenCodePluginResult>;
-
-// ---------------------------------------------------------------------------
-// Tool registration
-// ---------------------------------------------------------------------------
-
-/** JSON-schema-ish description of `actions` used in error messages. */
-const ACTIONS_HINT =
-  'JSON array of actions, e.g. [{"type":"click","x":500,"y":400,"button":"left","coordinate_space":"normalized_1000"}]. Types: click, double_click, move, type, key, scroll, drag, wait. Coordinates default to normalized_1000.';
-
-export interface ComputerUseOpenCodeOptions {
-  /** Override the daemon socket path (default: ~/.computer-use/runtime.sock). */
-  socketPath?: string;
-}
-
-/** Build the OpenCode plugin. */
-export function computerUsePlugin(
-  options: ComputerUseOpenCodeOptions = {},
-): OpenCodePlugin {
-  return async function computerUseOpenCodePlugin(
-    _config: OpenCodeConfig,
-  ): Promise<OpenCodePluginResult> {
-    let client: ComputerUseClient | undefined;
-
-    async function getClient(): Promise<ComputerUseClient> {
-      if (client) return client;
-      client = await connect({
-        socketPath: options.socketPath ?? process.env.COMPUTER_USE_SOCKET,
-      });
-      return client;
-    }
-
-    function asError(err: unknown): string {
-      if (err instanceof ComputerUseError) {
-        return `ERROR ${err.code}: ${err.message}`;
-      }
-      return `ERROR: ${(err as Error).message ?? String(err)}`;
-    }
-
-    const tools: Record<string, OpenCodeTool> = {
-      computer_observe: {
-        description:
-          "Capture the current desktop. Returns the frame_id, dimensions, active application, and the path of the stored screenshot. Use frame_id for computer_act.",
-        args: {
-          session_id: { type: "string", optional: true },
-          include_cursor: { type: "boolean", optional: true },
-          max_width: { type: "number", optional: true, description: "downscale width" },
-          include_image: { type: "boolean", optional: true, default: false },
-        },
-        run: async (input: OpenCodeToolArgs) => {
-          try {
-            const c = await getClient();
-            const frame = await c.observe({
-              session_id: typeof input.session_id === "string" ? input.session_id : undefined,
-              include_cursor: input.include_cursor as boolean | undefined,
-              max_width: input.max_width as number | undefined,
-              include_image: input.include_image as boolean | undefined,
-            });
-            return {
-              frame_id: frame.frame_id,
-              session_id: frame.session_id,
-              width: frame.width,
-              height: frame.height,
-              display_id: frame.display_id,
-              scale_factor: frame.scale_factor,
-              active_application: frame.active_application ?? null,
-              image_path: frame.image_path,
-              captured_at: frame.captured_at,
-            };
-          } catch (err) {
-            return asError(err);
-          }
-        },
-      },
-
-      computer_act: {
-        description:
-          `Execute a batch of actions against the frame described by frame_id. ${ACTIONS_HINT} Acting on a stale frame is rejected (STALE_FRAME) — re-observe first.`,
-        args: {
-          session_id: { type: "string" },
-          frame_id: { type: "string", description: "frame_id from the most recent computer_observe" },
-          actions: { type: "string", description: ACTIONS_HINT },
-          wait_policy: { type: "string", optional: true, enum: ["none", "fixed", "until_stable"] },
-          fixed_wait_ms: { type: "number", optional: true },
-          return_screenshot: { type: "boolean", optional: true, default: false },
-        },
-        run: async (input: OpenCodeToolArgs) => {
-          try {
-            let actions: ComputerAction[];
-            try {
-              actions = JSON.parse(String(input.actions)) as ComputerAction[];
-            } catch {
-              return `ERROR INVALID_PARAMS: actions is not valid JSON. ${ACTIONS_HINT}`;
-            }
-            const c = await getClient();
-            const result = await c.act({
-              session_id: String(input.session_id),
-              frame_id: String(input.frame_id),
-              actions,
-              wait_policy: input.wait_policy as "none" | "fixed" | "until_stable" | undefined,
-              fixed_wait_ms: input.fixed_wait_ms as number | undefined,
-              return_screenshot: input.return_screenshot as boolean | undefined,
-            });
-            return {
-              executed: result.executed,
-              screen_changed: result.screen_changed,
-              stable: result.stable,
-              next_frame_id: result.next_frame_id ?? null,
-              action_results: result.action_results,
-            };
-          } catch (err) {
-            return asError(err);
-          }
-        },
-      },
-
-      computer_inspect: {
-        description:
-          "Crop a region from the last frame. Returns the crop as a PNG file path plus the mapping to translate crop coordinates back to global desktop coordinates.",
-        args: {
-          session_id: { type: "string" },
-          frame_id: { type: "string" },
-          x: { type: "number" },
-          y: { type: "number" },
-          width: { type: "number" },
-          height: { type: "number" },
-          coordinate_space: { type: "string", optional: true, enum: ["normalized_1000", "image_pixels"] },
-          scale: { type: "number", optional: true },
-        },
-        run: async (input: OpenCodeToolArgs) => {
-          try {
-            const c = await getClient();
-            const result = await c.inspect({
-              session_id: String(input.session_id),
-              frame_id: String(input.frame_id),
-              region: {
-                x: Number(input.x),
-                y: Number(input.y),
-                width: Number(input.width),
-                height: Number(input.height),
-                coordinate_space: (input.coordinate_space as "normalized_1000" | "image_pixels" | undefined) ?? "normalized_1000",
-              },
-              scale: input.scale as number | undefined,
-            });
-            return {
-              frame_id: result.frame_id,
-              width: result.width,
-              height: result.height,
-              mapping: result.mapping,
-              image_base64_length: result.image_base64.length,
-            };
-          } catch (err) {
-            return asError(err);
-          }
-        },
-      },
-
-      computer_session: {
-        description:
-          "Manage the computer-use session: start, status, pause, resume, stop, takeover, release. Sessions gate access to keyboard and mouse.",
-        args: {
-          action: { type: "string", enum: ["start", "status", "pause", "resume", "stop", "takeover", "release"] },
-          session_id: { type: "string", optional: true },
-          display_id: { type: "string", optional: true },
-        },
-        run: async (input: OpenCodeToolArgs) => {
-          try {
-            const c = await getClient();
-            const result = await c.session(input.action as "start", {
-              session_id: input.session_id as string | undefined,
-              display_id: input.display_id as string | undefined,
-            });
-            return {
-              session_id: result.session_id,
-              state: result.state,
-              paused: result.paused,
-              user_takeover: result.user_takeover,
-              lock_held: result.lock_held,
-              started_by: result.started_by,
-              ...(result.current_frame_id ? { current_frame_id: result.current_frame_id } : {}),
-            };
-          } catch (err) {
-            return asError(err);
-          }
-        },
-      },
-    };
-
-    return { tools };
+/** MCP server entry (the value under `mcp.computer-use`). */
+export function mcpConfigFragment(): Record<string, unknown> {
+  return {
+    type: "local",
+    command: [MCP_BIN],
+    enabled: true,
   };
 }
 
-/** Default export expected by OpenCode's plugin loader. */
-export default computerUsePlugin();
+/**
+ * Build an opencode config object with the computer-use MCP server merged
+ * in. Existing keys (other MCP servers, tools, agent config, ...) are kept;
+ * an existing `computer-use` entry is replaced with the current fragment.
+ */
+export function generateOpenCodeConfig(existing: Record<string, unknown> = {}): Record<string, unknown> {
+  const mcp = { ...(typeof existing.mcp === "object" && existing.mcp !== null ? (existing.mcp as Record<string, unknown>) : {}) };
+  mcp["computer-use"] = mcpConfigFragment();
+  return { ...existing, mcp };
+}
+
+/**
+ * Write (or merge into) an OpenCode config file. Returns the path written
+ * and whether the file existed before.
+ */
+export async function writeOpenCodeConfig(
+  path: string,
+  existing?: Record<string, unknown>,
+): Promise<{ path: string; existed: boolean; merged: boolean }> {
+  const existed = existsSync(path);
+  let base: Record<string, unknown>;
+  if (existing) {
+    base = existing;
+  } else if (existed) {
+    try {
+      base = JSON.parse(await readFile(path, "utf8"));
+    } catch {
+      throw new Error(`cannot parse existing config at ${path}`);
+    }
+  } else {
+    base = {};
+  }
+  const hadEntry = Boolean((base.mcp as Record<string, unknown> | undefined)?.["computer-use"]);
+  const config = generateOpenCodeConfig(base);
+  await writeFile(path, `${JSON.stringify(config, null, 2)}\n`);
+  return { path, existed, merged: hadEntry };
+}
+
+// ---------------------------------------------------------------------------
+// Introspection + cleanup
+// ---------------------------------------------------------------------------
+
+/** Text summary of daemon health and the current session (for `status`). */
+export async function statusText(client: ComputerUseClient): Promise<string> {
+  const health: Health = await client.health();
+  const lines = [
+    `daemon: v${health.version} ${health.ready ? "ready" : "NOT READY"}`,
+    `permissions: screen_recording=${health.permissions.screen_recording} accessibility=${health.permissions.accessibility}`,
+    `active_sessions: ${health.active_sessions}`,
+  ];
+  try {
+    const s: SessionResult = await client.session("status");
+    lines.push(
+      `session: ${s.session_id} state=${s.state} paused=${s.paused} takeover=${s.user_takeover} lock=${s.lock_held}`,
+      ...(s.current_frame_id ? [`current_frame_id: ${s.current_frame_id}`] : []),
+      ...(s.trace_dir ? [`trace_dir: ${s.trace_dir}`] : []),
+    );
+  } catch (err) {
+    if (err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND") {
+      lines.push("session: none");
+    } else {
+      lines.push(`session: ${(err as Error).message}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/** Stop the active session (if any); idempotent cleanup. */
+export async function cleanupSession(client: ComputerUseClient): Promise<{ stopped: boolean; message: string }> {
+  try {
+    const s: SessionResult = await client.session("status");
+    await client.session("stop", { session_id: s.session_id });
+    return {
+      stopped: true,
+      message: `stopped session ${s.session_id} (was ${s.state})`,
+    };
+  } catch (err) {
+    if (err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND") {
+      return { stopped: false, message: "no active session to clean up" };
+    }
+    throw err;
+  }
+}
+
+export interface DoctorReport {
+  daemon_binary: string | null;
+  socket_path: string;
+  socket_exists: boolean;
+  mcp_binary: string | null;
+  daemon_health: Health | null;
+  errors: string[];
+}
+
+/**
+ * Environment check: daemon binary on PATH, socket present, MCP binary on
+ * PATH, and (when reachable) daemon health/permissions.
+ */
+export async function doctor(options: { socketPath?: string } = {}): Promise<DoctorReport> {
+  const socketPath = options.socketPath ?? process.env.COMPUTER_USE_SOCKET ?? defaultSocketPath();
+  const errors: string[] = [];
+  const report: DoctorReport = {
+    daemon_binary: null,
+    socket_path: socketPath,
+    socket_exists: existsSync(socketPath),
+    mcp_binary: null,
+    daemon_health: null,
+    errors,
+  };
+
+  for (const name of ["cu", MCP_BIN]) {
+    try {
+      // `which` semantics without a shell: PATH lookup.
+      execFileSync("which", [name], { stdio: "ignore" });
+      if (name === "cu") report.daemon_binary = name;
+      else report.mcp_binary = name;
+    } catch {
+      // not on PATH
+    }
+  }
+  if (!report.daemon_binary) {
+    errors.push("`cu` binary not found on PATH — install with `cargo install --path crates/cu-cli` or use the daemon binary directly");
+  }
+  if (!report.mcp_binary) {
+    errors.push("`computer-use-mcp` binary not found on PATH — install the @computer-use/mcp-server package");
+  }
+  if (!report.socket_exists) {
+    errors.push(`no socket at ${socketPath} — start the daemon with \`cu daemon start\``);
+  } else {
+    try {
+      const client = await connect({ socketPath });
+      report.daemon_health = await client.health();
+      client.close();
+    } catch (err) {
+      errors.push(`daemon at ${socketPath} unreachable: ${(err as Error).message}`);
+    }
+  }
+  return report;
+}
+
+/** Human-readable doctor report. */
+export function doctorText(r: DoctorReport): string {
+  const lines = [
+    `cu binary:        ${r.daemon_binary ?? "NOT FOUND"}`,
+    `mcp binary:       ${r.mcp_binary ?? "NOT FOUND"}`,
+    `socket:           ${r.socket_path} (${r.socket_exists ? "present" : "missing"})`,
+  ];
+  if (r.daemon_health) {
+    lines.push(
+      `daemon:           v${r.daemon_health.version} ${r.daemon_health.ready ? "ready" : "NOT READY"} (screen_recording=${r.daemon_health.permissions.screen_recording}, accessibility=${r.daemon_health.permissions.accessibility})`,
+    );
+  } else {
+    lines.push("daemon:           unreachable");
+  }
+  if (r.errors.length > 0) {
+    lines.push("", "Issues found:", ...r.errors.map((e) => `  - ${e}`));
+  }
+  return lines.join("\n");
+}
+
+/** Default OpenCode config location. */
+export function defaultOpenCodeConfigPath(): string {
+  return join(homedir(), ".config", "opencode", "opencode.json");
+}

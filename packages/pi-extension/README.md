@@ -1,8 +1,10 @@
 # @computer-use/pi-extension
 
-A Pi extension that turns the computer-use runtime into tools **plus** a
-ready-made driver loop (`runDriverLoop`) for agents that don't want to wire
-tools by hand.
+A [Pi](https://pi.do.computer) (pi-coding-agent) extension that exposes the
+computer-use runtime to agents as **tools with real screenshot image
+content blocks** plus slash commands for session control. Built on Pi's
+official `@earendil-works/pi-coding-agent` Extension API (default-export
+factory).
 
 ## Install into Pi
 
@@ -10,53 +12,53 @@ tools by hand.
 pnpm add @computer-use/pi-extension
 ```
 
-Then register it with your Pi config (see
-[pi's extension docs](https://pi.do.computer/docs/extensions)):
-
-```js
-import { ComputerUseExtension } from "@computer-use/pi-extension";
-
-export const extensions = [new ComputerUseExtension()];
-```
-
-`ComputerUseExtension` exposes `toolSchemas()` (the four computer tools +
-trace tools), `ensureSession()`, `handleTool(name, args)` and
-`runDriverLoop(model, { maxSteps, systemPrompt? })`.
-
-## Driver Mode
+Register it in your Pi config (see [Pi's extension docs](https://pi.do.computer/docs/extensions)):
 
 ```ts
-const ext = new ComputerUseExtension();
-await ext.ensureSession();
+// pi.config.ts
+import computerUseExtension from "@computer-use/pi-extension";
 
-await ext.runDriverLoop(
-  {
-    decide: async (ctx) => {
-      // ctx: { frame, history } — frame has image (base64), size, app;
-      // history is the list of past {action, result} records.
-      // Call your model of choice with ctx, then return:
-      return { kind: "act", action: { type: "click", x: 500, y: 400 } };
-      // or { kind: "done" } when finished, { kind: "error", message } on failure.
-    },
-  },
-  { maxSteps: 10, systemPrompt: undefined }
-);
+export default computerUseExtension;
 ```
 
-`DRIVER_SYSTEM_PROMPT` is exported as a sensible default system prompt for
-models that take one.
+The extension talks to the daemon at `~/.computer-use/runtime.sock`
+(override with `COMPUTER_USE_SOCKET`). Sessions are started lazily on first
+tool use.
 
-Safety is enforced by the runtime, not the loop: STALE_FRAME results are
-retried with a fresh observe; PAUSED / USER_TAKEOVER / INVALID_SESSION_STATE
-errors surface as tool errors for the model to react to.
+## Tools
 
-## Without the loop
+| Tool | Purpose |
+|---|---|
+| `computer_session` | start / status / pause / resume / takeover / release / stop |
+| `computer_observe` | screenshot → text metadata + a **real image content block** (base64 + mimeType) |
+| `computer_act` | click / double_click / move / type / key / scroll / drag / wait on a frame; returns per-action results + the post-batch screenshot as an image block |
+| `computer_inspect` | crop a region of a frame → image block + coordinate mapping text |
 
-If you prefer wiring Pi tools yourself, use `ext.toolSchemas()` for schema and
-`ext.handleTool()` for execution — both accept and return plain JSON.
+All runtime safety (stale frames, pause, takeover, bounds, control lock) is
+enforced server-side; errors surface with the runtime's error codes.
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `/computer-status` | daemon health + real session state |
+| `/computer-start` | start a session |
+| `/computer-pause` / `/computer-resume` | pause / resume |
+| `/computer-takeover` / `/computer-release` | human takeover / hand control back |
+| `/computer-stop` | stop the session |
+| `/computer-observe` | save the current frame as PNG into the working directory |
+
+## Cancellation & lifecycle
+
+- Tool executions honor Pi's `AbortSignal`: a pre-aborted call returns
+  `Cancelled` immediately; an in-flight call propagates the abort to the
+  daemon request.
+- The extension listens for Pi's `session_shutdown` event and stops the
+  active session and closes its connection on quit / reload / session
+  switch.
 
 ## Tests
 
 ```bash
-pnpm test   # 8 tests incl. a driver loop and stale-frame retry (fake daemon)
+pnpm test   # 9 tests (fake daemon, drive the registered tools directly)
 ```

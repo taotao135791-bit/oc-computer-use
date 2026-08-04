@@ -1,61 +1,110 @@
 # @computer-use/opencode-adapter
 
-An [OpenCode](https://opencode.ai) plugin that exposes the computer-use
-runtime as four tools: `computer_observe`, `computer_act`, `computer_inspect`,
-`computer_session`.
+Companion tooling for using the [computer-use runtime](../../README.md) from
+[OpenCode](https://opencode.ai).
+
+**How OpenCode connects:** through the runtime's **MCP server**
+(`@computer-use/mcp-server`, binary `computer-use-mcp`), using OpenCode's
+official MCP config format. This package does **not** re-implement the tools
+as an OpenCode plugin — MCP is the single supported wiring.
+
+## What it provides
+
+`cu-opencode` — a CLI that keeps that wiring healthy:
+
+| Command | What it does |
+|---|---|
+| `cu-opencode setup` | adds the computer-use MCP server to `~/.config/opencode/opencode.json` (merges with existing config) |
+| `cu-opencode setup --print` | prints the config fragment to stdout |
+| `cu-opencode status` | daemon health (version, permissions, active sessions) + current session state |
+| `cu-opencode session cleanup` | stops the active session (idempotent) |
+| `cu-opencode doctor` | checks `cu`/`computer-use-mcp` binaries, socket, and daemon health; exits nonzero on issues |
+| `cu-opencode help` | usage |
+
+Also ships `config/opencode.config.json` — a ready-to-copy config with the
+MCP entry.
 
 ## Install
 
-```bash
-pnpm add @computer-use/opencode-adapter
-```
-
-## Configure
+From the repo (workspace):
 
 ```bash
-opencode add plugin -- npm:@computer-use/opencode-adapter
+pnpm --filter @computer-use/opencode-adapter build
+pnpm --filter @computer-use/opencode-adapter link  # puts cu-opencode on PATH
 ```
 
-or add to your OpenCode config (`config/opencode.config.json` — see the
-example in this repo):
+or as a published package:
+
+```bash
+pnpm add -g @computer-use/opencode-adapter @computer-use/mcp-server
+```
+
+## Wire OpenCode to the runtime
+
+The MCP server must be installed so `computer-use-mcp` is on PATH (or edit
+the `command` to its absolute path).
+
+```bash
+# 1. start the daemon
+cu daemon start
+
+# 2. generate the OpenCode config
+cu-opencode setup            # writes ~/.config/opencode/opencode.json
+cu-opencode doctor           # verify everything is reachable
+```
+
+Equivalent hand-written config (`config/opencode.config.json` in this repo):
 
 ```json
 {
-  "plugins": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "computer-use": {
-      "type": "npm",
-      "name": "@computer-use/opencode-adapter"
+      "type": "local",
+      "command": ["computer-use-mcp"],
+      "enabled": true
     }
   }
 }
 ```
 
-The plugin default-exports `computerUsePlugin()` which the loader picks up
-automatically. The tools speak to the daemon at
-`~/.computer-use/runtime.sock` (override with `COMPUTER_USE_SOCKET`).
+Restart OpenCode after changing the config. The MCP server registers the
+four tools — `computer_session`, `computer_observe`, `computer_act`,
+`computer_inspect` — with structured zod schemas (actions are a
+discriminated union, `region` is an object; no JSON-string-inside-JSON).
 
-## Tools
+## Smoke test (OpenCode)
 
-| Tool | Purpose |
-|---|---|
-| `computer_observe` | screenshot → frame_id + image + metadata |
-| `computer_act` | click/move/type/key/scroll/drag/wait on a frame |
-| `computer_inspect` | crop a region of a stored frame |
-| `computer_session` | session lifecycle |
-
-All runtime safety (stale frames, pause, takeover, bounds) is enforced
-server-side, so the adapter stays thin.
-
-## Programmatic use
-
-```ts
-import { computerUsePlugin } from "@computer-use/opencode-adapter";
-
-export default computerUsePlugin({ socketPath: process.env.COMPUTER_USE_SOCKET });
+```bash
+cu daemon start
+cu-opencode status            # daemon ready, no session
+opencode                      # start an agent session
 ```
+
+1. Ask: "use computer_session to start a session" → expect the session state
+   and a `session_id`.
+2. Ask: "use computer_observe to look at the screen" → expect a real
+   screenshot image (not a path or a file download).
+3. Ask: "use computer_act to move the mouse to (500, 500) normalized" →
+   expect success with a post-batch screenshot.
+4. Ask: "use computer_inspect on region (0,0,200,200)" → expect a cropped
+   image with a coordinate mapping.
+5. Trigger takeover outside the agent (`cu session takeover`) and ask it to
+   act → expect `USER_TAKEOVER_ACTIVE`; ask it to release then act again →
+   succeeds.
+6. `cu-opencode session cleanup` outside → next tool call from OpenCode
+   fails with `SESSION_NOT_FOUND` (clean, not stale).
+7. Quit OpenCode → `cu-opencode status` shows no session.
+
+## Library use
+
+All functionality is exported from `dist/index.js` as plain async functions
+(`generateOpenCodeConfig`, `writeOpenCodeConfig`, `statusText`,
+`cleanupSession`, `doctor`, `doctorText`, `defaultOpenCodeConfigPath`), so
+scripts and tests can drive it without spawning the CLI.
 
 ## Tests
 
 ```bash
-pnpm test   # 6 tests (fake daemon)
+pnpm test   # 10 tests (fake daemon)
 ```

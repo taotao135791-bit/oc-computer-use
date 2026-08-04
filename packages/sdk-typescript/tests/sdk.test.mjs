@@ -12,6 +12,7 @@ import {
   ComputerUseError,
   ComputerUseClient,
   TransportError,
+  AbortError,
   ERROR_CODES,
   errorCodeName,
 } from "../dist/index.js";
@@ -50,8 +51,28 @@ function startFakeDaemon({ outOfOrder = false } = {}) {
           respond({ jsonrpc: "2.0", id: req.id, error: { code: -32005, message: "PAUSED", data: { code: "PAUSED", message: "session paused" } } });
         } else if (req.method === "not_found") {
           respond({ jsonrpc: "2.0", id: req.id, error: { code: -32009, message: "SESSION_NOT_FOUND", data: { code: "SESSION_NOT_FOUND", message: "no active session" } } });
+        } else if (req.method === "takeover_active") {
+          respond({ jsonrpc: "2.0", id: req.id, error: { code: -32016, message: "USER_TAKEOVER_ACTIVE", data: { code: "USER_TAKEOVER_ACTIVE", message: "The user has taken control. Call release before resuming agent control." } } });
+        } else if (req.method === "timeout") {
+          respond({ jsonrpc: "2.0", id: req.id, error: { code: -32017, message: "ACTION_TIMEOUT", data: { code: "ACTION_TIMEOUT", message: "request timed out", method: "computer.act" } } });
+        } else if (req.method === "capture") {
+          respond({ jsonrpc: "2.0", id: req.id, error: { code: -32018, message: "CAPTURE_FAILED", data: { code: "CAPTURE_FAILED", message: "screen capture failed" } } });
         } else if (req.method === "hang") {
           // Never respond.
+        } else if (req.method === "computer.act") {
+          respond({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: {
+              executed: true,
+              action_results: [{ index: 0, status: "success", duration_ms: 5 }],
+              screen_changed: false,
+              stable: true,
+              next_frame_id: "frame_9",
+              stabilization: { outcome: "timed_out", change_score: 0.31, samples: 7, elapsed_ms: 2000 },
+              trace: { mode: "best_effort", degraded: false, warnings: [] },
+            },
+          });
         } else if (req.method === "computer.session") {
           const action = req.params?.action;
           if (action === "start") {
@@ -139,6 +160,39 @@ test("out-of-order responses are matched by id", async () => {
   }
 });
 
+test("aborting with a signal rejects with AbortError and drops the request", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const ac = new AbortController();
+    // Fire after the request is in flight (daemon hangs on "hang").
+    setTimeout(() => ac.abort(), 20);
+    const err = await client.request("hang", undefined, { signal: ac.signal }).catch((e) => e);
+    assert.ok(err instanceof AbortError);
+    assert.match(err.message, /aborted/);
+    // The client stays usable after an abort.
+    const echoed = await client.request("echo", { ok: true });
+    assert.deepEqual(echoed.echoed, { ok: true });
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("a pre-aborted signal rejects immediately", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const ac = new AbortController();
+    ac.abort();
+    const err = await client.request("hang", undefined, { signal: ac.signal }).catch((e) => e);
+    assert.ok(err instanceof AbortError);
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
 test("request timeout rejects with TransportError", async () => {
   const fake = startFakeDaemon();
   const client = await connect({ socketPath: fake.socketPath });
@@ -211,8 +265,83 @@ test("unconnected client rejects request()", async () => {
 test("errorCodeName maps jsonrpc codes", () => {
   assert.equal(errorCodeName(-32003), "STALE_FRAME");
   assert.equal(errorCodeName(-32005), "PAUSED");
+  assert.equal(errorCodeName(-32016), "USER_TAKEOVER_ACTIVE");
+  assert.equal(errorCodeName(-32017), "ACTION_TIMEOUT");
+  assert.equal(errorCodeName(-32018), "CAPTURE_FAILED");
   assert.equal(errorCodeName(-32700), "PARSE_ERROR");
   assert.equal(errorCodeName(-9999), ERROR_CODES.INTERNAL);
+});
+
+test("the full spec error taxonomy is exported (13 canonical names + aliases)", () => {
+  // Canonical programmatic names for every failure class in the spec.
+  assert.equal(ERROR_CODES.DAEMON_UNAVAILABLE, "DAEMON_UNAVAILABLE");
+  assert.equal(ERROR_CODES.PERMISSION_DENIED, "PERMISSION");
+  assert.equal(ERROR_CODES.SESSION_NOT_FOUND, "SESSION_NOT_FOUND");
+  assert.equal(ERROR_CODES.SESSION_PAUSED, "PAUSED");
+  assert.equal(ERROR_CODES.USER_TAKEOVER_ACTIVE, "USER_TAKEOVER_ACTIVE");
+  assert.equal(ERROR_CODES.CONTROL_LOCKED, "CONTROL_LOCKED");
+  assert.equal(ERROR_CODES.STALE_FRAME, "STALE_FRAME");
+  assert.equal(ERROR_CODES.OUT_OF_BOUNDS, "OUT_OF_BOUNDS");
+  assert.equal(ERROR_CODES.ACTION_CANCELLED, "CANCELLED");
+  assert.equal(ERROR_CODES.ACTION_TIMEOUT, "ACTION_TIMEOUT");
+  assert.equal(ERROR_CODES.CAPTURE_FAILED, "CAPTURE_FAILED");
+  assert.equal(ERROR_CODES.INVALID_REQUEST, "INVALID_REQUEST");
+  assert.equal(ERROR_CODES.TRACE_UNAVAILABLE, "TRACE_ERROR");
+  // The wire codes resolve to their canonical names.
+  assert.equal(errorCodeName(-32016), ERROR_CODES.USER_TAKEOVER_ACTIVE);
+  assert.equal(errorCodeName(-32017), ERROR_CODES.ACTION_TIMEOUT);
+  assert.equal(errorCodeName(-32018), ERROR_CODES.CAPTURE_FAILED);
+});
+
+test("new daemon error codes surface on ComputerUseError", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const t = await client.request("takeover_active").catch((e) => e);
+    assert.equal(t.code, "USER_TAKEOVER_ACTIVE");
+    assert.equal(t.jsonrpcCode, -32016);
+    const x = await client.request("timeout").catch((e) => e);
+    assert.equal(x.code, "ACTION_TIMEOUT");
+    assert.equal(x.jsonrpcCode, -32017);
+    const c = await client.request("capture").catch((e) => e);
+    assert.equal(c.code, "CAPTURE_FAILED");
+    assert.equal(c.jsonrpcCode, -32018);
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("TransportError carries the DAEMON_UNAVAILABLE code", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cu-sdk-unavail-"));
+  try {
+    const missing = join(dir, "missing.sock");
+    const err = await connect({ socketPath: missing }).catch((e) => e);
+    assert.ok(err instanceof TransportError);
+    assert.equal(err.code, "DAEMON_UNAVAILABLE");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("act result exposes stabilization and trace reports", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const res = await client.act({
+      session_id: "s1",
+      frame_id: "frame_1",
+      actions: [{ type: "wait", duration_ms: 1 }],
+    });
+    assert.equal(res.stabilization.outcome, "timed_out");
+    assert.equal(res.stabilization.change_score, 0.31);
+    assert.equal(res.stabilization.elapsed_ms, 2000);
+    assert.equal(res.trace.mode, "best_effort");
+    assert.equal(res.trace.degraded, false);
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
 });
 
 test("convenience wrappers pass params through", async () => {

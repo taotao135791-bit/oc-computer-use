@@ -21,7 +21,8 @@ use chrono::Utc;
 use cu_core::{
     ActParams, ActResult, CoordinateSpace, CuError, ErrorCode, ImageGeometry, InspectMapping,
     InspectParams, InspectResult, ObserveParams, ObserveResult, Region, ScreenFrame,
-    ScreenSnapshot, SessionAction, SessionResult, SessionState, WaitPolicy,
+    ScreenSnapshot, SessionAction, SessionResult, SessionState, StabilizationInfo, TraceReport,
+    WaitPolicy,
 };
 use cu_driver::{
     ApplicationInfo, CaptureRequest, ComputerDriver, DesktopLayout, DisplayInfo, PermissionStatus,
@@ -29,7 +30,7 @@ use cu_driver::{
 };
 use cu_policy::confirmation::Authorization;
 use cu_policy::{authorize, ConfirmationPolicy, TakeoverDetector, TakeoverPolicy};
-use cu_trace::{TraceConfig, TraceRecorder};
+use cu_trace::{TraceConfig, TraceMode, TraceRecorder};
 
 use crate::action_queue::{to_action_result_reports, ActionQueue};
 use crate::frames::FrameStore;
@@ -49,6 +50,8 @@ pub struct RuntimeConfig {
     pub traces_dir: PathBuf,
     pub frames_dir: PathBuf,
     pub trace_dev_mode: bool,
+    /// How strictly traces are recorded (required / best_effort / disabled).
+    pub trace_mode: TraceMode,
     pub takeover_policy: TakeoverPolicy,
 }
 
@@ -64,6 +67,7 @@ impl Default for RuntimeConfig {
             traces_dir: cu_core::config::traces_dir(),
             frames_dir: cu_core::config::frames_dir(),
             trace_dev_mode: false,
+            trace_mode: TraceMode::BestEffort,
             takeover_policy: TakeoverPolicy::AutoPause,
         }
     }
@@ -193,20 +197,30 @@ impl Runtime {
             None => self.driver.desktop_layout().await?.primary_id,
         };
 
-        let trace = match TraceRecorder::open(
-            &id,
-            &self.config.traces_dir,
-            TraceConfig {
-                dev_mode: self.config.trace_dev_mode,
+        let trace = match self.config.trace_mode {
+            // Disabled: no recorder at all; trace RPCs simply find nothing.
+            TraceMode::Disabled => None,
+            _ => match TraceRecorder::open(
+                &id,
+                &self.config.traces_dir,
+                TraceConfig {
+                    dev_mode: self.config.trace_dev_mode,
+                    mode: self.config.trace_mode,
+                },
+            )
+            .await
+            {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    if self.config.trace_mode == TraceMode::Required {
+                        // required: a session whose trace cannot be recorded
+                        // must not start silently without one.
+                        return Err(e);
+                    }
+                    tracing::warn!(session = %id, error = %e, "trace recorder unavailable; continuing without traces (degraded)");
+                    None
+                }
             },
-        )
-        .await
-        {
-            Ok(t) => Some(t),
-            Err(e) => {
-                tracing::warn!(session = %id, error = %e, "trace recorder unavailable; continuing without traces");
-                None
-            }
         };
 
         let session = SharedSession::new(Session::new(
@@ -258,7 +272,10 @@ impl Runtime {
     pub async fn session_resume(&self, session_id: &str) -> Result<SessionResult, CuError> {
         let session = self.get_session(session_id)?;
         match session.state() {
-            SessionState::Paused | SessionState::UserTakeover => {
+            // Only a paused session can be resumed by the agent. A session the
+            // user took over cannot be resumed — `release` is the only exit.
+            SessionState::UserTakeover => Err(CuError::UserTakeoverActive),
+            SessionState::Paused => {
                 session.transition(SessionState::Active)?;
                 if let Some(t) = session.trace.as_ref() {
                     let _ = t
@@ -286,8 +303,17 @@ impl Runtime {
         Ok(self.session_result(&session))
     }
 
+    /// Hand control back to the agent. Only valid while the user holds the
+    /// session (state `UserTakeover`); releasing an active/paused session is
+    /// a no-op error, not a silent state flip.
     pub async fn session_release(&self, session_id: &str) -> Result<SessionResult, CuError> {
         let session = self.get_session(session_id)?;
+        if session.state() != SessionState::UserTakeover {
+            return Err(CuError::InvalidSessionState(format!(
+                "cannot release a session in state {:?}; release is only valid while the user holds control",
+                session.state()
+            )));
+        }
         session.transition(SessionState::Active)?;
         if let Some(t) = session.trace.as_ref() {
             let _ = t
@@ -434,7 +460,14 @@ impl Runtime {
                 .jpeg_quality
                 .unwrap_or(self.config.observe_jpeg_quality),
         };
-        let captured = self.driver.capture(request).await?;
+        // A capture failure is a CAPTURE_FAILED error, distinct from generic
+        // driver failures, so agents can distinguish "screen could not be
+        // captured" from other bridge problems.
+        let captured = self
+            .driver
+            .capture(request)
+            .await
+            .map_err(|e| CuError::CaptureFailed(e.to_string()))?;
 
         // A cheap snapshot gives us the thumbnail + live app name for the
         // stale-frame fingerprint of this frame.
@@ -571,13 +604,23 @@ impl Runtime {
                 })
             })?;
         let before_screen: ScreenSnapshot = before_q.clone().into();
-        let live_id =
-            cu_core::config::new_frame_id(self.frame_counter.fetch_add(1, Ordering::SeqCst));
+        // The "current frame" the referenced frame is checked against is the
+        // session's latest observed frame (used by the strict policy, which
+        // rejects any non-current frame_id). The live visual comparison runs
+        // regardless.
+        let current_frame_id = session
+            .current_frame_id
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| {
+                cu_core::config::new_frame_id(self.frame_counter.fetch_add(1, Ordering::SeqCst))
+            });
         let verdict = self.stale.check(
             &referenced_snapshot,
             &before_screen,
             &params.frame_id,
-            &live_id,
+            &current_frame_id,
         );
         if verdict.is_stale {
             return Err(self.stale.to_error(&verdict));
@@ -603,7 +646,7 @@ impl Runtime {
                 &session,
                 &batch.actions,
                 &geometry,
-                token,
+                token.clone(),
                 &mut takeover,
                 session.trace.as_ref(),
                 request_id.as_deref(),
@@ -614,8 +657,10 @@ impl Runtime {
             .await?;
         *session.last_action_at.lock().unwrap() = Some(Utc::now());
 
-        // Wait policy.
+        // Wait policy. The batch token is passed to the stabilizer so a
+        // pause/takeover/stop during the wait cancels it immediately.
         let mut stable = false;
+        let mut stabilization: Option<StabilizationInfo> = None;
         match batch.wait_policy {
             WaitPolicy::None => {}
             WaitPolicy::Fixed => {
@@ -627,11 +672,34 @@ impl Runtime {
             WaitPolicy::UntilStable => {
                 let stabilizer = Stabilizer::new(self.driver.as_ref(), self.config.stabilizer);
                 match stabilizer
-                    .until_stable(&session.display_id, &before_q)
+                    .until_stable(&session.display_id, &before_q, &token)
                     .await
                 {
-                    Ok(StabilizeOutcome::Stable { .. }) => stable = true,
-                    Ok(StabilizeOutcome::TimedOut { .. }) => stable = false,
+                    Ok(StabilizeOutcome::Stable {
+                        change_score,
+                        samples,
+                    }) => {
+                        stable = true;
+                        stabilization = Some(StabilizationInfo {
+                            outcome: "stable".into(),
+                            change_score,
+                            samples,
+                            elapsed_ms: None,
+                        });
+                    }
+                    Ok(StabilizeOutcome::TimedOut {
+                        change_score,
+                        samples,
+                        elapsed_ms,
+                    }) => {
+                        stable = false;
+                        stabilization = Some(StabilizationInfo {
+                            outcome: "timed_out".into(),
+                            change_score,
+                            samples,
+                            elapsed_ms: Some(elapsed_ms),
+                        });
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -671,6 +739,18 @@ impl Runtime {
                 (None, None)
             };
 
+        // Trace status for this batch: surfaces best-effort degradation so
+        // callers know the trace may be incomplete (see TraceReport).
+        let trace = if let Some(t) = session.trace.as_ref() {
+            Some(TraceReport {
+                mode: self.config.trace_mode.as_str().to_string(),
+                degraded: t.is_degraded(),
+                warnings: t.warnings().await,
+            })
+        } else {
+            None
+        };
+
         Ok(ActResult {
             executed,
             action_results: reports,
@@ -678,6 +758,8 @@ impl Runtime {
             stable,
             next_frame_id,
             screenshot,
+            stabilization,
+            trace,
         })
     }
 
@@ -822,10 +904,12 @@ mod tests {
     use std::sync::Arc;
 
     /// A deterministic in-memory driver that lets us exercise every gate
-    /// without a real display.
+    /// without a real display. `Wait` actions actually sleep (so in-flight
+    /// cancellation can be observed); every execute is counted.
     #[derive(Default)]
     struct FakeDriver {
         pub pointer: std::sync::Mutex<Point>,
+        pub executes: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -898,8 +982,14 @@ mod tests {
             &self,
             action: &cu_driver::ResolvedAction,
         ) -> Result<cu_driver::ActionResult, CuError> {
+            self.executes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let cu_driver::ResolvedAction::Move { to, .. } = action {
                 *self.pointer.lock().unwrap() = *to;
+            }
+            if let cu_driver::ResolvedAction::Wait { duration_ms } = action {
+                // Actually wait, so a mid-batch takeover can be observed.
+                tokio::time::sleep(Duration::from_millis((*duration_ms).min(1000))).await;
             }
             Ok(cu_driver::ActionResult {
                 success: true,
@@ -928,17 +1018,29 @@ mod tests {
     }
 
     fn test_config() -> RuntimeConfig {
-        let dir = tempfile::tempdir().unwrap();
+        // Stable per-process temp dir (kept alive for the whole test binary,
+        // unlike tempfile::tempdir which drops the directory on return).
+        let dir = std::env::temp_dir().join(format!("cu-runtime-tests-{}", std::process::id()));
         RuntimeConfig {
-            traces_dir: dir.path().join("traces"),
-            frames_dir: dir.path().join("frames"),
+            traces_dir: dir.join("traces"),
+            frames_dir: dir.join("frames"),
             ..RuntimeConfig::default()
         }
     }
 
-    async fn runtime() -> Runtime {
+    async fn runtime_with_config(cfg: RuntimeConfig) -> Arc<Runtime> {
         let driver = Arc::new(FakeDriver::default());
-        Runtime::new(driver, test_config())
+        Arc::new(Runtime::new(driver, cfg))
+    }
+
+    async fn runtime() -> Arc<Runtime> {
+        runtime_with_driver().await.0
+    }
+
+    async fn runtime_with_driver() -> (Arc<Runtime>, Arc<FakeDriver>) {
+        let driver = Arc::new(FakeDriver::default());
+        let rt = Arc::new(Runtime::new(driver.clone(), test_config()));
+        (rt, driver)
     }
 
     #[tokio::test]
@@ -974,6 +1076,159 @@ mod tests {
         let status = rt.session_status(&started.session_id).await.unwrap();
         assert_eq!(status.state, SessionState::Stopped);
         assert!(!status.lock_held);
+    }
+
+    fn wait_params(session_id: &str, frame_id: &str) -> ActParams {
+        ActParams {
+            session_id: session_id.into(),
+            frame_id: frame_id.into(),
+            actions: vec![ComputerAction::Wait { duration_ms: 1 }],
+            wait_policy: None,
+            fixed_wait_ms: None,
+            return_screenshot: None,
+            risk_level: None,
+            requires_confirmation: None,
+            policy_context: None,
+        }
+    }
+
+    /// The full takeover/resume/release matrix. A takeover must NOT be
+    /// bypassable by a plain `resume`: resume only recovers `Paused`, release
+    /// is the only exit from `UserTakeover`, and release outside takeover is
+    /// itself rejected.
+    #[tokio::test]
+    async fn takeover_cannot_be_bypassed_by_resume() {
+        let rt = runtime().await;
+        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let sid = s.session_id.clone();
+
+        // 1. Pause → act rejected.
+        rt.session_pause(&sid).await.unwrap();
+        let err = rt
+            .act(wait_params(&sid, "frame_x"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Paused);
+
+        // 2. Pause → resume succeeds.
+        rt.session_resume(&sid).await.unwrap();
+        let st = rt.session_status(&sid).await.unwrap();
+        assert_eq!(st.state, SessionState::Active);
+
+        // 3. Takeover → act rejected.
+        rt.session_takeover(&sid).await.unwrap();
+        let err = rt
+            .act(wait_params(&sid, "frame_x"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::UserTakeover);
+
+        // 4. Takeover → resume REJECTED with USER_TAKEOVER_ACTIVE; state holds.
+        let err = rt.session_resume(&sid).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::UserTakeoverActive);
+        assert!(
+            err.to_string().contains("release"),
+            "error must point at release: {err}"
+        );
+        let st = rt.session_status(&sid).await.unwrap();
+        assert_eq!(st.state, SessionState::UserTakeover);
+        assert!(st.user_takeover);
+        assert!(!st.paused);
+
+        // 5. Takeover → release succeeds and returns to Active.
+        let rel = rt.session_release(&sid).await.unwrap();
+        assert_eq!(rel.state, SessionState::Active);
+        assert!(!rel.user_takeover);
+
+        // 6. After release, acting works again (fresh frame, fresh act).
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    include_image: Some(false),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let res = rt
+            .act(wait_params(&sid, &obs.frame_id), None)
+            .await
+            .unwrap();
+        assert!(res.executed);
+
+        // 7. Release outside takeover is rejected (no silent no-op).
+        let err = rt.session_release(&sid).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidSessionState);
+
+        rt.session_stop(&sid).await.unwrap();
+    }
+
+    /// Takeover mid-batch: the in-flight act stops at the next safe boundary
+    /// and the remaining actions are reported `cancelled` — none execute.
+    #[tokio::test]
+    async fn takeover_cancels_in_flight_actions() {
+        let (rt, fake) = runtime_with_driver().await;
+        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let sid = s.session_id.clone();
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let params = ActParams {
+            session_id: sid.clone(),
+            frame_id: obs.frame_id.clone(),
+            actions: vec![
+                ComputerAction::Wait { duration_ms: 200 },
+                ComputerAction::Wait { duration_ms: 200 },
+                ComputerAction::Wait { duration_ms: 200 },
+            ],
+            wait_policy: None,
+            fixed_wait_ms: None,
+            return_screenshot: None,
+            risk_level: None,
+            requires_confirmation: None,
+            policy_context: None,
+        };
+
+        let rt2 = rt.clone();
+        let handle = tokio::spawn(async move { rt2.act(params, None).await });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        rt.session_takeover(&sid).await.unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(
+            result.action_results[0].status, "success",
+            "first action ran"
+        );
+        for report in &result.action_results[1..] {
+            assert_eq!(
+                report.status, "cancelled",
+                "actions after takeover must be cancelled, got {report:?}"
+            );
+        }
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the first action may reach the driver"
+        );
+
+        // The session is still under takeover and still rejects actions.
+        let err = rt
+            .act(wait_params(&sid, &obs.frame_id), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::UserTakeover);
+        rt.session_release(&sid).await.unwrap();
+        rt.session_stop(&sid).await.unwrap();
     }
 
     #[tokio::test]
@@ -1018,6 +1273,146 @@ mod tests {
         let err = rt.act(params(&obs.frame_id), None).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::StaleFrame);
         rt.session_stop(&s.session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn act_strict_policy_rejects_older_frames() {
+        // Default policy is Strict: only the session's current frame is
+        // actionable, even when the older frame's pixels still match.
+        let rt = runtime().await;
+        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let obs1 = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let obs2 = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(obs1.frame_id, obs2.frame_id);
+        let err = rt
+            .act(wait_params(&s.session_id, &obs1.frame_id), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::StaleFrame);
+        // The current frame still runs (fake screen is unchanged).
+        rt.act(wait_params(&s.session_id, &obs2.frame_id), None)
+            .await
+            .unwrap();
+        rt.session_stop(&s.session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn act_visual_match_accepts_older_identical_frames() {
+        // VisualMatch policy: an older frame whose content still matches the
+        // live screen is actionable (the pre-strict runtime behavior).
+        let mut cfg = test_config();
+        cfg.stale.policy = crate::stale_frame::StaleFramePolicy::VisualMatch;
+        let rt = runtime_with_config(cfg).await;
+        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let obs1 = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let obs2 = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        // The older frame still matches the live screen → allowed.
+        rt.act(wait_params(&s.session_id, &obs1.frame_id), None)
+            .await
+            .unwrap();
+        rt.act(wait_params(&s.session_id, &obs2.frame_id), None)
+            .await
+            .unwrap();
+        rt.session_stop(&s.session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_trace_mode_fails_session_start_without_trace() {
+        // traces_dir points at a file, so create_dir_all fails → session
+        // start must fail under Required (best_effort would degrade instead).
+        let file = std::env::temp_dir().join(format!("cu-required-trace-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let mut cfg = test_config();
+        cfg.trace_mode = cu_trace::TraceMode::Required;
+        cfg.traces_dir = file.clone();
+        let rt = runtime_with_config(cfg).await;
+        let err = rt.session_start(None, "test".into()).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::TraceError);
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn act_reports_trace_mode_and_degradation() {
+        // Best-effort (default): act carries a trace report, mode best_effort.
+        let rt = runtime().await;
+        let s = rt.session_start(None, "test".into()).await.unwrap();
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let res = rt
+            .act(wait_params(&s.session_id, &obs.frame_id), None)
+            .await
+            .unwrap();
+        let trace = res.trace.expect("best_effort act must report trace status");
+        assert_eq!(trace.mode, "best_effort");
+        assert!(!trace.degraded);
+        assert!(trace.warnings.is_empty());
+        rt.session_stop(&s.session_id).await.unwrap();
+
+        // Disabled: no recorder exists → no trace report.
+        let mut cfg = test_config();
+        cfg.trace_mode = cu_trace::TraceMode::Disabled;
+        let rt2 = runtime_with_config(cfg).await;
+        let s2 = rt2.session_start(None, "test".into()).await.unwrap();
+        let obs2 = rt2
+            .observe(
+                ObserveParams {
+                    session_id: Some(s2.session_id.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let res2 = rt2
+            .act(wait_params(&s2.session_id, &obs2.frame_id), None)
+            .await
+            .unwrap();
+        assert!(res2.trace.is_none(), "disabled mode has no trace report");
+        rt2.session_stop(&s2.session_id).await.unwrap();
     }
 
     #[tokio::test]

@@ -1,10 +1,13 @@
 {
   "name": "@computer-use/opencode-adapter",
   "version": "0.1.0",
-  "description": "OpenCode plugin exposing the computer-use daemon's four tools (observe/act/inspect/session)",
+  "description": "Companion CLI (cu-opencode) for using the computer-use runtime from OpenCode via its MCP server",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "cu-opencode": "./dist/cli.js"
+  },
   "files": [
     "dist",
     "config"

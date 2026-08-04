@@ -1,7 +1,7 @@
 {
   "name": "@computer-use/pi-extension",
   "version": "0.1.0",
-  "description": "Driver-mode extension exposing the computer-use runtime's four tools to agents (Pi, or any model harness)",
+  "description": "Pi (pi-coding-agent) extension exposing the computer-use runtime's four tools to agents, with real screenshot image blocks",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -18,9 +18,12 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@computer-use/sdk": "workspace:*"
+    "@computer-use/sdk": "workspace:*",
+    "@earendil-works/pi-ai": "^0.83.0",
+    "typebox": "^1.3.7"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.83.0",
     "@types/node": "^24.0.0",
     "typescript": "^5.5.0"
   }

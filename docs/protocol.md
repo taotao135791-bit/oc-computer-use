@@ -33,12 +33,17 @@ Example:
 `error.code` is the JSON-RPC number, `error.message` is the stable machine
 code, and `data` carries the same code plus a human message and detail.
 
-**Staleness is decided against the live screen**, not just by comparing id
-numbers: a referenced frame is stale when the live desktop differs from it
-(thumbnail diff over the configured threshold) or when the frontmost app
-changed — even a slightly older `frame_id` whose content still matches the
-screen is actionable. That is intentional: it rejects acting on outdated
-reality, not merely on an old id.
+**Staleness is decided against the live screen** in addition to id
+comparisons: a referenced frame is stale when the live desktop differs from
+it (thumbnail diff over the configured threshold), when the frontmost app
+changed, or when it is too old. Two policies control how strictly the
+referenced `frame_id` itself is checked (`COMPUTER_USE_STALE_POLICY`):
+
+- `strict` (default): only the session's **current** frame is actionable;
+  acting on any older `frame_id` is `STALE_FRAME` regardless of how similar
+  the pixels are. The live-screen checks still run on top.
+- `visual_match`: a slightly older `frame_id` whose content still matches the
+  live screen is actionable (the live-screen checks decide).
 
 | JSON-RPC code | Machine code | Meaning |
 |---|---|---|
@@ -46,18 +51,39 @@ reality, not merely on an old id.
 | -32601 | `METHOD_NOT_FOUND` | unknown method |
 | -32602 | `INVALID_PARAMS` | missing/wrong params (e.g. observe without `session_id`) |
 | -32000 | `INTERNAL` | internal failure |
-| -32003 | `STALE_FRAME` | acted on a non-current frame |
+| -32003 | `STALE_FRAME` | acted on a stale/out-of-date frame |
 | -32005 | `PAUSED` | session is paused |
 | -32006 | `USER_TAKEOVER` | user is driving the machine |
 | -32009 | `SESSION_NOT_FOUND` | unknown session id |
 | -32010 | `INVALID_SESSION_STATE` | session already stopped, or transition invalid |
 | -32015 | `UNSUPPORTED` | feature not supported (e.g. on this macOS) |
+| -32016 | `USER_TAKEOVER_ACTIVE` | `resume` while the user holds control — call `release` first |
+| -32017 | `ACTION_TIMEOUT` | request exceeded the daemon deadline (batch still running) |
+| -32018 | `CAPTURE_FAILED` | screen capture failed (driver/capture failure) |
 | — | `OUT_OF_BOUNDS` | coordinate outside the display |
 | — | `CONTROL_LOCKED` | control lock held elsewhere |
 | — | `CANCELLED` | action cancelled (computer.cancel) |
 | — | `DRIVER_ERROR` | bridge/driver failure (e.g. Screen Recording permission missing) |
 | — | `PERMISSION` | macOS permission missing |
 | — | `CONFIRMATION_REQUIRED` | confirmation gating enabled |
+| — | `TRACE_ERROR` | trace unavailable/failed (see trace modes below) |
+
+### Trace modes
+
+Trace recording policy is set with `COMPUTER_USE_TRACE_MODE`:
+
+- `best_effort` (default): a trace write failure degrades the trace (the
+  response's `trace` object reports `degraded: true` + warnings) but the
+  operation succeeds.
+- `required`: session start fails if a trace cannot be opened; an act batch
+  fails if its trace entries cannot be written.
+- `disabled`: no trace recorder is created; `computer.act` responses have no
+  `trace` object.
+
+`computer.act` responses include `trace: {mode, degraded, warnings}` when a
+recorder exists, so callers can tell when a trace may be incomplete. `type`
+text is always redacted to `{text_redacted, character_count}` unless the
+daemon runs with `COMPUTER_USE_TRACE_DEV_MODE=1`.
 
 ## Methods
 
@@ -130,8 +156,13 @@ Coordinates: `normalized_1000` (0–1000 across the display) or `image_pixels`
 (the pixels of the frame returned by observe). All actions accept
 `wait_policy`: `none` | `fixed` (with `fixed_wait_ms`) | `until_stable`.
 
-Result: `{session_id, frame_id, action_results: [{index, status,
-duration_ms, error?}]}`.
+Result: `{executed, action_results: [{index, status, duration_ms, error?}],
+screen_changed, stable, next_frame_id?, screenshot?, stabilization?, trace?}`.
+`stabilization` (when `wait_policy: "until_stable"`) is
+`{outcome: "stable"|"timed_out", change_score, samples, elapsed_ms?}` —
+`change_score` is the **last measured** thumbnail difference, never a
+fabricated 0, so a timeout reports how close the screen actually got to
+settling. `trace` is `{mode, degraded, warnings}` (see [Trace modes](#trace-modes)).
 
 ### computer.inspect
 

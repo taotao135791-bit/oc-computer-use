@@ -172,24 +172,114 @@ export function createComputerUseServer(client?: ComputerUseClient): McpServer {
   );
 
   // --- computer_act --------------------------------------------------------
+  // Structured (non-JSON-string) action schema: a zod discriminated union that
+  // mirrors the runtime's serde tagged union exactly (tag `type`, snake_case
+  // variants). The MCP input schema is generated from this zod schema, so the
+  // model receives the real field list per action type — no JSON string
+  // inside JSON, no hand-rolled parsing on this side.
+
+  const coordinateSpace = z
+    .enum(["normalized_1000", "image_pixels"])
+    .default("normalized_1000")
+    .describe("Coordinate space (default normalized_1000; image treated as a 1000x1000 canvas)");
+
+  const pointSchema = z.object({
+    x: z.number().min(0).describe("X in the coordinate space"),
+    y: z.number().min(0).describe("Y in the coordinate space"),
+  });
+
+  const actionSchemas = {
+    click: z.object({
+      type: z.literal("click"),
+      x: z.number().min(0).describe("Click X"),
+      y: z.number().min(0).describe("Click Y"),
+      button: z.enum(["left", "right", "middle"]).default("left"),
+      coordinate_space: coordinateSpace,
+    }),
+    double_click: z.object({
+      type: z.literal("double_click"),
+      x: z.number().min(0).describe("Click X"),
+      y: z.number().min(0).describe("Click Y"),
+      button: z.enum(["left", "right", "middle"]).default("left"),
+      coordinate_space: coordinateSpace,
+    }),
+    move: z.object({
+      type: z.literal("move"),
+      x: z.number().min(0).describe("Move target X"),
+      y: z.number().min(0).describe("Move target Y"),
+      coordinate_space: coordinateSpace,
+      duration_ms: z.number().int().min(0).optional().describe("Animation duration in ms"),
+    }),
+    type: z.object({
+      type: z.literal("type"),
+      text: z
+        .string()
+        .max(10_000)
+        .describe("Text to type; logged redacted by default"),
+      method: z
+        .enum(["keyboard", "clipboard"])
+        .default("keyboard")
+        .describe("Input method (default keyboard)"),
+    }),
+    key: z.object({
+      type: z.literal("key"),
+      keys: z
+        .array(z.string())
+        .min(1)
+        .max(16)
+        .describe("Key names, e.g. [\"return\"] or [\"cmd\", \"c\"]"),
+    }),
+    scroll: z.object({
+      type: z.literal("scroll"),
+      x: z.number().min(0).optional().describe("Scroll position X (optional)"),
+      y: z.number().min(0).optional().describe("Scroll position Y (optional)"),
+      delta_x: z.number().optional().describe("Horizontal scroll delta"),
+      delta_y: z.number().optional().describe("Vertical scroll delta"),
+      coordinate_space: coordinateSpace,
+    }),
+    drag: z.object({
+      type: z.literal("drag"),
+      from: pointSchema.describe("Drag start"),
+      to: pointSchema.describe("Drag end"),
+      coordinate_space: coordinateSpace,
+      duration_ms: z.number().int().min(0).optional().describe("Drag duration in ms"),
+    }),
+    wait: z.object({
+      type: z.literal("wait"),
+      duration_ms: z.number().int().min(1).max(600_000).describe("Milliseconds to wait"),
+    }),
+  } as const;
+
+  const actionUnion = z.discriminatedUnion("type", [
+    actionSchemas.click,
+    actionSchemas.double_click,
+    actionSchemas.move,
+    actionSchemas.type,
+    actionSchemas.key,
+    actionSchemas.scroll,
+    actionSchemas.drag,
+    actionSchemas.wait,
+  ]);
+
   server.registerTool(
     "computer_act",
     {
       title: "Execute computer actions",
       description:
-        "Execute a batch of actions on the frame described by frame_id. Actions is a JSON " +
-        "array of tagged objects, e.g. " +
-        `[{"type":"click","x":500,"y":400,"button":"left","coordinate_space":"normalized_1000"}]` +
-        ". Valid types: click, double_click, move, type (with text), key (with keys array), " +
-        "scroll (delta_x/delta_y), drag (from/to), wait (duration_ms). Coordinates use " +
-        "normalized_1000 by default (image treated as a 1000x1000 canvas). The frame must " +
-        "be the most recent observe — acting on a stale frame is rejected with STALE_FRAME.",
+        "Execute a batch of 1-50 actions on the frame described by frame_id. Each action is " +
+        "a structured object discriminated on `type`: click, double_click, move, type (with " +
+        "text), key (with keys), scroll (delta_x/delta_y), drag (from/to), wait (duration_ms). " +
+        "Coordinates are in normalized_1000 by default (the image treated as a 1000x1000 " +
+        "canvas); image_pixels uses the frame's raw pixel grid. The frame must be the most " +
+        "recent observe — acting on a stale frame is rejected with STALE_FRAME.",
       inputSchema: z.object({
         session_id: z.string(),
         frame_id: z.string().describe("frame_id from the most recent computer_observe"),
         actions: z
-          .string()
-          .describe("JSON string: array of action objects (see description)"),
+          .array(actionUnion)
+          .min(1)
+          .max(50)
+          .describe("Ordered action batch, executed in sequence"),
         wait_policy: z.enum(["none", "fixed", "until_stable"]).optional(),
         fixed_wait_ms: z.number().int().min(0).optional(),
         return_screenshot: z.boolean().optional(),
@@ -197,20 +287,11 @@ export function createComputerUseServer(client?: ComputerUseClient): McpServer {
     },
     async ({ session_id, frame_id, actions, wait_policy, fixed_wait_ms, return_screenshot }) => {
       try {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(actions);
-        } catch {
-          return {
-            content: [textBlock("ERROR INVALID_PARAMS: `actions` is not valid JSON")],
-            isError: true,
-          };
-        }
         const c = await getClient();
         const result = await c.act({
           session_id,
           frame_id,
-          actions: parsed as ComputerAction[],
+          actions: actions as ComputerAction[],
           wait_policy,
           fixed_wait_ms,
           return_screenshot: return_screenshot ?? true,
@@ -243,19 +324,29 @@ export function createComputerUseServer(client?: ComputerUseClient): McpServer {
       description:
         "Crop a region from the last frame and return it as an image block, with the " +
         "mapping needed to translate inspect-relative coordinates back to global " +
-        "desktop coordinates (global_origin, normalized_1000_origin).",
+        "desktop coordinates (global_origin, normalized_1000_origin). The region is a " +
+        "structured object, not a JSON string.",
       inputSchema: z.object({
         session_id: z.string(),
         frame_id: z.string(),
-        x: z.number().min(0).describe("Region left in the frame's coordinate space"),
-        y: z.number().min(0).describe("Region top in the frame's coordinate space"),
-        width: z.number().min(1).describe("Region width"),
-        height: z.number().min(1).describe("Region height"),
-        coordinate_space: z
-          .enum(["normalized_1000", "image_pixels"])
+        region: z
+          .object({
+            x: z.number().min(0).describe("Region left in the frame's coordinate space"),
+            y: z.number().min(0).describe("Region top in the frame's coordinate space"),
+            width: z.number().min(1).describe("Region width"),
+            height: z.number().min(1).describe("Region height"),
+            coordinate_space: coordinateSpace.describe(
+              "Coordinate space of x/y/width/height (default normalized_1000)",
+            ),
+          })
+          .describe("Rectangle to crop from the frame"),
+        scale: z
+          .number()
+          .int()
+          .min(1)
+          .max(8)
           .optional()
-          .describe("Coordinate space of x/y/width/height (default normalized_1000)"),
-        scale: z.number().int().min(1).optional().describe("Integer zoom applied to the crop"),
+          .describe("Integer zoom applied to the crop"),
       }),
     },
     async (p) => {
@@ -264,13 +355,7 @@ export function createComputerUseServer(client?: ComputerUseClient): McpServer {
         const result = await c.inspect({
           session_id: p.session_id,
           frame_id: p.frame_id,
-          region: {
-            x: p.x,
-            y: p.y,
-            width: p.width,
-            height: p.height,
-            coordinate_space: p.coordinate_space ?? "normalized_1000",
-          },
+          region: p.region,
           scale: p.scale,
         });
         const blocks: ContentBlock[] = [

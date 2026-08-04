@@ -30,8 +30,8 @@ runtime executes*.
 | Trace recorder | [crates/cu-trace](crates/cu-trace) | session JSONL traces with redaction |
 | TypeScript SDK | [packages/sdk-typescript](packages/sdk-typescript) | `ComputerUseClient` for Node agents |
 | MCP Server | [packages/mcp-server](packages/mcp-server) | 7 tools (observe/act/inspect/session/cancel/trace) as image content blocks |
-| Pi Extension | [packages/pi-extension](packages/pi-extension) | tools + a built-in `runDriverLoop` |
-| OpenCode adapter | [packages/opencode-adapter](packages/opencode-adapter) | plugin exposing the four tools to OpenCode |
+| Pi Extension | [packages/pi-extension](packages/pi-extension) | 4 tools with real image content blocks + 8 slash commands, abort + lifecycle |
+| OpenCode adapter | [packages/opencode-adapter](packages/opencode-adapter) | companion CLI (`cu-opencode`) + official MCP config for OpenCode |
 | Inspector | [apps/cu-inspector](apps/cu-inspector) | minimal local dashboard (http://127.0.0.1:8420) |
 
 ## Quick start
@@ -78,27 +78,6 @@ Everything the runtime enforces — frame staleness, coordinates in bounds,
 pause, takeover, session state, the control lock — is enforced **server-side**,
 not by the client, so every adapter gets the same guarantees.
 
-## Driver Mode (agents that prefer acting over tool schemas)
-
-`packages/pi-extension` ships `runDriverLoop(model, { maxSteps })`: a loop that
-observes, calls your model with the screenshot + history, executes the chosen
-action, and repeats until the model says `done`. STALE_FRAME results are
-retried automatically with a fresh observe.
-
-```js
-import { ComputerUseExtension } from "@computer-use/pi-extension";
-
-const ext = new ComputerUseExtension({ socketPath: process.env.COMPUTER_USE_SOCKET });
-await ext.ensureSession();
-for (let step = 0; step < 10; step++) {
-  const ctx = { frame: await ext.observe(), history: ext.history };
-  const decision = await yourModel(ctx);      // → { kind: "act", action } | { kind: "done" }
-  if (decision.kind === "done") break;
-  const result = await ext.handleTool("computer_act", decision.action);
-  if (result.error?.code === "STALE_FRAME") continue; // re-observe automatically
-}
-```
-
 ## Security model
 
 - **Socket**: Unix domain socket at `~/.computer-use/runtime.sock`, mode `0700`
@@ -106,13 +85,17 @@ for (let step = 0; step < 10; step++) {
 - **Sessions**: one active session at a time; every observe/act carries a
   `session_id`. Actions on a stale, paused, taken-over, or stopped session are
   rejected with a specific error code.
-- **Stale frames**: every `frame_id` is monotonic; acting on anything but the
-  current frame is rejected (`STALE_FRAME`).
+- **Stale frames**: acting on anything but the session's current frame is
+  rejected (`STALE_FRAME`) under the default `strict` policy; the
+  `visual_match` policy (env `COMPUTER_USE_STALE_POLICY`) additionally
+  allows an older frame whose content still matches the live screen. Live
+  visual comparison + app-change + age backstop always run on top.
 - **Bounds**: actions outside the display are rejected (`OUT_OF_BOUNDS`).
 - **Redaction**: `type` records `{ text_redacted: true, character_count }` in
   traces; full text only under an explicit opt-in.
 - **Takeover**: a human can grab the mouse at any time; the session flips to
-  `user_takeover` and the runtime refuses further actions.
+  `user_takeover` and the runtime refuses further actions. `resume` cannot
+  bypass it — the agent must `release` first (`USER_TAKEOVER_ACTIVE`).
 - See [docs/protocol.md](docs/protocol.md) for the full error table and
   [docs/permissions.md](docs/permissions.md) for the permission gotchas
   (including the "rebuild cubridge → re-grant Screen Recording" one).
@@ -129,6 +112,11 @@ COMPUTER_USE_TRACE_DEV_MODE=1 cu daemon start
 Each trace entry keeps `redaction: { text_redacted, character_count }` so you
 can audit what happened without exposing secrets.
 
+Trace recording policy (`COMPUTER_USE_TRACE_MODE`): `best_effort` (default —
+a trace write failure degrades the trace and `computer.act` reports
+`trace: {degraded: true, warnings}`), `required` (session start / act fail if
+the trace cannot be recorded), or `disabled` (no recorder).
+
 ## Layout
 
 ```
@@ -143,10 +131,11 @@ can audit what happened without exposing secrets.
 ## Tests
 
 ```bash
-cargo test --workspace                    # 122 tests (Rust: core, driver, runtime, daemon protocol)
+cargo test --workspace                    # 140 tests (Rust: core, driver, runtime, daemon protocol)
 cargo test -p cu-daemon --test integration -- --ignored   # live security-matrix test
-pnpm install && pnpm -r build && pnpm -r test             # SDK (11), MCP (7), Pi (8), OpenCode (6), inspector (2)
-./scripts/acceptance.sh                   # 18-step manual acceptance
+pnpm install && pnpm -r build && pnpm -r test             # 47 tests: SDK (17), MCP (9), Pi (9), OpenCode (10), inspector (2)
+./scripts/smoke.sh                        # automated smoke: gates + Pi/OpenCode wiring snapshots
+./scripts/acceptance.sh                   # 18-step manual acceptance (needs a GUI session)
 ```
 
 ## Documentation
@@ -154,6 +143,7 @@ pnpm install && pnpm -r build && pnpm -r test             # SDK (11), MCP (7), P
 - [docs/architecture.md](docs/architecture.md) — components, threads, data flow
 - [docs/protocol.md](docs/protocol.md) — JSON-RPC surface, methods, error codes
 - [docs/permissions.md](docs/permissions.md) — Screen Recording / Accessibility setup & troubleshooting
+- [docs/acceptance-manual.md](docs/acceptance-manual.md) — Pi (15 steps) + OpenCode (11 steps) manual acceptance checklist
 - [docs/uninstall.md](docs/uninstall.md) — clean removal
 - [packages/sdk-typescript/README.md](packages/sdk-typescript/README.md)
 - [packages/mcp-server/README.md](packages/mcp-server/README.md)

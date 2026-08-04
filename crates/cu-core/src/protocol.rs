@@ -150,6 +150,19 @@ pub struct ActionResultReport {
     pub error: Option<String>,
 }
 
+/// Outcome of the post-batch stabilization wait (`WaitPolicy::UntilStable`).
+/// `change_score` is the **last measured** thumbnail difference — on timeout
+/// it carries the real score (never a fabricated 0), so the caller can tell a
+/// screen that nearly settled from one that kept animating.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StabilizationInfo {
+    pub outcome: String, // "stable" | "timed_out"
+    pub change_score: f64,
+    pub samples: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
 /// `computer.act` result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActResult {
@@ -161,6 +174,26 @@ pub struct ActResult {
     pub next_frame_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot: Option<ObserveResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stabilization: Option<StabilizationInfo>,
+    /// Trace-recording status for this batch. Present when the session has a
+    /// recorder; `degraded`/`warnings` surface best-effort recording problems
+    /// so callers know the trace may be incomplete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<TraceReport>,
+}
+
+/// Recording status of the session's trace for one `computer.act` batch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceReport {
+    /// "required" | "best_effort" | "disabled" — the daemon's trace mode.
+    pub mode: String,
+    /// True when the trace could not be written in best-effort mode (or the
+    /// recorder degraded); the operation itself still succeeded.
+    pub degraded: bool,
+    /// Human-readable warnings produced while recording this batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// `computer.inspect` request.

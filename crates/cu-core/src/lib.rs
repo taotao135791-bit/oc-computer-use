@@ -22,6 +22,6 @@ pub use frames::{ScreenFrame, ScreenSnapshot, StaleFrameVerdict};
 pub use protocol::{
     ActParams, ActResult, ActionResultReport, InspectMapping, InspectParams, InspectResult,
     ObserveParams, ObserveResult, RpcRequest, RpcResponse, SessionParams, SessionResult,
-    TraceEntry, TraceExport, TraceSummary,
+    StabilizationInfo, TraceEntry, TraceExport, TraceReport, TraceSummary,
 };
 pub use sessions::{SessionAction, SessionState, SessionStatus};

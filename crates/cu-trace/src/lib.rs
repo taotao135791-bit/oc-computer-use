@@ -8,6 +8,6 @@ pub mod recorder;
 pub mod replay;
 pub mod storage;
 
-pub use recorder::{TraceConfig, TraceRecorder};
+pub use recorder::{TraceConfig, TraceMode, TraceRecorder};
 pub use replay::{build_replay, replay_from_file, Replay, ReplayStep};
 pub use storage::{export_trace, list_traces, prune_old_traces, read_trace};

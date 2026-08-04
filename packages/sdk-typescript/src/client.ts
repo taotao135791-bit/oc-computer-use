@@ -11,7 +11,7 @@ import { createConnection, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { ComputerUseError, TransportError } from "./errors.js";
+import { AbortError, ComputerUseError, TransportError } from "./errors.js";
 import type {
   ActParams,
   ActResult,
@@ -45,6 +45,14 @@ export interface ClientOptions {
   socketPath?: string;
   /** Per-request timeout in ms (default 30_000). */
   timeoutMs?: number;
+}
+
+/** Per-call overrides for a single JSON-RPC request. */
+export interface RequestOptions {
+  /** Override this client's default per-request timeout (ms). */
+  timeoutMs?: number;
+  /** Abort the request. Rejects with `AbortError` when it fires. */
+  signal?: AbortSignal;
 }
 
 interface PendingRequest {
@@ -131,26 +139,45 @@ export class ComputerUseClient {
   /**
    * Send one JSON-RPC request and await its response.
    * Rejects with ComputerUseError for daemon errors, TransportError for
-   * connection/framing failures.
+   * connection/framing failures, AbortError when `options.signal` fires.
+   *
+   * The third argument accepts either a bare timeout (ms) for backward
+   * compatibility or a `RequestOptions` object.
    */
-  request<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
+  request<T = unknown>(
+    method: string,
+    params?: unknown,
+    options: RequestOptions | number = {},
+  ): Promise<T> {
+    const opts: RequestOptions = typeof options === "number" ? { timeoutMs: options } : options;
     if (this.closed || !this.socket) {
       return Promise.reject(
         new TransportError("not connected — call connect() first"),
       );
     }
+    if (opts.signal?.aborted) {
+      return Promise.reject(new AbortError(`request ${method} aborted before it started`));
+    }
     const id = this.nextId++;
     const payload = { jsonrpc: "2.0", id, method, ...(params !== undefined ? { params } : {}) };
-    const timerMs = timeoutMs ?? this.defaultTimeoutMs;
+    const timerMs = opts.timeoutMs ?? this.defaultTimeoutMs;
 
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
+        opts.signal?.removeEventListener("abort", onAbort);
         this.pending.delete(id);
         reject(
           new TransportError(`request ${method} timed out after ${timerMs}ms`),
         );
       }, timerMs);
       timer.unref();
+      const onAbort = () => {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(new AbortError(`request ${method} aborted by caller`));
+      };
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
 
       this.socket!.write(`${JSON.stringify(payload)}\n`, (err) => {
@@ -158,6 +185,7 @@ export class ComputerUseClient {
           const pending = this.pending.get(id);
           if (pending) {
             clearTimeout(pending.timer);
+            opts.signal?.removeEventListener("abort", onAbort);
             this.pending.delete(id);
             reject(new TransportError(`failed to write to daemon: ${err.message}`));
           }
@@ -206,20 +234,24 @@ export class ComputerUseClient {
   // Sessions
   // -------------------------------------------------------------------------
 
-  session(action: SessionAction, params: Partial<SessionParams> = {}): Promise<SessionResult> {
-    return this.request<SessionResult>("computer.session", { action, ...params });
+  session(
+    action: SessionAction,
+    params: Partial<SessionParams> = {},
+    options?: RequestOptions,
+  ): Promise<SessionResult> {
+    return this.request<SessionResult>("computer.session", { action, ...params }, options ?? {});
   }
 
   /**
    * Ensure an active session exists: resolves the current one, or starts a new
    * one. Returns the resulting SessionResult.
    */
-  async ensureSession(displayId?: string): Promise<SessionResult> {
+  async ensureSession(displayId?: string, options?: RequestOptions): Promise<SessionResult> {
     try {
-      return await this.session("status");
+      return await this.session("status", {}, options);
     } catch (err) {
       if (err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND") {
-        return this.session("start", { display_id: displayId });
+        return this.session("start", { display_id: displayId }, options);
       }
       throw err;
     }
@@ -233,27 +265,35 @@ export class ComputerUseClient {
    * Capture a frame. When `session_id` is omitted, the active session is
    * resolved automatically (a new one is started if none exists).
    */
-  async observe(params: ObserveParams = {}): Promise<ObserveResult> {
+  async observe(params: ObserveParams = {}, options?: RequestOptions): Promise<ObserveResult> {
     if (!params.session_id) {
-      const session = await this.ensureSession();
-      return this.request<ObserveResult>("computer.observe", {
-        ...params,
-        session_id: session.session_id,
-      });
+      const session = await this.ensureSession(undefined, options);
+      return this.request<ObserveResult>(
+        "computer.observe",
+        { ...params, session_id: session.session_id },
+        options ?? {},
+      );
     }
-    return this.request<ObserveResult>("computer.observe", params);
+    return this.request<ObserveResult>("computer.observe", params, options ?? {});
   }
 
-  act(params: ActParams): Promise<ActResult> {
-    return this.request<ActResult>("computer.act", params);
+  act(params: ActParams, options?: RequestOptions): Promise<ActResult> {
+    return this.request<ActResult>("computer.act", params, options ?? {});
   }
 
-  inspect(params: InspectParams): Promise<InspectResult> {
-    return this.request<InspectResult>("computer.inspect", params);
+  inspect(params: InspectParams, options?: RequestOptions): Promise<InspectResult> {
+    return this.request<InspectResult>("computer.inspect", params, options ?? {});
   }
 
-  cancel(params: SessionOnlyParams): Promise<{ cancelled: boolean; session_id: string }> {
-    return this.request<{ cancelled: boolean; session_id: string }>("computer.cancel", params);
+  cancel(
+    params: SessionOnlyParams,
+    options?: RequestOptions,
+  ): Promise<{ cancelled: boolean; session_id: string }> {
+    return this.request<{ cancelled: boolean; session_id: string }>(
+      "computer.cancel",
+      params,
+      options ?? {},
+    );
   }
 
   // -------------------------------------------------------------------------

@@ -230,6 +230,29 @@ test("initializes and lists the seven tools", { timeout: 15000 }, async () => {
   }
 });
 
+test("computer_act and computer_inspect expose structured JSON schemas", { timeout: 15000 }, async () => {
+  const fake = startFakeDaemon();
+  const { proc, client } = spawnServer(fake);
+  try {
+    await client.initialize();
+    const { tools } = await client.listTools();
+    const act = tools.find((t) => t.name === "computer_act");
+    assert.equal(act.inputSchema.properties.actions.type, "array", "actions must be a real array, not a JSON string");
+    assert.ok(
+      act.inputSchema.properties.actions.items.oneOf ?? act.inputSchema.properties.actions.items.anyOf,
+      "action array items must carry a discriminated union schema",
+    );
+    assert.equal(act.inputSchema.properties.actions.minItems, 1);
+    assert.equal(act.inputSchema.properties.actions.maxItems, 50);
+    const inspect = tools.find((t) => t.name === "computer_inspect");
+    assert.equal(inspect.inputSchema.properties.region.type, "object");
+    assert.equal(inspect.inputSchema.properties.region.properties.width.minimum, 1);
+  } finally {
+    proc.kill();
+    stopFakeDaemon(fake);
+  }
+});
+
 test("computer_observe returns an image content block", { timeout: 15000 }, async () => {
   const fake = startFakeDaemon();
   const { proc, client } = spawnServer(fake);
@@ -264,7 +287,7 @@ test("computer_observe without include_image still returns the image by default"
   }
 });
 
-test("computer_act executes a batch and reports per-action results", { timeout: 15000 }, async () => {
+test("computer_act accepts a structured action array (not a JSON string)", { timeout: 15000 }, async () => {
   const fake = startFakeDaemon();
   const { proc, client } = spawnServer(fake);
   try {
@@ -272,10 +295,10 @@ test("computer_act executes a batch and reports per-action results", { timeout: 
     const result = await client.callTool("computer_act", {
       session_id: "s_active",
       frame_id: "frame_1",
-      actions: JSON.stringify([
-        { type: "move", x: 100, y: 100, coordinate_space: "normalized_1000" },
-      ]),
+      actions: [{ type: "move", x: 100, y: 100 }],
+      wait_policy: "until_stable",
     });
+    assert.equal(result.isError, undefined);
     const text = result.content.find((b) => b.type === "text").text;
     assert.match(text, /action\[0\]: success \(12ms\)/);
     assert.match(text, /next_frame_id: frame_2/);
@@ -285,19 +308,38 @@ test("computer_act executes a batch and reports per-action results", { timeout: 
   }
 });
 
-test("computer_act with malformed JSON reports an error", { timeout: 15000 }, async () => {
+test("computer_act validates every action shape with field-level errors", { timeout: 15000 }, async () => {
   const fake = startFakeDaemon();
   const { proc, client } = spawnServer(fake);
   try {
     await client.initialize();
-    const result = await client.callTool("computer_act", {
+    // Negative coordinate: zod rejects with a path that names the field.
+    const badCoord = await client.callTool("computer_act", {
       session_id: "s_active",
       frame_id: "frame_1",
-      actions: "not json",
+      actions: [{ type: "click", x: -5, y: 10 }],
     });
-    assert.equal(result.isError, true);
-    const text = result.content.find((b) => b.type === "text").text;
-    assert.match(text, /INVALID_PARAMS/);
+    assert.equal(badCoord.isError, true);
+    const badCoordText = badCoord.content.find((b) => b.type === "text").text;
+    assert.match(badCoordText, /actions\[0\]\.x/);
+
+    // Unknown action type: discriminated union rejects it.
+    const badType = await client.callTool("computer_act", {
+      session_id: "s_active",
+      frame_id: "frame_1",
+      actions: [{ type: "swipe", x: 1, y: 1 }],
+    });
+    assert.equal(badType.isError, true);
+    assert.match(badType.content.find((b) => b.type === "text").text, /actions\[0\]\.type/);
+
+    // Empty batch: at least one action is required.
+    const empty = await client.callTool("computer_act", {
+      session_id: "s_active",
+      frame_id: "frame_1",
+      actions: [],
+    });
+    assert.equal(empty.isError, true);
+    assert.match(empty.content.find((b) => b.type === "text").text, /actions/);
   } finally {
     proc.kill();
     stopFakeDaemon(fake);
@@ -320,7 +362,7 @@ test("computer_session status and start round-trip", { timeout: 15000 }, async (
   }
 });
 
-test("computer_inspect returns image plus mapping", { timeout: 15000 }, async () => {
+test("computer_inspect accepts a structured region object and returns image plus mapping", { timeout: 15000 }, async () => {
   const fake = startFakeDaemon();
   const { proc, client } = spawnServer(fake);
   try {
@@ -328,14 +370,37 @@ test("computer_inspect returns image plus mapping", { timeout: 15000 }, async ()
     const result = await client.callTool("computer_inspect", {
       session_id: "s_active",
       frame_id: "frame_1",
-      x: 0,
-      y: 0,
-      width: 100,
-      height: 100,
+      region: {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+        coordinate_space: "normalized_1000",
+      },
+      scale: 4,
     });
+    assert.equal(result.isError, undefined);
     const image = result.content.find((b) => b.type === "image");
     assert.ok(image);
     assert.match(result.content[0].text, /global_origin: 0,0/);
+  } finally {
+    proc.kill();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("computer_inspect rejects an invalid region with a field-level error", { timeout: 15000 }, async () => {
+  const fake = startFakeDaemon();
+  const { proc, client } = spawnServer(fake);
+  try {
+    await client.initialize();
+    const result = await client.callTool("computer_inspect", {
+      session_id: "s_active",
+      frame_id: "frame_1",
+      region: { x: 0, y: 0, width: 0, height: 100 }, // width must be >= 1
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content.find((b) => b.type === "text").text, /region/);
   } finally {
     proc.kill();
     stopFakeDaemon(fake);
