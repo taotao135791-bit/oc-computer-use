@@ -5,7 +5,7 @@
 // computer-use daemon on a temp Unix socket: config generation, status
 // reporting, session cleanup, and doctor checks.
 import { createServer } from "node:net";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +18,7 @@ import {
   cleanupSession,
   defaultOpenCodeConfigPath,
   generateOpenCodeConfig,
+  listStoredCredentials,
   mergeOpenCodeConfigText,
   statusText,
   writeOpenCodeConfig,
@@ -62,7 +63,15 @@ function startFakeDaemon({ sessionHandler } = {}) {
               display_id: "1",
               created_at: "2026-08-03T00:00:00Z",
               started_by: "opencode-adapter-test",
+              owner_client_id: "oc-test-conn-1",
+              owner_client_name: "opencode-adapter-test",
             },
+          });
+        } else if (req.method === "runtime.version") {
+          respond({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: { name: "fake", version: "0.1.0", protocol_version: 2 },
           });
         } else if (req.method === "runtime.health") {
           respond({
@@ -97,6 +106,35 @@ const connect = async (socketPath) => {
   const { connect: sdkConnect } = await import("@computer-use/sdk");
   return sdkConnect({ socketPath });
 };
+
+// Point $HOME at a temp dir (os.homedir() reads $HOME on POSIX) so the
+// credential store that cleanupSession/listStoredCredentials read is
+// hermetic. Restored on restore().
+function withTempHome(tag) {
+  const dir = mkdtempSync(join(tmpdir(), `cu-oc-home-${tag}-`));
+  const origHome = process.env.HOME;
+  process.env.HOME = dir;
+  return {
+    dir,
+    writeCredential(sessionId, controlToken) {
+      const credDir = join(dir, ".local", "state", "oc-computer-use", "credentials");
+      mkdirSync(credDir, { recursive: true });
+      writeFileSync(
+        join(credDir, `${sessionId}.json`),
+        JSON.stringify({
+          session_id: sessionId,
+          control_token: controlToken,
+          client_instance_id: "cu-test",
+          created_at: "2026-08-04T00:00:00Z",
+        }),
+      );
+    },
+    restore() {
+      process.env.HOME = origHome;
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
 
 // Capture stdout while running the CLI `main`.
 async function runMain(args) {
@@ -309,6 +347,9 @@ test("statusText reports real daemon health and session state", async () => {
     assert.match(text, /screen_recording=true accessibility=true/);
     assert.match(text, /active_sessions: 1/);
     assert.match(text, /session: s1 state=active paused=false takeover=false lock=true/);
+    // The owner is shown by name; the control token is never displayed.
+    assert.match(text, /owner: opencode-adapter-test/);
+    assert.doesNotMatch(text, /control_token|token:/);
   } finally {
     stopFakeDaemon(fake);
   }
@@ -332,23 +373,123 @@ test("statusText reports \"session: none\" when no session exists", async () => 
   }
 });
 
-test("cleanupSession stops the active session", async () => {
-  const fake = startFakeDaemon();
+test("listStoredCredentials reads only well-formed cu credential files", () => {
+  const home = withTempHome("list");
   try {
-    const client = await connect(fake.socketPath);
-    const result = await cleanupSession(client);
-    client.close();
-    assert.equal(result.stopped, true);
-    assert.match(result.message, /stopped session s1 \(was active\)/);
-    const stopReqs = fake.requests.filter((r) => r.method === "computer.session" && r.params?.action === "stop");
-    assert.equal(stopReqs.length, 1);
-    assert.equal(stopReqs[0].params.session_id, "s1");
+    assert.deepEqual(listStoredCredentials(), []);
+    home.writeCredential("s1", "tok-1");
+    const credDir = join(home.dir, ".local", "state", "oc-computer-use", "credentials");
+    // Corrupt / incomplete files are skipped.
+    writeFileSync(join(credDir, "junk.json"), "{not json", "utf8");
+    writeFileSync(join(credDir, "incomplete.json"), JSON.stringify({ session_id: "s2" }), "utf8");
+    assert.deepEqual(listStoredCredentials(), [{ sessionId: "s1", controlToken: "tok-1" }]);
   } finally {
+    home.restore();
+  }
+});
+
+test("cleanupSession stops exactly the sessions this machine holds credentials for", async () => {
+  const fake = startFakeDaemon();
+  const home = withTempHome("cred-stop");
+  try {
+    home.writeCredential("s1", "tok-1");
+    home.writeCredential("s2", "tok-2");
+    const client = await connect(fake.socketPath);
+    try {
+      const result = await cleanupSession(client);
+      assert.equal(result.stopped, true);
+      assert.match(result.message, /stopped sessions s1, s2/);
+    } finally {
+      client.close();
+    }
+    const stops = fake.requests.filter((r) => r.method === "computer.session" && r.params?.action === "stop");
+    assert.equal(stops.length, 2);
+    assert.deepEqual(
+      stops.map((s) => s.params.session_id).sort(),
+      ["s1", "s2"],
+    );
+    // Every stop carries the control token — without it the daemon refuses.
+    assert.deepEqual(
+      stops.map((s) => s.params.control_token).sort(),
+      ["tok-1", "tok-2"],
+    );
+  } finally {
+    home.restore();
     stopFakeDaemon(fake);
   }
 });
 
-test("cleanupSession is a no-op when no session exists", async () => {
+test("cleanupSession without credentials reports an owner-owned session and never stops it", async () => {
+  const fake = startFakeDaemon();
+  const home = withTempHome("no-creds");
+  try {
+    const client = await connect(fake.socketPath);
+    try {
+      const result = await cleanupSession(client);
+      assert.equal(result.stopped, false);
+      assert.match(result.message, /owned by opencode-adapter-test/);
+      assert.match(result.message, /knowing its id does not grant control/);
+    } finally {
+      client.close();
+    }
+    // No stop attempt was made: the session belongs to another client.
+    assert.equal(fake.requests.filter((r) => r.params?.action === "stop").length, 0);
+  } finally {
+    home.restore();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("cleanupSession notes a credential whose token the daemon no longer accepts", async () => {
+  const fake = startFakeDaemon({
+    sessionHandler: (req) => {
+      if (req.params?.action === "stop") {
+        return {
+          jsonrpc: "2.0",
+          id: req.id,
+          error: {
+            code: -32019,
+            message: "control token required",
+            data: { code: "CONTROL_TOKEN_REQUIRED" },
+          },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id: req.id,
+        result: {
+          session_id: "s1",
+          state: "active",
+          paused: false,
+          user_takeover: false,
+          lock_held: true,
+          display_id: "1",
+          created_at: "2026-08-04T00:00:00Z",
+          started_by: "cu-test",
+          owner_client_id: "oc-test-conn-1",
+          owner_client_name: "cu-test",
+        },
+      };
+    },
+  });
+  const home = withTempHome("stale");
+  try {
+    home.writeCredential("s1", "old-token");
+    const client = await connect(fake.socketPath);
+    try {
+      const result = await cleanupSession(client);
+      assert.equal(result.stopped, false);
+      assert.match(result.message, /token no longer valid/);
+    } finally {
+      client.close();
+    }
+  } finally {
+    home.restore();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("cleanupSession is a no-op when no session exists and no credentials are held", async () => {
   const fake = startFakeDaemon({
     sessionHandler: (req) => ({
       jsonrpc: "2.0",
@@ -356,14 +497,19 @@ test("cleanupSession is a no-op when no session exists", async () => {
       error: { code: -32000, message: "no active session", data: { code: "SESSION_NOT_FOUND" } },
     }),
   });
+  const home = withTempHome("none");
   try {
     const client = await connect(fake.socketPath);
-    const result = await cleanupSession(client);
-    client.close();
-    assert.equal(result.stopped, false);
-    assert.match(result.message, /no active session/);
+    try {
+      const result = await cleanupSession(client);
+      assert.equal(result.stopped, false);
+      assert.match(result.message, /no active session/);
+    } finally {
+      client.close();
+    }
     assert.equal(fake.requests.filter((r) => r.params?.action === "stop").length, 0);
   } finally {
+    home.restore();
     stopFakeDaemon(fake);
   }
 });
@@ -412,13 +558,38 @@ test("CLI `status` prints daemon health", async () => {
   }
 });
 
-test("CLI `session cleanup` stops the active session", async () => {
-  const fake = startFakeDaemon();
+test("CLI `session cleanup` stops the owned session and reports an unowned one", async () => {
+  // Phase 1: this machine holds a credential → the owned session is stopped
+  // with its control token.
+  const homeOwned = withTempHome("cli-cleanup-owned");
   try {
-    const out = await runMain(["session", "cleanup", "--socket", fake.socketPath]);
-    assert.match(out, /stopped session s1 \(was active\)/);
+    homeOwned.writeCredential("s1", "tok-1");
+    const fake = startFakeDaemon();
+    try {
+      const out = await runMain(["session", "cleanup", "--socket", fake.socketPath]);
+      assert.match(out, /stopped session s1/);
+      const stops = fake.requests.filter((r) => r.method === "computer.session" && r.params?.action === "stop");
+      assert.equal(stops.length, 1);
+      assert.equal(stops[0].params.control_token, "tok-1");
+    } finally {
+      stopFakeDaemon(fake);
+    }
   } finally {
-    stopFakeDaemon(fake);
+    homeOwned.restore();
+  }
+  // Phase 2: no credential held → the foreign session is reported, never stopped.
+  const homeForeign = withTempHome("cli-cleanup-foreign");
+  try {
+    const fake2 = startFakeDaemon();
+    try {
+      const out = await runMain(["session", "cleanup", "--socket", fake2.socketPath]);
+      assert.match(out, /does not grant control/);
+      assert.equal(fake2.requests.filter((r) => r.params?.action === "stop").length, 0);
+    } finally {
+      stopFakeDaemon(fake2);
+    }
+  } finally {
+    homeForeign.restore();
   }
 });
 

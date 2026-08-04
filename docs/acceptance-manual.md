@@ -100,6 +100,23 @@ Plan on the acceptance machine expired during the round-2 run.
 | B — Pi owns the session | Pi creates via first observe → Pi `session_shutdown` → session stopped, screenshot cleaned | ✅ PASS (Pi steps 8/18/19) |
 | C — CLI owns the session, Pi must not take over | CLI starts → Pi (reject) → CONTROL_LOCKED; with `attach` → usable, shutdown does not stop it | ✅ PASS (Pi step 20) |
 
+**Round 3 (2026-08-04)** added the server-side session-ownership round
+(control token, ExistingSessionPolicy, precise cancel). Results recorded per
+step below; all automated scripts pass against the round-3 daemon.
+
+| # | Step | Expected result | Round-3 result |
+|---|---|---|---|
+| 1 | `cu session start --json` | `control_token` present but `<redacted>` — the token is issued exactly once and never printed | ✅ PASS |
+| 2 | `cu session status --json` | **no** `control_token` field (read-only never repeats it); `owner_client_id`/`owner_client_name` present | ✅ PASS |
+| 3 | second `cu session start` | `CONTROL_LOCKED` naming the holder; the lock is held by the first session | ✅ PASS |
+| 4 | stop with a wrong token (raw wire request) | `INVALID_CONTROL_TOKEN`; the session stays active (no side effects) | ✅ PASS |
+| 5 | CLI credential file | `~/.local/state/oc-computer-use/credentials/<sid>.json`, mode `0600` | ✅ PASS |
+| 6 | `cu session stop` (owner) | succeeds; credential file deleted with the session | ✅ PASS |
+| 7 | daemon restart | in-memory session ends, token invalid; stale operations fail cleanly (SESSION_NOT_FOUND) | ✅ PASS |
+| 8 | Pi extension against the round-3 daemon | full matrix 31/31 PASS incl. scenario C with the new wire shape (`CONTROL_LOCKED` message + owner in `data`) | ✅ PASS (host shim) |
+| 9 | OpenCode/MCP against the round-3 daemon | 17/17 PASS incl. cancel of a 30 s wait in 761 ms; session owned by `mcp-server` | ✅ PASS |
+| 10 | ownership scenario A | 6/6 PASS — Pi shutdown does not stop the MCP-owned session | ✅ PASS |
+
 ## Failure record (round 2)
 
 | Date | Step # | Observed | Root cause / fix |

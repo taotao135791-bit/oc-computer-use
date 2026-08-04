@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use chrono::Utc;
 use cu_core::{
-    ActParams, ActResult, ClientInfo, CoordinateSpace, CuError, ErrorCode, ImageGeometry,
-    InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult, Region,
-    ScreenFrame, ScreenSnapshot, SessionAction, SessionResult, SessionState, StabilizationInfo,
-    TraceReport, WaitPolicy,
+    generate_control_token, ActParams, ActResult, ClientInfo, CoordinateSpace, CuError, ErrorCode,
+    ImageGeometry, InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult,
+    Region, RequestKey, ScreenFrame, ScreenSnapshot, SecretTokenHash, SessionAction, SessionResult,
+    SessionState, StabilizationInfo, TraceReport, WaitPolicy,
 };
 use cu_driver::{
     ApplicationInfo, CaptureRequest, ComputerDriver, DesktopLayout, DisplayInfo, PermissionStatus,
@@ -34,6 +34,7 @@ use cu_trace::{TraceConfig, TraceMode, TraceRecorder};
 
 use crate::action_queue::{to_action_result_reports, ActionQueue};
 use crate::frames::FrameStore;
+use crate::requests::RequestRegistry;
 use crate::sessions::{ControlLock, Session, SharedSession};
 use crate::stabilizer::{StabilizeOutcome, Stabilizer, StabilizerConfig};
 use crate::stale_frame::{StaleFrameChecker, StaleFrameConfig};
@@ -83,6 +84,9 @@ pub struct Runtime {
     frame_counter: AtomicU64,
     stale: StaleFrameChecker,
     started_at: Instant,
+    /// Per-request cancellation registry (connection_id, request_id) → batch
+    /// token. Lets `computer.cancel` abort exactly one request.
+    requests: RequestRegistry,
 }
 
 impl Runtime {
@@ -98,6 +102,7 @@ impl Runtime {
             frame_counter: AtomicU64::new(0),
             stale,
             started_at: Instant::now(),
+            requests: RequestRegistry::new(),
         }
     }
 
@@ -176,10 +181,43 @@ impl Runtime {
 
     /// Cancel any in-flight action batch for a session (e.g. an explicit
     /// `computer.cancel` request).
-    pub fn cancel_in_flight(&self, session_id: &str) -> Result<(), CuError> {
+    /// Session-wide cancellation: cancels every in-flight batch on the
+    /// session. Verifies the control token first — cancelling is a mutating
+    /// operation and must not be triggerable by a session-id-only caller —
+    /// and refuses stopped sessions (`SESSION_STOPPED`): a stopped session's
+    /// token no longer grants anything.
+    pub fn cancel_in_flight(
+        &self,
+        session_id: &str,
+        control_token: Option<&str>,
+    ) -> Result<(), CuError> {
         let session = self.get_session(session_id)?;
+        self.verify_mutating(&session, control_token)?;
         session.cancel_in_flight();
         Ok(())
+    }
+
+    /// Precise cancellation: aborts exactly the request named by `key`
+    /// `(connection_id, request_id)` on this connection. The token is verified
+    /// against the session's hash first; a wrong token never touches anything.
+    ///
+    /// Returns `Ok(true)` when a live request was cancelled, `Ok(false)` when
+    /// no such request was registered (already finished, or it will be
+    /// cancelled at registration via the tombstone path).
+    pub fn cancel_request(
+        &self,
+        key: &RequestKey,
+        session_id: &str,
+        control_token: Option<&str>,
+    ) -> Result<bool, CuError> {
+        let session = self.get_session(session_id)?;
+        self.verify_mutating(&session, control_token)?;
+        self.requests.cancel(key, session_id)
+    }
+
+    /// Number of registered in-flight requests (tests).
+    pub fn request_count(&self) -> usize {
+        self.requests.len()
     }
 
     // ------------------------------------------------------------------
@@ -196,6 +234,12 @@ impl Runtime {
             Some(d) => d,
             None => self.driver.desktop_layout().await?.primary_id,
         };
+
+        // The control token is the capability for this session. Generated from
+        // the OS CSPRNG, issued exactly once (in the start response), stored
+        // only as a hash. It must never appear in logs, traces, or `status`.
+        let control_token = generate_control_token();
+        let control_token_hash = SecretTokenHash::from_token(&control_token);
 
         let trace = match self.config.trace_mode {
             // Disabled: no recorder at all; trace RPCs simply find nothing.
@@ -228,15 +272,19 @@ impl Runtime {
             display_id,
             client.client_name.clone(),
             Some(client),
+            control_token_hash,
             trace,
         ));
 
         // Acquire the global control lock. Held for the session's lifetime.
+        // A lock held by another session fails with CONTROL_LOCKED carrying
+        // the holder's (non-secret) owner identity, so the rejected client can
+        // say "Owner: OpenCode" without ever seeing a token.
         if let Err(e) = self.control_lock.try_acquire(&id) {
             if let Some(t) = session.trace.as_ref() {
                 let _ = t.close().await;
             }
-            return Err(e);
+            return Err(self.with_holder_owner(e));
         }
 
         self.sessions
@@ -259,16 +307,43 @@ impl Runtime {
                 .await;
         }
         tracing::info!(session = %id, "session started");
-        Ok(self.session_result(&session))
+        let mut result = self.session_result(&session);
+        // The one and only disclosure of the control token: the response to
+        // the client that just created the session.
+        result.control_token = Some(control_token.as_str().to_string());
+        Ok(result)
     }
 
     pub async fn session_status(&self, session_id: &str) -> Result<SessionResult, CuError> {
+        // Read-only: status needs no control token and never returns one.
         let session = self.get_session(session_id)?;
         Ok(self.session_result(&session))
     }
 
-    pub async fn session_pause(&self, session_id: &str) -> Result<SessionResult, CuError> {
+    /// Verify the token and refuse operations on a stopped/failed session
+    /// with the dedicated codes. Pause/resume/takeover/release/stop are the
+    /// only mutating session ops; every one verifies *before* any state change
+    /// or trace write.
+    fn verify_mutating(
+        &self,
+        session: &Session,
+        control_token: Option<&str>,
+    ) -> Result<(), CuError> {
+        session.verify_control_token(control_token)?;
+        match session.state() {
+            SessionState::Stopping | SessionState::Stopped => Err(CuError::SessionStopped),
+            SessionState::Failed => Err(CuError::InvalidSessionState("session is failed".into())),
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn session_pause(
+        &self,
+        session_id: &str,
+        control_token: Option<&str>,
+    ) -> Result<SessionResult, CuError> {
         let session = self.get_session(session_id)?;
+        self.verify_mutating(&session, control_token)?;
         session.transition(SessionState::Paused)?;
         if let Some(t) = session.trace.as_ref() {
             let _ = t.record_event("session.pause", serde_json::json!({})).await;
@@ -276,8 +351,13 @@ impl Runtime {
         Ok(self.session_result(&session))
     }
 
-    pub async fn session_resume(&self, session_id: &str) -> Result<SessionResult, CuError> {
+    pub async fn session_resume(
+        &self,
+        session_id: &str,
+        control_token: Option<&str>,
+    ) -> Result<SessionResult, CuError> {
         let session = self.get_session(session_id)?;
+        self.verify_mutating(&session, control_token)?;
         match session.state() {
             // Only a paused session can be resumed by the agent. A session the
             // user took over cannot be resumed — `release` is the only exit.
@@ -299,8 +379,13 @@ impl Runtime {
 
     /// Human takes over: session enters `user_takeover`, in-flight actions are
     /// cancelled. `release` is the inverse (agent resumes control).
-    pub async fn session_takeover(&self, session_id: &str) -> Result<SessionResult, CuError> {
+    pub async fn session_takeover(
+        &self,
+        session_id: &str,
+        control_token: Option<&str>,
+    ) -> Result<SessionResult, CuError> {
         let session = self.get_session(session_id)?;
+        self.verify_mutating(&session, control_token)?;
         session.transition(SessionState::UserTakeover)?;
         if let Some(t) = session.trace.as_ref() {
             let _ = t
@@ -313,8 +398,13 @@ impl Runtime {
     /// Hand control back to the agent. Only valid while the user holds the
     /// session (state `UserTakeover`); releasing an active/paused session is
     /// a no-op error, not a silent state flip.
-    pub async fn session_release(&self, session_id: &str) -> Result<SessionResult, CuError> {
+    pub async fn session_release(
+        &self,
+        session_id: &str,
+        control_token: Option<&str>,
+    ) -> Result<SessionResult, CuError> {
         let session = self.get_session(session_id)?;
+        self.verify_mutating(&session, control_token)?;
         if session.state() != SessionState::UserTakeover {
             return Err(CuError::InvalidSessionState(format!(
                 "cannot release a session in state {:?}; release is only valid while the user holds control",
@@ -331,15 +421,28 @@ impl Runtime {
     }
 
     /// Stop a session: cancel in-flight work, close its trace, release the
-    /// control lock, and mark it `stopped`. Idempotent.
-    pub async fn session_stop(&self, session_id: &str) -> Result<SessionResult, CuError> {
+    /// control lock, and mark it `stopped`. Idempotent (a stopped session
+    /// reports `Ok` again), but only ever with a valid control token.
+    pub async fn session_stop(
+        &self,
+        session_id: &str,
+        control_token: Option<&str>,
+    ) -> Result<SessionResult, CuError> {
         let session = self.get_session(session_id)?;
+        session.verify_control_token(control_token)?;
+        self.stop_session(&session).await
+    }
+
+    /// The stop routine itself; callers are responsible for having verified
+    /// the control token (or being the runtime's own shutdown path).
+    async fn stop_session(&self, session: &SharedSession) -> Result<SessionResult, CuError> {
+        let session_id = session.id.clone();
         match session.state() {
-            SessionState::Stopped => return Ok(self.session_result(&session)),
+            SessionState::Stopped => return Ok(self.session_result(session)),
             SessionState::Stopping => {
                 session.set_state(SessionState::Stopped);
-                self.control_lock.release(session_id);
-                return Ok(self.session_result(&session));
+                self.control_lock.release(&session_id);
+                return Ok(self.session_result(session));
             }
             _ => {}
         }
@@ -351,18 +454,23 @@ impl Runtime {
             let _ = t.close().await;
         }
         session.set_state(SessionState::Stopped);
-        self.control_lock.release(session_id);
+        self.control_lock.release(&session_id);
         tracing::info!(session = %session_id, "session stopped");
-        Ok(self.session_result(&session))
+        Ok(self.session_result(session))
     }
 
     /// Dispatch a `computer.session` action.
+    ///
+    /// `control_token` is required for every mutating action except `start`
+    /// (which creates the session and issues the token) — `status` is
+    /// read-only and needs none.
     pub async fn session(
         &self,
         action: SessionAction,
         session_id: Option<&str>,
         display_id: Option<String>,
         client: ClientInfo,
+        control_token: Option<&str>,
     ) -> Result<SessionResult, CuError> {
         match action {
             SessionAction::Start => self.session_start(display_id, client).await,
@@ -379,33 +487,48 @@ impl Runtime {
                 }
             },
             SessionAction::Pause => {
-                self.session_pause(session_id.ok_or_else(|| {
-                    CuError::InvalidParams("session.pause requires session_id".into())
-                })?)
+                self.session_pause(
+                    session_id.ok_or_else(|| {
+                        CuError::InvalidParams("session.pause requires session_id".into())
+                    })?,
+                    control_token,
+                )
                 .await
             }
             SessionAction::Resume => {
-                self.session_resume(session_id.ok_or_else(|| {
-                    CuError::InvalidParams("session.resume requires session_id".into())
-                })?)
+                self.session_resume(
+                    session_id.ok_or_else(|| {
+                        CuError::InvalidParams("session.resume requires session_id".into())
+                    })?,
+                    control_token,
+                )
                 .await
             }
             SessionAction::Takeover => {
-                self.session_takeover(session_id.ok_or_else(|| {
-                    CuError::InvalidParams("session.takeover requires session_id".into())
-                })?)
+                self.session_takeover(
+                    session_id.ok_or_else(|| {
+                        CuError::InvalidParams("session.takeover requires session_id".into())
+                    })?,
+                    control_token,
+                )
                 .await
             }
             SessionAction::Release => {
-                self.session_release(session_id.ok_or_else(|| {
-                    CuError::InvalidParams("session.release requires session_id".into())
-                })?)
+                self.session_release(
+                    session_id.ok_or_else(|| {
+                        CuError::InvalidParams("session.release requires session_id".into())
+                    })?,
+                    control_token,
+                )
                 .await
             }
             SessionAction::Stop => {
-                self.session_stop(session_id.ok_or_else(|| {
-                    CuError::InvalidParams("session.stop requires session_id".into())
-                })?)
+                self.session_stop(
+                    session_id.ok_or_else(|| {
+                        CuError::InvalidParams("session.stop requires session_id".into())
+                    })?,
+                    control_token,
+                )
                 .await
             }
         }
@@ -552,18 +675,42 @@ impl Runtime {
     pub async fn act(
         &self,
         params: ActParams,
-        request_id: Option<String>,
+        request_key: Option<RequestKey>,
     ) -> Result<ActResult, CuError> {
         let session = self.get_session(&params.session_id)?;
+        // Capability check FIRST: without a valid control token nothing is
+        // parsed, queued, or executed — no side effects of any kind.
+        session.verify_control_token(params.control_token.as_deref())?;
         self.gate_active(&session)?;
+
+        // The request's batch token registers before the busy lock, so a
+        // queued request can be cancelled without touching the batch that is
+        // executing, and the registry key (connection_id, request_id) makes
+        // the cancellation precise. The scope guard unregisters and ends the
+        // batch token on every exit path.
+        let token = session.begin_batch();
+        if let Some(key) = &request_key {
+            self.requests
+                .register(key.clone(), params.session_id.clone(), token.clone());
+        }
+        let _scope = BatchScope {
+            registry: &self.requests,
+            session: &session,
+            key: request_key.clone(),
+            token: token.clone(),
+        };
+        let request_id = request_key.as_ref().map(|k| k.request_id.to_string());
+
         // Serialize observe/act per session so two batches never interleave.
         let _busy = session.busy.lock().await;
+        // Cancelled while queued? Never run a cancelled batch.
+        if token.is_cancelled() {
+            return Err(CuError::Cancelled);
+        }
         // The control lock must be held by this session; a stopped/replaced
         // session must never drive the pointer.
         if !self.control_lock.is_held_by(&params.session_id) {
-            return Err(CuError::ControlLocked {
-                holder: self.control_lock.holder().unwrap_or_default(),
-            });
+            return Err(self.control_locked_for());
         }
 
         let batch = cu_core::ActionBatch {
@@ -644,8 +791,7 @@ impl Runtime {
             }
         }
 
-        // Execute the batch.
-        let token = session.begin_batch();
+        // Execute the batch with the request-scoped token.
         let mut takeover = TakeoverDetector {
             policy: self.config.takeover_policy,
             ..Default::default()
@@ -861,10 +1007,13 @@ impl Runtime {
     // ------------------------------------------------------------------
 
     /// Stop every session, close traces, and release driver resources.
+    /// The runtime's own shutdown path is the one caller that may stop a
+    /// session without a control token.
     pub async fn shutdown(&self) -> Result<(), CuError> {
-        let ids: Vec<String> = self.sessions.lock().unwrap().keys().cloned().collect();
-        for id in ids {
-            let _ = self.session_stop(&id).await;
+        let sessions: Vec<SharedSession> =
+            self.sessions.lock().unwrap().values().cloned().collect();
+        for session in sessions {
+            let _ = self.stop_session(&session).await;
         }
         self.driver.shutdown().await
     }
@@ -888,10 +1037,43 @@ impl Runtime {
             SessionState::Starting => Err(CuError::NotReady("session is still starting".into())),
             SessionState::Paused => Err(CuError::Paused),
             SessionState::UserTakeover => Err(CuError::UserTakeover),
-            SessionState::Stopping | SessionState::Stopped | SessionState::Failed => Err(
-                CuError::InvalidSessionState(format!("session is {:?}", session.state())),
-            ),
+            SessionState::Stopping | SessionState::Stopped => Err(CuError::SessionStopped),
+            SessionState::Failed => Err(CuError::InvalidSessionState("session is failed".into())),
         }
+    }
+
+    /// Enrich a `ControlLocked` error with the holder's (non-secret) owner
+    /// identity, so the rejected caller can identify who owns the session.
+    fn with_holder_owner(&self, e: CuError) -> CuError {
+        if let CuError::ControlLocked {
+            holder,
+            owner: None,
+        } = e
+        {
+            let owner = self
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&holder)
+                .and_then(|s| s.owner.clone());
+            CuError::ControlLocked { holder, owner }
+        } else {
+            e
+        }
+    }
+
+    /// A `ControlLocked` error for the current control-lock holder. Only
+    /// reachable when the caller already established the lock is not held by
+    /// its own session; the error reports who actually holds it.
+    fn control_locked_for(&self) -> CuError {
+        let holder = self.control_lock.holder().unwrap_or_default();
+        let owner = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&holder)
+            .and_then(|s| s.owner.clone());
+        CuError::ControlLocked { holder, owner }
     }
 
     fn session_result(&self, session: &Session) -> SessionResult {
@@ -910,10 +1092,32 @@ impl Runtime {
                 .as_ref()
                 .map(|t| t.path().to_string_lossy().into_owned()),
             started_by: session.started_by.clone(),
+            // The control token is NEVER included in status results — it is
+            // issued exactly once, in the start response.
+            control_token: None,
             owner_client_id: session.owner.as_ref().map(|c| c.client_id.clone()),
             owner_client_name: session.owner.as_ref().map(|c| c.client_name.clone()),
             owner_instance_id: session.owner.as_ref().map(|c| c.client_instance_id.clone()),
             message: None,
+        }
+    }
+}
+
+/// RAII guard for one `act` batch. Unregisters the request from the
+/// cancellation registry and ends the batch token on **every** exit path —
+/// success, error, cancellation — so no stale handle or token survives.
+struct BatchScope<'a> {
+    registry: &'a RequestRegistry,
+    session: &'a SharedSession,
+    key: Option<RequestKey>,
+    token: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for BatchScope<'_> {
+    fn drop(&mut self) {
+        self.session.end_batch(&self.token);
+        if let Some(key) = &self.key {
+            self.registry.unregister(key);
         }
     }
 }
@@ -1083,6 +1287,10 @@ mod tests {
     async fn session_lifecycle_and_lock() {
         let rt = runtime().await;
         let started = rt.session_start(None, test_client()).await.unwrap();
+        let token = started
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         assert_eq!(started.state, SessionState::Active);
         assert!(started.lock_held);
 
@@ -1091,7 +1299,10 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ControlLocked);
 
         // Pause gates act.
-        let p = rt.session_pause(&started.session_id).await.unwrap();
+        let p = rt
+            .session_pause(&started.session_id, Some(&token))
+            .await
+            .unwrap();
         assert!(p.paused);
         let act_params = ActParams {
             session_id: started.session_id.clone(),
@@ -1103,12 +1314,17 @@ mod tests {
             risk_level: None,
             requires_confirmation: None,
             policy_context: None,
+            control_token: Some(token.clone()),
         };
         let err = rt.act(act_params, None).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::Paused);
 
-        rt.session_resume(&started.session_id).await.unwrap();
-        rt.session_stop(&started.session_id).await.unwrap();
+        rt.session_resume(&started.session_id, Some(&token))
+            .await
+            .unwrap();
+        rt.session_stop(&started.session_id, Some(&token))
+            .await
+            .unwrap();
         let status = rt.session_status(&started.session_id).await.unwrap();
         assert_eq!(status.state, SessionState::Stopped);
         assert!(!status.lock_held);
@@ -1121,7 +1337,7 @@ mod tests {
     async fn status_without_session_returns_session_not_found() {
         let rt = runtime().await;
         let err = rt
-            .session(SessionAction::Status, None, None, test_client())
+            .session(SessionAction::Status, None, None, test_client(), None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::SessionNotFound);
@@ -1148,7 +1364,7 @@ mod tests {
         assert_eq!(status.owner_client_id.as_deref(), Some("test"));
     }
 
-    fn wait_params(session_id: &str, frame_id: &str) -> ActParams {
+    fn wait_params(session_id: &str, frame_id: &str, control_token: Option<String>) -> ActParams {
         ActParams {
             session_id: session_id.into(),
             frame_id: frame_id.into(),
@@ -1159,6 +1375,7 @@ mod tests {
             risk_level: None,
             requires_confirmation: None,
             policy_context: None,
+            control_token,
         }
     }
 
@@ -1170,31 +1387,35 @@ mod tests {
     async fn takeover_cannot_be_bypassed_by_resume() {
         let rt = runtime().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let sid = s.session_id.clone();
 
         // 1. Pause → act rejected.
-        rt.session_pause(&sid).await.unwrap();
+        rt.session_pause(&sid, Some(&token)).await.unwrap();
         let err = rt
-            .act(wait_params(&sid, "frame_x"), None)
+            .act(wait_params(&sid, "frame_x", Some(token.clone())), None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::Paused);
 
         // 2. Pause → resume succeeds.
-        rt.session_resume(&sid).await.unwrap();
+        rt.session_resume(&sid, Some(&token)).await.unwrap();
         let st = rt.session_status(&sid).await.unwrap();
         assert_eq!(st.state, SessionState::Active);
 
         // 3. Takeover → act rejected.
-        rt.session_takeover(&sid).await.unwrap();
+        rt.session_takeover(&sid, Some(&token)).await.unwrap();
         let err = rt
-            .act(wait_params(&sid, "frame_x"), None)
+            .act(wait_params(&sid, "frame_x", Some(token.clone())), None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::UserTakeover);
 
         // 4. Takeover → resume REJECTED with USER_TAKEOVER_ACTIVE; state holds.
-        let err = rt.session_resume(&sid).await.unwrap_err();
+        let err = rt.session_resume(&sid, Some(&token)).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::UserTakeoverActive);
         assert!(
             err.to_string().contains("release"),
@@ -1206,7 +1427,7 @@ mod tests {
         assert!(!st.paused);
 
         // 5. Takeover → release succeeds and returns to Active.
-        let rel = rt.session_release(&sid).await.unwrap();
+        let rel = rt.session_release(&sid, Some(&token)).await.unwrap();
         assert_eq!(rel.state, SessionState::Active);
         assert!(!rel.user_takeover);
 
@@ -1223,16 +1444,16 @@ mod tests {
             .await
             .unwrap();
         let res = rt
-            .act(wait_params(&sid, &obs.frame_id), None)
+            .act(wait_params(&sid, &obs.frame_id, Some(token.clone())), None)
             .await
             .unwrap();
         assert!(res.executed);
 
         // 7. Release outside takeover is rejected (no silent no-op).
-        let err = rt.session_release(&sid).await.unwrap_err();
+        let err = rt.session_release(&sid, Some(&token)).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidSessionState);
 
-        rt.session_stop(&sid).await.unwrap();
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
     }
 
     /// Takeover mid-batch: the in-flight act stops at the next safe boundary
@@ -1241,6 +1462,10 @@ mod tests {
     async fn takeover_cancels_in_flight_actions() {
         let (rt, fake) = runtime_with_driver().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let sid = s.session_id.clone();
         let obs = rt
             .observe(
@@ -1274,12 +1499,13 @@ mod tests {
             risk_level: None,
             requires_confirmation: None,
             policy_context: None,
+            control_token: Some(token.clone()),
         };
 
         let rt2 = rt.clone();
         let handle = tokio::spawn(async move { rt2.act(params, None).await });
         tokio::time::sleep(Duration::from_millis(40)).await;
-        rt.session_takeover(&sid).await.unwrap();
+        rt.session_takeover(&sid, Some(&token)).await.unwrap();
 
         let result = handle.await.unwrap().unwrap();
         assert_eq!(
@@ -1300,18 +1526,22 @@ mod tests {
 
         // The session is still under takeover and still rejects actions.
         let err = rt
-            .act(wait_params(&sid, &obs.frame_id), None)
+            .act(wait_params(&sid, &obs.frame_id, Some(token.clone())), None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::UserTakeover);
-        rt.session_release(&sid).await.unwrap();
-        rt.session_stop(&sid).await.unwrap();
+        rt.session_release(&sid, Some(&token)).await.unwrap();
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
     }
 
     #[tokio::test]
     async fn act_rejects_unknown_frame_and_stale() {
         let rt = runtime().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let params = |frame: &str| ActParams {
             session_id: s.session_id.clone(),
             frame_id: frame.into(),
@@ -1322,6 +1552,7 @@ mod tests {
             risk_level: None,
             requires_confirmation: None,
             policy_context: None,
+            control_token: Some(token.clone()),
         };
         // Unknown frame.
         let err = rt.act(params("frame_missing"), None).await.unwrap_err();
@@ -1349,7 +1580,7 @@ mod tests {
         }
         let err = rt.act(params(&obs.frame_id), None).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::StaleFrame);
-        rt.session_stop(&s.session_id).await.unwrap();
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1358,6 +1589,10 @@ mod tests {
         // actionable, even when the older frame's pixels still match.
         let rt = runtime().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let obs1 = rt
             .observe(
                 ObserveParams {
@@ -1380,15 +1615,21 @@ mod tests {
             .unwrap();
         assert_ne!(obs1.frame_id, obs2.frame_id);
         let err = rt
-            .act(wait_params(&s.session_id, &obs1.frame_id), None)
+            .act(
+                wait_params(&s.session_id, &obs1.frame_id, Some(token.clone())),
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::StaleFrame);
         // The current frame still runs (fake screen is unchanged).
-        rt.act(wait_params(&s.session_id, &obs2.frame_id), None)
-            .await
-            .unwrap();
-        rt.session_stop(&s.session_id).await.unwrap();
+        rt.act(
+            wait_params(&s.session_id, &obs2.frame_id, Some(token.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1399,6 +1640,10 @@ mod tests {
         cfg.stale.policy = crate::stale_frame::StaleFramePolicy::VisualMatch;
         let rt = runtime_with_config(cfg).await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let obs1 = rt
             .observe(
                 ObserveParams {
@@ -1420,13 +1665,19 @@ mod tests {
             .await
             .unwrap();
         // The older frame still matches the live screen → allowed.
-        rt.act(wait_params(&s.session_id, &obs1.frame_id), None)
-            .await
-            .unwrap();
-        rt.act(wait_params(&s.session_id, &obs2.frame_id), None)
-            .await
-            .unwrap();
-        rt.session_stop(&s.session_id).await.unwrap();
+        rt.act(
+            wait_params(&s.session_id, &obs1.frame_id, Some(token.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+        rt.act(
+            wait_params(&s.session_id, &obs2.frame_id, Some(token.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1449,6 +1700,10 @@ mod tests {
         // Best-effort (default): act carries a trace report, mode best_effort.
         let rt = runtime().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1460,20 +1715,27 @@ mod tests {
             .await
             .unwrap();
         let res = rt
-            .act(wait_params(&s.session_id, &obs.frame_id), None)
+            .act(
+                wait_params(&s.session_id, &obs.frame_id, Some(token.clone())),
+                None,
+            )
             .await
             .unwrap();
         let trace = res.trace.expect("best_effort act must report trace status");
         assert_eq!(trace.mode, "best_effort");
         assert!(!trace.degraded);
         assert!(trace.warnings.is_empty());
-        rt.session_stop(&s.session_id).await.unwrap();
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
 
         // Disabled: no recorder exists → no trace report.
         let mut cfg = test_config();
         cfg.trace_mode = cu_trace::TraceMode::Disabled;
         let rt2 = runtime_with_config(cfg).await;
         let s2 = rt2.session_start(None, test_client()).await.unwrap();
+        let token2 = s2
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let obs2 = rt2
             .observe(
                 ObserveParams {
@@ -1485,17 +1747,26 @@ mod tests {
             .await
             .unwrap();
         let res2 = rt2
-            .act(wait_params(&s2.session_id, &obs2.frame_id), None)
+            .act(
+                wait_params(&s2.session_id, &obs2.frame_id, Some(token2.clone())),
+                None,
+            )
             .await
             .unwrap();
         assert!(res2.trace.is_none(), "disabled mode has no trace report");
-        rt2.session_stop(&s2.session_id).await.unwrap();
+        rt2.session_stop(&s2.session_id, Some(&token2))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn act_out_of_bounds_rejected() {
         let rt = runtime().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1521,16 +1792,21 @@ mod tests {
             risk_level: None,
             requires_confirmation: None,
             policy_context: None,
+            control_token: Some(token.clone()),
         };
         let err = rt.act(params, None).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::OutOfBounds);
-        rt.session_stop(&s.session_id).await.unwrap();
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
     }
 
     #[tokio::test]
     async fn confirmation_required_is_enforced() {
         let rt = runtime().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1556,16 +1832,21 @@ mod tests {
             risk_level: Some("high".into()),
             requires_confirmation: None,
             policy_context: Some("deleting files".into()),
+            control_token: Some(token.clone()),
         };
         let err = rt.act(params, None).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfirmationRequired);
-        rt.session_stop(&s.session_id).await.unwrap();
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
     }
 
     #[tokio::test]
     async fn inspect_crops_and_maps() {
         let rt = runtime().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1595,7 +1876,7 @@ mod tests {
         assert_eq!(res.height, 2);
         assert!(!res.image_base64.is_empty());
         assert_eq!(res.mapping.source_image_rect.x, 0.0);
-        rt.session_stop(&s.session_id).await.unwrap();
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1606,6 +1887,10 @@ mod tests {
         // `cancelled` — not `failed`, and not an internal error.
         let (rt, _driver) = runtime_with_driver().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1618,6 +1903,7 @@ mod tests {
             .unwrap();
         let sid = s.session_id.clone();
         let frame = obs.frame_id.clone();
+        let act_token = token.clone();
         let rt2 = rt.clone();
         let handle = tokio::spawn(async move {
             rt2.act(
@@ -1644,6 +1930,7 @@ mod tests {
                     risk_level: None,
                     requires_confirmation: None,
                     policy_context: None,
+                    control_token: Some(act_token),
                 },
                 None,
             )
@@ -1651,7 +1938,7 @@ mod tests {
         });
         // Let the first action run and the wait begin, then cancel.
         tokio::time::sleep(Duration::from_millis(120)).await;
-        rt.cancel_in_flight(&s.session_id).unwrap();
+        rt.cancel_in_flight(&s.session_id, Some(&token)).unwrap();
         let started = Instant::now();
         let res = handle.await.unwrap().unwrap();
         let elapsed = started.elapsed();
@@ -1668,7 +1955,7 @@ mod tests {
             res.action_results[1].error.is_none(),
             "cancelled is not an error"
         );
-        rt.session_stop(&s.session_id).await.unwrap();
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1677,6 +1964,10 @@ mod tests {
         // cancel, surfacing CANCELLED (not ACTION_TIMEOUT / internal error).
         let (rt, _driver) = runtime_with_driver().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1689,6 +1980,7 @@ mod tests {
             .unwrap();
         let sid = s.session_id.clone();
         let frame = obs.frame_id.clone();
+        let act_token = token.clone();
         let rt2 = rt.clone();
         let handle = tokio::spawn(async move {
             rt2.act(
@@ -1707,13 +1999,14 @@ mod tests {
                     risk_level: None,
                     requires_confirmation: None,
                     policy_context: None,
+                    control_token: Some(act_token),
                 },
                 None,
             )
             .await
         });
         tokio::time::sleep(Duration::from_millis(150)).await;
-        rt.cancel_in_flight(&s.session_id).unwrap();
+        rt.cancel_in_flight(&s.session_id, Some(&token)).unwrap();
         let started = Instant::now();
         let err = handle.await.unwrap().unwrap_err();
         assert!(
@@ -1722,7 +2015,7 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(err.code(), ErrorCode::Cancelled);
-        rt.session_stop(&s.session_id).await.unwrap();
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1732,6 +2025,10 @@ mod tests {
         // token). The act call errors with CANCELLED rather than hanging.
         let (rt, _driver) = runtime_with_driver().await;
         let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
         let obs = rt
             .observe(
                 ObserveParams {
@@ -1744,6 +2041,7 @@ mod tests {
             .unwrap();
         let sid = s.session_id.clone();
         let frame = obs.frame_id.clone();
+        let act_token = token.clone();
         let rt2 = rt.clone();
         let handle = tokio::spawn(async move {
             rt2.act(
@@ -1762,6 +2060,7 @@ mod tests {
                     risk_level: None,
                     requires_confirmation: None,
                     policy_context: None,
+                    control_token: Some(act_token),
                 },
                 None,
             )
@@ -1769,7 +2068,7 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(120)).await;
         // Stopping the session cancels its in-flight batch token.
-        rt.session_stop(&s.session_id).await.unwrap();
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
         let started = Instant::now();
         let err = handle.await.unwrap().unwrap_err();
         assert!(
@@ -1778,5 +2077,468 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(err.code(), ErrorCode::Cancelled);
+    }
+
+    // ------------------------------------------------------------------
+    // Server-side ownership (§十七): the control token is the capability.
+    // Knowing the session id grants nothing; every mutating operation is
+    // refused without a valid token, and a refusal never has side effects.
+    // ------------------------------------------------------------------
+
+    /// Helper: start a session and observe a fresh frame for act calls.
+    async fn start_observed(rt: &Arc<Runtime>) -> (String, String, String) {
+        let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    include_image: Some(false),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        (s.session_id, token, obs.frame_id)
+    }
+
+    #[tokio::test]
+    async fn owner_with_token_can_operate() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_observed(&rt).await;
+
+        rt.session_pause(&sid, Some(&token)).await.unwrap();
+        rt.session_resume(&sid, Some(&token)).await.unwrap();
+        let res = rt
+            .act(
+                ActParams {
+                    session_id: sid.clone(),
+                    frame_id: frame,
+                    actions: vec![ComputerAction::Move {
+                        x: 100.0,
+                        y: 100.0,
+                        coordinate_space: CoordinateSpace::Normalized1000,
+                        duration_ms: None,
+                    }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(res.executed);
+        assert_eq!(fake.executes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_token_is_refused_without_side_effects() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_observed(&rt).await;
+
+        for op in [
+            ("pause", SessionAction::Pause),
+            ("resume", SessionAction::Resume),
+            ("takeover", SessionAction::Takeover),
+            ("stop", SessionAction::Stop),
+        ] {
+            let err = rt
+                .session(op.1, Some(&sid), None, test_client(), None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code(),
+                ErrorCode::ControlTokenRequired,
+                "{} without a token must be CONTROL_TOKEN_REQUIRED",
+                op.0
+            );
+        }
+        let err = rt
+            .act(
+                ActParams {
+                    session_id: sid.clone(),
+                    frame_id: frame.clone(),
+                    actions: vec![ComputerAction::Wait { duration_ms: 1 }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: None,
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ControlTokenRequired);
+        assert!(rt.cancel_in_flight(&sid, None).is_err());
+
+        // No side effects: session still Active, nothing reached the driver,
+        // nothing was cancelled.
+        let st = rt.session_status(&sid).await.unwrap();
+        assert_eq!(st.state, SessionState::Active);
+        assert_eq!(fake.executes.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // The owner still holds a fully working session afterwards.
+        rt.act(
+            ActParams {
+                session_id: sid.clone(),
+                frame_id: frame,
+                actions: vec![ComputerAction::Wait { duration_ms: 1 }],
+                wait_policy: None,
+                fixed_wait_ms: None,
+                return_screenshot: None,
+                risk_level: None,
+                requires_confirmation: None,
+                policy_context: None,
+                control_token: Some(token.clone()),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrong_token_is_refused_and_says_nothing_useful() {
+        let rt = runtime().await;
+        let (sid, _token, _frame) = start_observed(&rt).await;
+
+        // A wrong token fails with INVALID_CONTROL_TOKEN and the message must
+        // not hint at why (length, hash, or session mismatch all look alike).
+        for wrong in ["wrong-token".to_string(), "a".repeat(43), "b".repeat(43)] {
+            let err = rt.session_pause(&sid, Some(&wrong)).await.unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidControlToken);
+            assert!(
+                !err.to_string().contains(&wrong),
+                "error must not echo the presented token"
+            );
+        }
+        let err = rt
+            .session_stop(&sid, Some("wrong-token"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidControlToken);
+        assert_eq!(
+            err.code().as_str(),
+            "INVALID_CONTROL_TOKEN",
+            "error string must not distinguish length/hash/ownership"
+        );
+
+        // Still Active: the refusals had no side effects.
+        let st = rt.session_status(&sid).await.unwrap();
+        assert_eq!(st.state, SessionState::Active);
+        assert_eq!(
+            st.control_token, None,
+            "status must never return the control token"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_clients_cannot_stop_takeover_or_cancel() {
+        let rt = runtime().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+
+        // A different client (no token — it never received one) trying to
+        // stop, takeover, or cancel must be refused.
+        let other = ClientInfo {
+            client_id: "other-client".into(),
+            client_name: "Other".into(),
+            client_instance_id: "other-1".into(),
+        };
+        for action in [
+            SessionAction::Stop,
+            SessionAction::Takeover,
+            SessionAction::Pause,
+        ] {
+            let err = rt
+                .session(action, Some(&sid), None, other.clone(), None)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ControlTokenRequired);
+        }
+        assert!(rt.cancel_in_flight(&sid, None).is_err());
+
+        // The owner's session is untouched and still controllable.
+        let st = rt.session_status(&sid).await.unwrap();
+        assert_eq!(st.state, SessionState::Active);
+        assert_eq!(st.owner_client_id.as_deref(), Some("test"));
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_can_cancel_precisely() {
+        let rt = runtime().await;
+        let (sid, token, frame) = start_observed(&rt).await;
+
+        // Two requests with the same request_id on different connections:
+        // cancelling one must not touch the other (§十六 at runtime level).
+        let rt2 = rt.clone();
+        let token2 = token.clone();
+        let frame2 = frame.clone();
+        let sid2 = sid.clone();
+        let a = tokio::spawn(async move {
+            rt2.act(
+                ActParams {
+                    session_id: sid2,
+                    frame_id: frame2,
+                    actions: vec![ComputerAction::Wait {
+                        duration_ms: 10_000,
+                    }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token2),
+                },
+                Some(RequestKey {
+                    connection_id: 1,
+                    request_id: serde_json::json!(7),
+                }),
+            )
+            .await
+        });
+        let rt3 = rt.clone();
+        let token3 = token.clone();
+        let frame3 = frame.clone();
+        let sid3 = sid.clone();
+        let b = tokio::spawn(async move {
+            rt3.act(
+                ActParams {
+                    session_id: sid3,
+                    frame_id: frame3,
+                    actions: vec![ComputerAction::Wait { duration_ms: 500 }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token3),
+                },
+                Some(RequestKey {
+                    connection_id: 2,
+                    request_id: serde_json::json!(7),
+                }),
+            )
+            .await
+        });
+        // Both batches begin (each registers; the fake driver waits).
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(rt.request_count(), 2, "both requests must be registered");
+
+        // Cancel exactly connection 1's request 7.
+        assert!(rt
+            .cancel_request(
+                &RequestKey {
+                    connection_id: 1,
+                    request_id: serde_json::json!(7),
+                },
+                &sid,
+                Some(&token),
+            )
+            .unwrap());
+        let started = Instant::now();
+        let a_result = a.await.unwrap().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "A must stop quickly after its cancel"
+        );
+        // The interrupted wait reports `cancelled` (queue path) — never
+        // success, and never an internal error.
+        assert_eq!(a_result.action_results[0].status, "cancelled");
+        assert!(!a_result.executed);
+
+        // B is untouched and completes on its own (waits run in the queue,
+        // so success is visible through the report, not the driver).
+        let b_result = b.await.unwrap().unwrap();
+        assert!(b_result.executed);
+        assert_eq!(b_result.action_results[0].status, "success");
+        assert_eq!(rt.request_count(), 0, "both batches must unregister");
+
+        // Cancelling a key that never existed reports Ok(false) — and still
+        // requires the token.
+        assert!(rt
+            .cancel_request(
+                &RequestKey {
+                    connection_id: 9,
+                    request_id: serde_json::json!(1)
+                },
+                &sid,
+                None
+            )
+            .is_err());
+        assert!(!rt
+            .cancel_request(
+                &RequestKey {
+                    connection_id: 9,
+                    request_id: serde_json::json!(1)
+                },
+                &sid,
+                Some(&token),
+            )
+            .unwrap());
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_is_issued_exactly_once() {
+        let rt = runtime().await;
+        let s = rt.session_start(None, test_client()).await.unwrap();
+        let issued = s.control_token.clone().expect("start must issue the token");
+        assert_eq!(issued.len(), 43, "256-bit base64url token");
+
+        // Every other response form must never contain the token: status,
+        // pause, resume, stop results are all tokenless.
+        let st = rt.session_status(&s.session_id).await.unwrap();
+        assert_eq!(st.control_token, None);
+        let p = rt
+            .session_pause(&s.session_id, Some(&issued))
+            .await
+            .unwrap();
+        assert_eq!(p.control_token, None);
+        let r = rt
+            .session_resume(&s.session_id, Some(&issued))
+            .await
+            .unwrap();
+        assert_eq!(r.control_token, None);
+        let stop = rt.session_stop(&s.session_id, Some(&issued)).await.unwrap();
+        assert_eq!(stop.control_token, None);
+    }
+
+    #[tokio::test]
+    async fn token_is_invalid_after_stop() {
+        let rt = runtime().await;
+        let (sid, token, frame) = start_observed(&rt).await;
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+
+        // With the (previously valid) token: mutating ops on a stopped
+        // session are SESSION_STOPPED — the token no longer grants control.
+        let err = rt.session_pause(&sid, Some(&token)).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SessionStopped);
+        let err = rt.session_resume(&sid, Some(&token)).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SessionStopped);
+        let err = rt.session_takeover(&sid, Some(&token)).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SessionStopped);
+        let err = rt
+            .act(
+                ActParams {
+                    session_id: sid.clone(),
+                    frame_id: frame,
+                    actions: vec![ComputerAction::Wait { duration_ms: 1 }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SessionStopped);
+        assert!(rt.cancel_in_flight(&sid, Some(&token)).is_err());
+
+        // Stop stays idempotent with the token.
+        let again = rt.session_stop(&sid, Some(&token)).await.unwrap();
+        assert_eq!(again.state, SessionState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn token_is_invalid_after_daemon_restart() {
+        // A fresh runtime has no sessions: the old session id is gone, so
+        // nothing (with or without the old token) can address it.
+        let rt = runtime().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+        let rt2 = runtime().await;
+
+        let err = rt2.session_status(&sid).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SessionNotFound);
+        let err = rt2
+            .session(
+                SessionAction::Stop,
+                Some(&sid),
+                None,
+                test_client(),
+                Some(&token),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SessionNotFound);
+        let err = rt2
+            .session(
+                SessionAction::Pause,
+                Some(&sid),
+                None,
+                test_client(),
+                Some(&token),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SessionNotFound);
+    }
+
+    #[tokio::test]
+    async fn takeover_and_release_verify_the_token() {
+        let rt = runtime().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+
+        let err = rt.session_takeover(&sid, None).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ControlTokenRequired);
+        assert_eq!(
+            rt.session_status(&sid).await.unwrap().state,
+            SessionState::Active
+        );
+
+        rt.session_takeover(&sid, Some(&token)).await.unwrap();
+        let err = rt.session_release(&sid, None).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ControlTokenRequired);
+        assert_eq!(
+            rt.session_status(&sid).await.unwrap().state,
+            SessionState::UserTakeover
+        );
+        rt.session_release(&sid, Some(&token)).await.unwrap();
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// A second session start fails with CONTROL_LOCKED carrying the holder's
+    /// non-secret owner identity — and never a token.
+    #[tokio::test]
+    async fn control_locked_carries_owner_but_never_a_token() {
+        let rt = runtime().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+
+        let err = rt.session_start(None, test_client()).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ControlLocked);
+        let data = err.to_error_data();
+        assert_eq!(data["holder"], sid, "rejected client learns the holder id");
+        assert_eq!(data["owner"]["client_id"], "test");
+        assert_eq!(data["owner"]["client_name"], "Test client");
+        assert_eq!(
+            data["code"], "CONTROL_LOCKED",
+            "the error is CONTROL_LOCKED, not a token oracle"
+        );
+        assert!(
+            !serde_json::to_string(&data)
+                .unwrap()
+                .contains(token.as_str()),
+            "the error must never contain the control token"
+        );
     }
 }

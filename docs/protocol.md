@@ -52,7 +52,7 @@ referenced `frame_id` itself is checked (`COMPUTER_USE_STALE_POLICY`):
 | -32602 | `INVALID_PARAMS` | missing/wrong params (e.g. observe without `session_id`) |
 | -32000 | `INTERNAL` | internal failure |
 | -32003 | `STALE_FRAME` | acted on a stale/out-of-date frame |
-| -32004 | `CONTROL_LOCKED` | session already active and owned by another client (or control lock held elsewhere) |
+| -32004 | `CONTROL_LOCKED` | session already active and owned by another client (or control lock held elsewhere); `data` carries `holder` and the owner's non-secret identity |
 | -32005 | `PAUSED` | session is paused |
 | -32006 | `USER_TAKEOVER` | user is driving the machine |
 | -32009 | `SESSION_NOT_FOUND` | no active session (status with no session → `"No active computer-use session exists."`) |
@@ -62,6 +62,11 @@ referenced `frame_id` itself is checked (`COMPUTER_USE_STALE_POLICY`):
 | -32016 | `USER_TAKEOVER_ACTIVE` | `resume` while the user holds control — call `release` first |
 | -32017 | `ACTION_TIMEOUT` | request exceeded the daemon deadline (batch still running) |
 | -32018 | `CAPTURE_FAILED` | screen capture failed (driver/capture failure) |
+| -32019 | `CONTROL_TOKEN_REQUIRED` | a mutating operation was attempted without the session's control token |
+| -32020 | `INVALID_CONTROL_TOKEN` | a control token was presented but did not verify (deliberately non-descriptive) |
+| -32021 | `SESSION_STOPPED` | a mutating operation targeted a session that is already stopped |
+| -32022 | `REQUEST_TIMEOUT` | the client-side request deadline expired (reported by the SDK, see below) |
+| -32023 | `PROTOCOL_VERSION_MISMATCH` | the client's `protocol_version` is incompatible with the daemon's |
 | — | `OUT_OF_BOUNDS` | coordinate outside the display |
 | — | `DRIVER_ERROR` | bridge/driver failure (e.g. Screen Recording permission missing) |
 | — | `PERMISSION` | macOS permission missing |
@@ -92,7 +97,7 @@ daemon runs with `COMPUTER_USE_TRACE_DEV_MODE=1`.
 | Method | Params | Result highlights |
 |---|---|---|
 | `runtime.health` | — | `version`, `ready`, `permissions`, `active_sessions`, `uptime_secs`, `frame_cache` |
-| `runtime.version` | — | `name`, `version` |
+| `runtime.version` | `{protocol_version}` | `name`, `version`, `protocol_version` — advertise your protocol version (`2`); a mismatch is `PROTOCOL_VERSION_MISMATCH` |
 | `runtime.permissions` | — | `screen_recording`, `accessibility` + guidance |
 | `runtime.displays` | — | array of `{id, name, bounds, pixel_width, pixel_height, scale_factor, is_main}` |
 | `runtime.desktop_layout` | — | `primary_id`, `displays` |
@@ -102,12 +107,37 @@ daemon runs with `COMPUTER_USE_TRACE_DEV_MODE=1`.
 
 ### Sessions
 
-`computer.session` — params `{action, session_id?, display_id?}`.
+`computer.session` — params `{action, session_id?, display_id?, control_token?,
+client_id?, client_name?, client_instance_id?}`.
 
 Actions: `start`, `status`, `pause`, `resume`, `takeover`, `release`, `stop`.
 Result: `{session_id, state, paused, user_takeover, lock_held, display_id,
 created_at, last_action_at, current_frame_id, trace_dir, owner_client_id,
-owner_client_name, owner_instance_id}`.
+owner_client_name, owner_instance_id, control_token?}`.
+
+#### Control token (capability)
+
+The daemon issues a session's **control token exactly once**, in the `start`
+response. It is a 256-bit random value (base64url), returned **only there**:
+`status` and every other read-only call never repeat it. The daemon stores
+only a SHA-256 hash and never logs, traces, or prints it. **Every mutating
+operation — `pause`, `resume`, `takeover`, `release`, `stop`, `computer.act`,
+`computer.cancel` — is refused without the token** (`CONTROL_TOKEN_REQUIRED`),
+and a wrong token is refused (`INVALID_CONTROL_TOKEN`) with no side effects.
+Read-only operations (`status`, `observe`, `inspect`, ...) need no token.
+
+**Knowing a session ID does not grant control.** A client that knows a
+session's id — through `status`, a trace, or another client's output — can
+read it, but cannot pause, stop, or cancel it. The token is the capability;
+the id is an address.
+
+Token lifecycle:
+
+- `pause` / `resume` / `takeover` / `release` never change the token.
+- `stop` ends the session; the token dies with it (the daemon forgets the
+  hash, and a later `stop` on the stopped session is `SESSION_STOPPED`).
+- A daemon restart ends every in-memory session and invalidates every token;
+  stored credentials must be treated as dead after a restart.
 
 #### Session behavior
 
@@ -119,24 +149,45 @@ owner_client_name, owner_instance_id}`.
 - **Ownership.** `start` takes optional identity params
   `{client_id, client_name, client_instance_id}`; the daemon records them on
   the session and returns them on every `session_result` (`owner_*` fields).
-  A session is meant to be stopped by the client that created it: clients
-  track ownership locally (e.g. the Pi extension stops a session only when it
-  started it, and refuses a foreign session with `CONTROL_LOCKED` under its
-  default `reject` policy — `attach` allows use without stop). The runtime
-  itself allows only **one active session** — a second `start` while one is
-  active fails with `CONTROL_LOCKED` regardless of identity.
+  The owner identity is non-secret and appears in `status`; the control token
+  is the secret that proves the right to mutate. The runtime itself allows
+  only **one active session** — a second `start` while one is active fails
+  with `CONTROL_LOCKED`, whose `data` carries the holder's session id and the
+  owner's identity (never a token).
+- **Existing sessions: default is `reject`.** When a client finds an active
+  session it does not own, it must **not** silently attach: the SDK's
+  `ensureSession` defaults to `reject` (the daemon's `CONTROL_LOCKED` surfaces
+  to the caller), with `read_only` (observe-only, no token) and
+  `attach_with_token` (the caller supplies the token, e.g. from its own
+  credential store) as explicit opt-ins. No client auto-attaches in a way
+  that would let it stop another client's session.
 - **`status` with no session** returns `SESSION_NOT_FOUND` (code -32009)
   with `"No active computer-use session exists."` — this is the
   signal to create.
 
-`computer.cancel` — params `{session_id}`. Cancels the in-flight action
-batch (if any) and returns `{cancelled, session_id}`. The cancelled batch
+`computer.cancel` — params `{session_id, control_token, request_id?,
+connection_id?}`. Cancellation is **precise** and token-verified: with
+`request_id`, exactly the request with that JSON-RPC id on the *same
+connection* is cancelled (the daemon keys in-flight batches by
+`(connection_id, request_id)`, so client A can never cancel client B's
+request even with an identical id); without it, the whole session's in-flight
+batch is cancelled. Returns `{cancelled, session_id}`. The cancelled batch
 stops at the next safe boundary (a long `wait` exits immediately) and its
 response reports the already-executed actions as `success` and the rest as
 `cancelled` — a cancelled `wait` is never reported as an internal error.
 Clients may also abort over the connection: the SDK maps an `AbortSignal`
-to a `computer.cancel` notification, so Pi/OpenCode cancellation reaches the
-daemon through the same path.
+to a `computer.cancel` with the request's own id, so Pi/OpenCode
+cancellation reaches the daemon through the same path.
+
+#### Client-side timeouts
+
+When an SDK request times out (`REQUEST_TIMEOUT`, -32022), the SDK sends a
+precise `computer.cancel` for that request and waits a short grace period
+(`cancelGracePeriodMs`, clamped 500–1500ms) for the daemon's acknowledgement.
+The thrown `RequestTimeoutError` carries `runtimeCancellationConfirmed`:
+`true` only when the daemon acknowledged the cancel — the SDK never claims
+the runtime stopped without proof. Unconfirmed cancels are reported honestly
+so the caller can re-check state instead of assuming.
 
 ### computer.observe
 

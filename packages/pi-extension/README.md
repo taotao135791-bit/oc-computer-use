@@ -36,11 +36,15 @@ The extension talks to the daemon at `~/.computer-use/runtime.sock`
   client created is left running. When a session owned by another client is
   already active, the behavior is controlled by
   `COMPUTER_USE_EXISTING_SESSION_POLICY`:
-  - `reject` (default): tools fail with `CONTROL_LOCKED` ("Another client
-    owns the active computer-use session.") — the extension never takes over.
-  - `attach`: tools observe/act on the foreign session, but can never stop
-    it. There is deliberately no `start_new` policy — the runtime allows only
-    one active session.
+  - `reject` (default): tools fail with `CONTROL_LOCKED`, whose payload names
+    the owner's non-secret identity — the extension never takes over.
+  - `attach`: observe-only use of the foreign session. The extension holds
+    **no control token** for it (the token is issued exactly once, at `start`,
+    to the creating client), so mutating calls are refused by the daemon with
+    `CONTROL_TOKEN_REQUIRED` and the extension can never stop it.
+  There is deliberately no `start_new` policy — the runtime allows only one
+  active session — and no token-less takeover: attaching without the
+  capability would be silently powerless.
 
 ## Tools
 

@@ -80,17 +80,35 @@ function sessionSummary(s: SessionResult): string {
   ].join("\n");
 }
 
+export interface McpServerOptions {
+  /**
+   * Stop the session this server started when the process exits (default
+   * true). Only sessions this server *owns* are stopped — never another
+   * client's session: the daemon would refuse a stop without the token
+   * anyway, and the SDK only holds a token for sessions it started.
+   */
+  stopOwnedSessionOnExit?: boolean;
+}
+
 /**
  * Build the MCP server. `client` may be injected for tests; by default a
  * client is created for the daemon socket when the first request arrives.
  */
-export function createComputerUseServer(client?: ComputerUseClient): McpServer {
+export function createComputerUseServer(
+  client?: ComputerUseClient,
+  opts: McpServerOptions = {},
+): McpServer {
+  const stopOwnedSessionOnExit = opts.stopOwnedSessionOnExit ?? true;
   const server = new McpServer({
     name: SERVER_NAME,
     version: SERVER_VERSION,
   });
 
   let lazyClient: ComputerUseClient | undefined = client;
+  // True while this server owns the active session (it issued the start). The
+  // SDK holds the control token only for sessions it started, so on exit this
+  // server stops exactly what it owns — never a session another client runs.
+  let ownsSession = false;
 
   /**
    * Identity this server reports when it starts a session. The daemon records
@@ -111,6 +129,36 @@ export function createComputerUseServer(client?: ComputerUseClient): McpServer {
     return lazyClient;
   }
 
+  if (stopOwnedSessionOnExit) {
+    // Best-effort cleanup on termination: stop only the session this server
+    // owns. `computer_cancel`/stop requests from other clients never touch
+    // this session (the daemon verifies the token per request), so the worst
+    // case on exit is an abandoned-but-still-owned session, which the owner
+    // (or `cu session stop`) can stop later.
+    let shuttingDown = false;
+    const stopOwned = async (): Promise<void> => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      const c = lazyClient;
+      if (!ownsSession || !c) return;
+      const cred = c.getSessionCredential();
+      if (!cred) return;
+      try {
+        await Promise.race([
+          c.session("stop", { session_id: cred.sessionId }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("stop timed out")), 3000)),
+        ]);
+      } catch {
+        // Daemon gone or session already stopped — nothing left to do.
+      }
+    };
+    const onSignal = (signal: string): void => {
+      void stopOwned().finally(() => process.exit(0));
+    };
+    process.on("SIGINT", () => onSignal("SIGINT"));
+    process.on("SIGTERM", () => onSignal("SIGTERM"));
+  }
+
   // --- computer_session ----------------------------------------------------
   server.registerTool(
     "computer_session",
@@ -120,7 +168,10 @@ export function createComputerUseServer(client?: ComputerUseClient): McpServer {
         "Start, inspect, pause, resume, stop, or release a computer-use session. " +
         "`status` resolves the currently active session (if any). " +
         "Sessions gate access to the keyboard and mouse — actions are rejected while " +
-        "paused or when the user has taken over.",
+        "paused or when the user has taken over. " +
+        "Only the client that started a session owns it: knowing a session id grants " +
+        "no control, and `stop` is honored only for the owner (the daemon verifies a " +
+        "control token that is issued once at start).",
       inputSchema: z.object({
         action: z
           .enum(["start", "status", "pause", "resume", "stop", "takeover", "release"])
@@ -133,6 +184,10 @@ export function createComputerUseServer(client?: ComputerUseClient): McpServer {
       try {
         const c = await getClient();
         const result = await c.session(action, { session_id, display_id });
+        // Ownership follows the token: the daemon issued one in this response,
+        // so this server is the owner and may (should) stop it on exit.
+        if (action === "start" && result.control_token) ownsSession = true;
+        if (action === "stop" && ownsSession) ownsSession = false;
         return { content: [textBlock(sessionSummary(result))] };
       } catch (err) {
         return { content: errorBlock(err), isError: true };
@@ -394,7 +449,9 @@ export function createComputerUseServer(client?: ComputerUseClient): McpServer {
       title: "Cancel an in-flight act",
       description:
         "Cancel the currently executing computer_act batch for a session. The batch " +
-        "stops at the next safe boundary.",
+        "stops at the next safe boundary. Cancelling is a mutating operation: the " +
+        "daemon verifies the session's control token, which the SDK holds only for " +
+        "sessions this server started — cancelling another client's session is refused.",
       inputSchema: z.object({ session_id: z.string() }),
     },
     async ({ session_id }) => {

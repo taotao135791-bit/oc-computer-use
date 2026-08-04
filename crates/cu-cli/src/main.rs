@@ -12,6 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 
 use cu_cli::client::{request, ClientError};
+use cu_cli::credentials;
 use cu_core::{
     ComputerAction, CoordinateSpace, MouseButton, Point, Region, TextInputMethod, WaitPolicy,
 };
@@ -390,6 +391,27 @@ fn emit(value: &Value, json: bool) {
     }
 }
 
+/// Deep-redact any `control_token` field so a token can never reach stdout,
+/// even in `--json` output. The daemon only returns the token in `start`
+/// responses; those must never be printed verbatim.
+fn redact_token(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if k == "control_token" {
+                    out.insert(k.clone(), Value::String("<redacted>".into()));
+                } else {
+                    out.insert(k.clone(), redact_token(v));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_token).collect()),
+        other => other.clone(),
+    }
+}
+
 /// `--json` flag forms: many commands carry it, but simple list-like commands
 /// always print raw JSON (the `print_json` path).
 fn print_json(value: Value) -> Result<(), ClientError> {
@@ -437,7 +459,8 @@ fn rpc_code_is(data: &Option<Value>, code: &str) -> bool {
 /// one when the caller left it unspecified. First use auto-creates: when the
 /// daemon has no active session (SESSION_NOT_FOUND), one is started with this
 /// CLI's identity, so `cu observe` / `cu click` work straight after
-/// `cu daemon start`.
+/// `cu daemon start`. The token issued by that start is saved to the
+/// credential store — the capability that later mutating commands need.
 async fn resolve_session(session_id: &Option<String>) -> Result<String, ClientError> {
     if let Some(id) = session_id {
         return Ok(id.clone());
@@ -446,7 +469,9 @@ async fn resolve_session(session_id: &Option<String>) -> Result<String, ClientEr
     let value = match resp {
         Ok(v) => v,
         Err(ClientError::Rpc { data, .. }) if rpc_code_is(&data, "SESSION_NOT_FOUND") => {
-            request("computer.session", session_start_params(Value::Null)).await?
+            let started = request("computer.session", session_start_params(Value::Null)).await?;
+            save_started_credential(&started);
+            started
         }
         Err(e) => return Err(e),
     };
@@ -459,6 +484,50 @@ async fn resolve_session(session_id: &Option<String>) -> Result<String, ClientEr
             message: "daemon did not return a session_id".into(),
             data: None,
         })
+}
+
+/// Persist the token from a `start` response (issued exactly once) to the
+/// 0600 credential store. Failures are non-fatal — the daemon simply refuses
+/// later mutating commands until the session is restarted.
+fn save_started_credential(started: &Value) {
+    if let (Some(sid), Some(token)) = (
+        started.get("session_id").and_then(Value::as_str),
+        started.get("control_token").and_then(Value::as_str),
+    ) {
+        let created_at = started
+            .get("created_at")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if let Err(e) = credentials::save(
+            sid,
+            token,
+            &format!("cu-{}", std::process::id()),
+            created_at,
+        ) {
+            eprintln!("cu: warning: cannot store session credential: {e}");
+        }
+    }
+}
+
+/// Drop credential files whose sessions no longer exist (stopped, or the
+/// daemon restarted — the token died with the session).
+async fn prune_stale_credentials() {
+    for cred in credentials::all() {
+        match request(
+            "computer.session",
+            json!({"action": "status", "session_id": cred.session_id}),
+        )
+        .await
+        {
+            Err(ClientError::Rpc { data, .. })
+                if rpc_code_is(&data, "SESSION_NOT_FOUND")
+                    || rpc_code_is(&data, "SESSION_STOPPED") =>
+            {
+                credentials::delete(&cred.session_id);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Params for `computer.session start`: identity is always attached so the
@@ -744,6 +813,30 @@ async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
             })
         }
     }
+    if args.action == "status" {
+        // Opportunistic cleanup: drop credential files whose sessions are
+        // gone (stopped, or the daemon restarted) — their tokens died with
+        // the sessions. Read-only status is the natural place for it.
+        prune_stale_credentials().await;
+    }
+
+    let resolved: Option<String> = if args.action == "start" || args.action == "status" {
+        None
+    } else {
+        // pause / resume / takeover / release / stop act on the session the
+        // user is operating — resolve the active one when none is named.
+        match &args.session_id {
+            Some(id) => Some(id.clone()),
+            None => match request("computer.session", json!({"action": "status"})).await {
+                Ok(v) => v
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                Err(_) => None,
+            },
+        }
+    };
+
     let params = if args.action == "start" {
         session_start_params(json!(args.display_id))
     } else if args.action == "status" {
@@ -755,21 +848,14 @@ async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
         }
         p
     } else {
-        // pause / resume / takeover / release / stop act on the session the
-        // user is operating — resolve the active one when none is named.
-        let session_id = match &args.session_id {
-            Some(id) => Some(id.clone()),
-            None => match request("computer.session", json!({"action": "status"})).await {
-                Ok(v) => v
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                Err(_) => None,
-            },
-        };
         let mut p = json!({"action": args.action});
-        if let Some(id) = session_id {
+        if let Some(id) = resolved.as_ref().or(args.session_id.as_ref()) {
             p["session_id"] = json!(id);
+            // Every mutating action needs the control token the daemon issued
+            // at start; only a credential this CLI holds authorizes it.
+            if let Some(cred) = credentials::load(id) {
+                p["control_token"] = json!(cred.control_token);
+            }
         }
         if let Some(d) = &args.display_id {
             p["display_id"] = json!(d);
@@ -777,6 +863,22 @@ async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
         p
     };
     let resp = request("computer.session", params).await?;
+
+    if args.action == "start" {
+        // The token is issued exactly once, here — persist it and never print
+        // it (the response is redacted even with --json).
+        save_started_credential(&resp);
+        emit(&redact_token(&resp), args.json);
+        return Ok(());
+    }
+
+    if args.action == "stop" {
+        // The session is gone and its token died with it — drop the file.
+        if let Some(id) = resolved.as_ref().or(args.session_id.as_ref()) {
+            credentials::delete(id);
+        }
+    }
+
     emit(&resp, args.json);
     Ok(())
 }
@@ -952,6 +1054,12 @@ async fn send_act(
     });
     if let Some(ms) = fixed_wait_ms {
         params["fixed_wait_ms"] = json!(ms);
+    }
+    // Acting is a mutating operation: the daemon verifies the control token
+    // before executing anything. Only a credential held for this session
+    // authorizes it — a session id alone is refused (CONTROL_TOKEN_REQUIRED).
+    if let Some(cred) = credentials::load(session_id) {
+        params["control_token"] = json!(cred.control_token);
     }
     request("computer.act", params).await
 }

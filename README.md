@@ -98,6 +98,19 @@ not by the client, so every adapter gets the same guarantees.
   `attach` mode to use, but never stop, a foreign session). Every
   observe/act carries a `session_id`. Actions on a stale, paused,
   taken-over, or stopped session are rejected with a specific error code.
+- **Control tokens (capability)**: `session start` returns a session's
+  **control token exactly once** (256-bit random). **Knowing a session ID
+  does not grant control** — every mutating operation (pause / resume /
+  takeover / release / stop, act, cancel) requires the token
+  (`CONTROL_TOKEN_REQUIRED` without it, `INVALID_CONTROL_TOKEN` when wrong),
+  while read-only calls (`status`, `observe`, `inspect`) need none and never
+  repeat the token. The daemon stores only a SHA-256 hash, never logs it,
+  and `stop` or a daemon restart invalidates it. The SDK and CLI keep the
+  token in per-session credential files (`0600`) and inject it automatically
+  into the calls they own. **Existing sessions default to `reject`**: a
+  client that finds a session it does not own must not silently attach —
+  `read_only` (observe-only) and `attach_with_token` (caller supplies the
+  token) are explicit opt-ins.
 - **Stale frames**: acting on anything but the session's current frame is
   rejected (`STALE_FRAME`) under the default `strict` policy; the
   `visual_match` policy (env `COMPUTER_USE_STALE_POLICY`) additionally
@@ -144,9 +157,9 @@ the trace cannot be recorded), or `disabled` (no recorder).
 ## Tests
 
 ```bash
-cargo test --workspace                    # 145 tests (Rust: core, driver, runtime, daemon protocol)
+cargo test --workspace                    # 175 tests (Rust: core, driver, runtime, daemon protocol, ownership matrix)
 cargo test -p cu-daemon --test integration -- --ignored   # live security-matrix test
-pnpm install && pnpm -r build && pnpm -r test             # 67 tests: SDK (21), Pi (14), OpenCode (20), MCP (10), inspector (2)
+pnpm install && pnpm -r build && pnpm -r test             # 80 tests: SDK (33), Pi (14), OpenCode adapter (23), MCP (10)
 ./scripts/smoke.sh                        # automated smoke: gates + Pi/OpenCode wiring snapshots
 ```
 
@@ -161,14 +174,14 @@ node scripts/ownership-scenario-a.mjs     # ownership: MCP-owned session vs. the
 
 See [docs/acceptance-manual.md](docs/acceptance-manual.md) for the full
 manual checklists (Pi 20 steps, OpenCode 14 steps, ownership A/B/C) and the
-results recorded during the round-2 acceptance run.
+results recorded during the round-2 and round-3 acceptance runs.
 
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — components, threads, data flow
 - [docs/protocol.md](docs/protocol.md) — JSON-RPC surface, methods, error codes, session behavior (auto-create, ownership, cancel)
 - [docs/permissions.md](docs/permissions.md) — Screen Recording / Accessibility setup & troubleshooting
-- [docs/acceptance-manual.md](docs/acceptance-manual.md) — Pi (20 steps) + OpenCode (14 steps) manual acceptance checklist, with round-2 results
+- [docs/acceptance-manual.md](docs/acceptance-manual.md) — Pi (20 steps) + OpenCode (14 steps) manual acceptance checklist, with round-2 and round-3 results
 - [docs/uninstall.md](docs/uninstall.md) — clean removal
 - [packages/sdk-typescript/README.md](packages/sdk-typescript/README.md)
 - [packages/mcp-server/README.md](packages/mcp-server/README.md)

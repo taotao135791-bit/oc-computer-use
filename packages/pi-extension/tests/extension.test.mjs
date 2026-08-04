@@ -96,12 +96,30 @@ function startFakeDaemon({ existingSession = null, jpeg = false } = {}) {
             data: { code, message },
           },
         });
+        // Mirrors the real daemon's CONTROL_LOCKED wire shape: message is the
+        // code, and `data` carries the holder's non-secret identity.
+        const controlLockedErr = () => ({
+          jsonrpc: "2.0",
+          id: req.id,
+          error: {
+            code: -32004,
+            message: "CONTROL_LOCKED",
+            data: {
+              holder: state.session.session_id,
+              owner: {
+                client_id: state.session.owner_client_id,
+                client_name: state.session.owner_client_name,
+                client_instance_id: state.session.owner_instance_id,
+              },
+            },
+          },
+        });
 
         if (req.method === "computer.session") {
           const action = req.params?.action;
           if (action === "start") {
             if (state.session) {
-              respond(rpcErr("CONTROL_LOCKED", "Another client owns the active computer-use session."));
+              respond(controlLockedErr());
             } else {
               state.startCount += 1;
               state.startCalls.push(req.params);
@@ -111,7 +129,13 @@ function startFakeDaemon({ existingSession = null, jpeg = false } = {}) {
                 owner_client_name: req.params?.client_name ?? "JSON-RPC client",
                 owner_instance_id: req.params?.client_instance_id ?? "unknown",
               });
-              respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+              // The control token appears exactly once — in the start
+              // response. Status (below) never repeats it.
+              respond({
+                jsonrpc: "2.0",
+                id: req.id,
+                result: { ...state.session, control_token: "pi-fake-control-token" },
+              });
             }
           } else if (action === "status") {
             if (!state.session) respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
@@ -213,6 +237,12 @@ function startFakeDaemon({ existingSession = null, jpeg = false } = {}) {
               uptime_secs: 42,
               frame_cache: 0,
             },
+          });
+        } else if (req.method === "runtime.version") {
+          respond({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: { name: "fake", version: "0.1.0", protocol_version: 2 },
           });
         } else if (req.method === "hang") {
           // Never respond — used to exercise in-flight aborts.
@@ -349,7 +379,13 @@ test("observe rejects a session owned by another client with CONTROL_LOCKED", as
       observe.execute("call-2", {}, undefined, undefined, ctx),
       (err) => {
         assert.equal(err.code, "CONTROL_LOCKED");
-        assert.equal(err.message, "Another client owns the active computer-use session.");
+        // The daemon's wire message is the code itself; the identity of the
+        // owner rides in `data` (non-secret) — never a token.
+        assert.equal(err.message, "CONTROL_LOCKED");
+        assert.equal(err.data.holder, "s_foreign");
+        assert.equal(err.data.owner.client_name, "OpenCode MCP");
+        assert.equal(err.data.owner.client_id, "opencode-mcp");
+        assert.equal(err.data.owner.client_instance_id, "opencode-instance-1");
         return true;
       },
     );

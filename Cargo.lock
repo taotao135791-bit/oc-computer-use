@@ -264,6 +264,7 @@ dependencies = [
  "clap",
  "cu-core",
  "cu-daemon",
+ "dirs",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -277,10 +278,14 @@ name = "cu-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "dirs",
+ "hex",
+ "rand",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.19",
 ]
 
@@ -289,6 +294,7 @@ name = "cu-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "cu-core",
  "cu-driver",

@@ -109,9 +109,49 @@ check "takeover" 'USER_TAKEOVER' "$("$CU" move 100 100 --session-id "$SESSION_ID
 check "takeover-status" '"user_takeover": true' "$("$CU" session status --json 2>&1)"
 "$CU" session release --session-id "$SESSION_ID" >/dev/null 2>&1
 
-echo "-- 13. stop rejects with INVALID_SESSION_STATE -------------------------------"
+echo "-- 13. stop rejects with SESSION_STOPPED -------------------------------------"
 "$CU" session stop --session-id "$SESSION_ID" >/dev/null 2>&1
-check "stopped" 'INVALID_SESSION_STATE' "$("$CU" move 100 100 --session-id "$SESSION_ID" --json 2>&1)"
+check "stopped" 'SESSION_STOPPED' "$("$CU" move 100 100 --session-id "$SESSION_ID" --json 2>&1)"
+
+echo "-- 13b. session ownership: token, owner, control lock (P0) -------------------"
+# A fresh session to own.
+OWN_JSON=$("$CU" session start --json 2>&1)
+OWN_SID=$(printf '%s' "$OWN_JSON" | grep -oE '"session_id": "s_[a-f0-9]+"' | cut -d'"' -f4)
+[ -n "$OWN_SID" ] || die "ownership: session start failed: $OWN_JSON"
+check "ownership.start-token-redacted" '"control_token": "<redacted>"' "$OWN_JSON"
+check "ownership.owner" '"owner_client_id": "cu-cli"' "$OWN_JSON"
+# Status (read-only) never repeats the token.
+OWN_STATUS=$("$CU" session status --json 2>&1)
+if printf '%s' "$OWN_STATUS" | grep -qF '"control_token"'; then
+  echo "  FAIL ownership — status leaked a control token"; FAIL=$((FAIL + 1))
+else
+  echo "  ok   ownership — status carries no control token"; PASS=$((PASS + 1))
+fi
+# A second start is refused while the control lock is held.
+check "ownership.lock" 'CONTROL_LOCKED' "$("$CU" session start 2>&1)"
+# A mutating call with a wrong token is refused with no side effects.
+WRONG_STOP=$(node -e '
+const net = require("net");
+const sid = process.argv[1];
+const sock = net.connect(process.env.HOME + "/.computer-use/runtime.sock");
+let buf = "";
+sock.on("data", (c) => (buf += c));
+sock.on("close", () => process.stdout.write(buf.trim()));
+sock.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "computer.session", params: { action: "stop", session_id: sid, control_token: "wrong" } }) + "\n");
+setTimeout(() => sock.end(), 500);
+' "$OWN_SID" 2>&1)
+check "ownership.wrong-token" 'INVALID_CONTROL_TOKEN' "$WRONG_STOP"
+check "ownership.survived" '"state": "active"' "$("$CU" session status --json 2>&1)"
+# The credential file is 0600 and dies with the session.
+OWN_CRED="$HOME/.local/state/oc-computer-use/credentials/$OWN_SID.json"
+if [ -f "$OWN_CRED" ]; then
+  CRED_MODE=$(stat -f '%Lp' "$OWN_CRED")
+  if [ "$CRED_MODE" = "600" ]; then echo "  ok   ownership — credential file 0600"; PASS=$((PASS + 1)); else echo "  FAIL ownership — credential mode $CRED_MODE"; FAIL=$((FAIL + 1)); fi
+else
+  echo "  FAIL ownership — no credential file for $OWN_SID"; FAIL=$((FAIL + 1))
+fi
+"$CU" session stop >/dev/null 2>&1
+if [ -f "$OWN_CRED" ]; then echo "  FAIL ownership — credential survives stop"; FAIL=$((FAIL + 1)); else echo "  ok   ownership — credential removed on stop"; PASS=$((PASS + 1)); fi
 
 echo "-- 14. trace list / export / replay -------------------------------------------"
 check "trace.list" 'entries' "$("$CU" trace list 2>&1)"

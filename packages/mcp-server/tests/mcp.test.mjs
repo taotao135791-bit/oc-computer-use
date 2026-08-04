@@ -65,7 +65,13 @@ function startFakeDaemon() {
               owner_client_name: req.params?.client_name ?? "JSON-RPC client",
               owner_instance_id: req.params?.client_instance_id ?? "unknown",
             };
-            respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+            // The control token appears exactly once — in the start response.
+            // Status (below) never repeats it.
+            respond({
+              jsonrpc: "2.0",
+              id: req.id,
+              result: { ...state.session, control_token: "mcp-fake-control-token" },
+            });
           } else if (action === "status") {
             if (!state.session) respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
             else respond({ jsonrpc: "2.0", id: req.id, result: state.session });
@@ -131,6 +137,12 @@ function startFakeDaemon() {
           });
         } else if (req.method === "computer.cancel") {
           respond({ jsonrpc: "2.0", id: req.id, result: { cancelled: true, session_id: req.params?.session_id } });
+        } else if (req.method === "runtime.version") {
+          respond({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: { name: "fake", version: "0.1.0", protocol_version: 2 },
+          });
         } else if (req.method === "trace.list") {
           respond({ jsonrpc: "2.0", id: req.id, result: { traces: [] } });
         } else {

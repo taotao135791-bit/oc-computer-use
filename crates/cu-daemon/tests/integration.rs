@@ -212,6 +212,167 @@ async fn shutdown_stops_the_accept_loop_and_removes_socket() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-client ownership (§ 十九): a second client that knows a session id
+// must be able to read it but never control or cancel it. Every request here
+// is a fresh connection — a fresh client that knows the session id but not
+// the control token. Protocol-level: no screen access needed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn two_clients_cannot_control_each_others_session() {
+    let d = spawn_daemon().await;
+
+    // Client A starts a session; the control token is issued exactly once.
+    let started = request(&d.socket, "computer.session", json!({ "action": "start" })).await;
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+    let token = started["control_token"]
+        .as_str()
+        .expect("start returns the control token")
+        .to_string();
+
+    // Client B (another connection) can read status — read-only needs no token.
+    let status_b = request(&d.socket, "computer.session", json!({ "action": "status" })).await;
+    assert_eq!(status_b["session_id"], json!(session_id));
+
+    // Every mutating op from B without the token is refused — and, the
+    // no-side-effects contract, the session survives each attempt untouched.
+    for (method, params) in [
+        (
+            "computer.session",
+            json!({ "action": "stop", "session_id": session_id }),
+        ),
+        (
+            "computer.session",
+            json!({ "action": "pause", "session_id": session_id }),
+        ),
+        (
+            "computer.cancel",
+            json!({ "session_id": session_id, "request_id": 7 }),
+        ),
+        (
+            "computer.act",
+            json!({
+                "session_id": session_id,
+                "frame_id": "f1",
+                "actions": [
+                    { "type": "move", "x": 100, "y": 100, "coordinate_space": "normalized_1000" }
+                ],
+            }),
+        ),
+    ] {
+        let err = request(&d.socket, method, params).await;
+        assert_eq!(
+            err["code"],
+            json!(-32019),
+            "{method} without the token must be CONTROL_TOKEN_REQUIRED, got {err}"
+        );
+    }
+    let still = request(&d.socket, "computer.session", json!({ "action": "status" })).await;
+    assert_eq!(
+        still["state"],
+        json!("active"),
+        "B's failed attempts left no side effects"
+    );
+
+    // A wrong token is refused, not silently accepted.
+    let wrong = request(
+        &d.socket,
+        "computer.session",
+        json!({
+            "action": "stop",
+            "session_id": session_id,
+            "control_token": "not-the-token",
+        }),
+    )
+    .await;
+    assert_eq!(
+        wrong["code"],
+        json!(-32020),
+        "wrong token must be INVALID_CONTROL_TOKEN"
+    );
+    let still2 = request(&d.socket, "computer.session", json!({ "action": "status" })).await;
+    assert_eq!(still2["state"], json!("active"));
+
+    // B cannot start a second session while A's is active.
+    let locked = request(&d.socket, "computer.session", json!({ "action": "start" })).await;
+    assert_eq!(
+        locked["code"],
+        json!(-32004),
+        "second start must be CONTROL_LOCKED, got {locked}"
+    );
+
+    // Status carries the owner (non-secret) but never repeats the token.
+    let status = request(&d.socket, "computer.session", json!({ "action": "status" })).await;
+    assert!(
+        status["owner_client_id"].is_string(),
+        "status should identify the owner: {status}"
+    );
+    assert!(
+        !status.to_string().contains(&token),
+        "status must never repeat the control token"
+    );
+
+    // Only A, with the token, can stop.
+    let stopped = request(
+        &d.socket,
+        "computer.session",
+        json!({
+            "action": "stop",
+            "session_id": session_id,
+            "control_token": token,
+        }),
+    )
+    .await;
+    assert_eq!(
+        stopped["state"],
+        json!("stopped"),
+        "token-carrying stop succeeds: {stopped}"
+    );
+    let gone = request(&d.socket, "computer.session", json!({ "action": "status" })).await;
+    assert_eq!(
+        gone["code"],
+        json!(-32009),
+        "after stop, status is SESSION_NOT_FOUND"
+    );
+
+    shutdown_daemon(d).await;
+}
+
+#[tokio::test]
+async fn old_protocol_clients_are_refused_explicitly() {
+    // § 二十一: a pre-ownership SDK (protocol v1) hitting this daemon gets a
+    // typed PROTOCOL_VERSION_MISMATCH — never a confusing half-working
+    // session. (Clients that don't advertise are served the version and must
+    // check it themselves; their tokenless mutating calls fail regardless.)
+    let d = spawn_daemon().await;
+
+    let old_version = request(
+        &d.socket,
+        "runtime.version",
+        json!({ "protocol_version": 1 }),
+    )
+    .await;
+    assert_eq!(
+        old_version["code"],
+        json!(-32023),
+        "old protocol_version: {old_version}"
+    );
+    let ok = request(
+        &d.socket,
+        "runtime.version",
+        json!({ "protocol_version": 2 }),
+    )
+    .await;
+    assert_eq!(
+        ok["protocol_version"],
+        json!(2),
+        "current client is served: {ok}"
+    );
+
+    shutdown_daemon(d).await;
+}
+
+// ---------------------------------------------------------------------------
 // Live tests (screen capture + input synthesis; require TCC grants).
 // Run explicitly:  cargo test -p cu-daemon --test integration -- --ignored
 // ---------------------------------------------------------------------------

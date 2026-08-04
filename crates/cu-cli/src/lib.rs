@@ -4,5 +4,6 @@
 //! the acceptance test harness, future tooling — can reuse it.
 
 pub mod client;
+pub mod credentials;
 
 pub use client::{request, request_on, ClientError};

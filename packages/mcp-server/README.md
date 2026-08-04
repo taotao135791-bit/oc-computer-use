@@ -12,6 +12,12 @@ server (or its owner). A `computer_session status` with no active session
 returns `SESSION_NOT_FOUND` — the error arrives as an `isError` content
 block, never as a thrown exception.
 
+**Control token.** The server holds the session's control token in memory
+(issued once at `start`; **knowing a session ID does not grant control**) and
+injects it into its own mutating calls. If the daemon restarts, the token is
+invalid — stale mutating calls fail cleanly (`SESSION_NOT_FOUND` /
+`INVALID_CONTROL_TOKEN`) and the next call auto-starts a fresh session.
+
 ## Run
 
 ```bash

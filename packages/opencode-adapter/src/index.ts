@@ -22,7 +22,7 @@
 // the tools as an OpenCode plugin — MCP is the single supported wiring.
 
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { copyFile, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -159,6 +159,7 @@ export async function statusText(client: ComputerUseClient): Promise<string> {
     const s: SessionResult = await client.session("status");
     lines.push(
       `session: ${s.session_id} state=${s.state} paused=${s.paused} takeover=${s.user_takeover} lock=${s.lock_held}`,
+      ...(s.owner_client_name ? [`owner: ${s.owner_client_name}`] : []),
       ...(s.current_frame_id ? [`current_frame_id: ${s.current_frame_id}`] : []),
       ...(s.trace_dir ? [`trace_dir: ${s.trace_dir}`] : []),
     );
@@ -172,21 +173,99 @@ export async function statusText(client: ComputerUseClient): Promise<string> {
   return lines.join("\n");
 }
 
-/** Stop the active session (if any); idempotent cleanup. */
-export async function cleanupSession(client: ComputerUseClient): Promise<{ stopped: boolean; message: string }> {
-  try {
-    const s: SessionResult = await client.session("status");
-    await client.session("stop", { session_id: s.session_id });
-    return {
-      stopped: true,
-      message: `stopped session ${s.session_id} (was ${s.state})`,
-    };
-  } catch (err) {
-    if (err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND") {
-      return { stopped: false, message: "no active session to clean up" };
+// ---------------------------------------------------------------------------
+// Credential store (shared with `cu` / `cu session start`)
+// ---------------------------------------------------------------------------
+
+export interface StoredCredential {
+  sessionId: string;
+  controlToken: string;
+}
+
+/** `~/.local/state/oc-computer-use/credentials` — where `cu` keeps tokens. */
+export function storedCredentialsDir(): string {
+  return join(homedir(), ".local", "state", "oc-computer-use", "credentials");
+}
+
+/** The credentials this machine holds (0600 files written by `cu session start`). */
+export function listStoredCredentials(): StoredCredential[] {
+  const dir = storedCredentialsDir();
+  if (!existsSync(dir)) return [];
+  const out: StoredCredential[] = [];
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const j = JSON.parse(readFileSync(join(dir, f), "utf8")) as {
+        session_id?: unknown;
+        control_token?: unknown;
+      };
+      if (typeof j.session_id === "string" && typeof j.control_token === "string") {
+        out.push({ sessionId: j.session_id, controlToken: j.control_token });
+      }
+    } catch {
+      // Unreadable/corrupt credential — ignore; `cu` prunes those.
     }
-    throw err;
   }
+  return out;
+}
+
+/**
+ * Stop the sessions this machine owns (if any); idempotent cleanup.
+ *
+ * Server-side ownership means a session id alone grants nothing: the daemon
+ * refuses a `stop` without the control token that was issued once at start.
+ * This CLI stops exactly the sessions it holds credentials for (files written
+ * by `cu session start`); an active session owned elsewhere is reported as
+ * such — stopping it is the owner's prerogative, not a companion CLI's.
+ */
+export async function cleanupSession(client: ComputerUseClient): Promise<{ stopped: boolean; message: string }> {
+  const creds = listStoredCredentials();
+  if (creds.length === 0) {
+    try {
+      const s: SessionResult = await client.session("status");
+      return {
+        stopped: false,
+        message:
+          `session ${s.session_id} is owned by ${s.owner_client_name ?? s.owner_client_id ?? "another client"} — ` +
+          `knowing its id does not grant control; stop it from the owning client or with \`cu session stop\``,
+      };
+    } catch (err) {
+      if (err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND") {
+        return { stopped: false, message: "no active session to clean up" };
+      }
+      throw err;
+    }
+  }
+  const stoppedIds: string[] = [];
+  const notes: string[] = [];
+  for (const cred of creds) {
+    try {
+      await client.session("stop", {
+        session_id: cred.sessionId,
+        control_token: cred.controlToken,
+      });
+      stoppedIds.push(cred.sessionId);
+    } catch (err) {
+      if (err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND") {
+        // already gone — nothing to note
+      } else if (err instanceof ComputerUseError && err.code === "CONTROL_TOKEN_REQUIRED") {
+        notes.push(`session ${cred.sessionId}: token no longer valid (daemon restarted?)`);
+      } else {
+        notes.push(`session ${cred.sessionId}: ${(err as Error).message}`);
+      }
+    }
+  }
+  if (stoppedIds.length === 0) {
+    return {
+      stopped: false,
+      message: notes.length > 0 ? notes.join("; ") : "no owned session to clean up",
+    };
+  }
+  const suffix = notes.length > 0 ? ` (${notes.join("; ")})` : "";
+  return {
+    stopped: true,
+    message: `stopped session${stoppedIds.length > 1 ? "s" : ""} ${stoppedIds.join(", ")}${suffix}`,
+  };
 }
 
 export interface DoctorReport {

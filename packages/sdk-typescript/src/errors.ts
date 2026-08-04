@@ -44,6 +44,16 @@ export const ERROR_CODES = {
   ACTION_TIMEOUT: "ACTION_TIMEOUT",
   /** Screen capture failed (driver/capture failure). */
   CAPTURE_FAILED: "CAPTURE_FAILED",
+  /** A mutating operation was attempted without a session control token. */
+  CONTROL_TOKEN_REQUIRED: "CONTROL_TOKEN_REQUIRED",
+  /** A control token was presented but did not verify (never says why). */
+  INVALID_CONTROL_TOKEN: "INVALID_CONTROL_TOKEN",
+  /** A mutating operation targeted a session that is already stopped. */
+  SESSION_STOPPED: "SESSION_STOPPED",
+  /** SDK-side request deadline (local). See RequestTimeoutError. */
+  REQUEST_TIMEOUT: "REQUEST_TIMEOUT",
+  /** The daemon speaks a different wire protocol version than this SDK. */
+  PROTOCOL_VERSION_MISMATCH: "PROTOCOL_VERSION_MISMATCH",
   TRACE_ERROR: "TRACE_ERROR",
   /** Canonical name for trace unavailability (wire code: TRACE_ERROR). */
   TRACE_UNAVAILABLE: "TRACE_ERROR",
@@ -77,6 +87,11 @@ const JSONRPC_CODE_TO_NAME: Record<number, ErrorCodeName> = {
   [-32016]: ERROR_CODES.USER_TAKEOVER_ACTIVE,
   [-32017]: ERROR_CODES.ACTION_TIMEOUT,
   [-32018]: ERROR_CODES.CAPTURE_FAILED,
+  [-32019]: ERROR_CODES.CONTROL_TOKEN_REQUIRED,
+  [-32020]: ERROR_CODES.INVALID_CONTROL_TOKEN,
+  [-32021]: ERROR_CODES.SESSION_STOPPED,
+  [-32022]: ERROR_CODES.REQUEST_TIMEOUT,
+  [-32023]: ERROR_CODES.PROTOCOL_VERSION_MISMATCH,
 };
 
 /** Map a numeric JSON-RPC code to its machine-readable name. */
@@ -111,12 +126,34 @@ export class ComputerUseError extends Error {
 
 /** Connection-level failures (socket, framing, timeouts). */
 export class TransportError extends Error {
-  /** Always `"DAEMON_UNAVAILABLE"` — the daemon could not be reached. */
-  readonly code: "DAEMON_UNAVAILABLE";
+  /** `"DAEMON_UNAVAILABLE"` when the daemon could not be reached. */
+  readonly code: string;
   constructor(message: string) {
     super(message);
     this.name = "TransportError";
     this.code = "DAEMON_UNAVAILABLE";
+  }
+}
+
+/**
+ * The SDK's own request deadline expired (local timeout, not a daemon error).
+ *
+ * The SDK does not just give up: it sends a precise `computer.cancel` (same
+ * connection, same `request_id`, with the session's control token) and waits
+ * for the daemon's acknowledgement before resolving this error.
+ * `runtimeCancellationConfirmed` is `true` only when the daemon explicitly
+ * reported the batch as cancelled — the SDK never claims the runtime stopped
+ * when it did not receive the acknowledgement.
+ */
+export class RequestTimeoutError extends TransportError {
+  /** Always `"REQUEST_TIMEOUT"` — the SDK-side deadline expired. */
+  override readonly code = "REQUEST_TIMEOUT" as const;
+  /** True when the runtime confirmed the request was cancelled. */
+  readonly runtimeCancellationConfirmed: boolean;
+  constructor(message: string, runtimeCancellationConfirmed: boolean) {
+    super(message);
+    this.name = "RequestTimeoutError";
+    this.runtimeCancellationConfirmed = runtimeCancellationConfirmed;
   }
 }
 

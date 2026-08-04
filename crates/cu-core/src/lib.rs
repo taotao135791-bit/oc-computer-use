@@ -11,6 +11,7 @@ pub mod coordinates;
 pub mod errors;
 pub mod frames;
 pub mod protocol;
+pub mod security;
 pub mod sessions;
 
 pub use actions::{
@@ -20,8 +21,10 @@ pub use coordinates::{CoordinateSpace, DisplayBounds, ImageGeometry, Point, Regi
 pub use errors::{CuError, ErrorCode, PermissionIssue, PermissionKind, StaleFrameDetail};
 pub use frames::{ScreenFrame, ScreenSnapshot, StaleFrameVerdict};
 pub use protocol::{
-    ActParams, ActResult, ActionResultReport, ClientInfo, InspectMapping, InspectParams,
-    InspectResult, ObserveParams, ObserveResult, RpcRequest, RpcResponse, SessionParams,
-    SessionResult, StabilizationInfo, TraceEntry, TraceExport, TraceReport, TraceSummary,
+    ActParams, ActResult, ActionResultReport, CancelParams, CancelResult, ClientInfo,
+    InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult, RequestKey,
+    RpcRequest, RpcResponse, SessionParams, SessionResult, StabilizationInfo, TraceEntry,
+    TraceExport, TraceReport, TraceSummary,
 };
+pub use security::{generate_control_token, ControlToken, SecretTokenHash};
 pub use sessions::{SessionAction, SessionState, SessionStatus};

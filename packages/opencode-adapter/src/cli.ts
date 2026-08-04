@@ -6,7 +6,7 @@
 //   cu-opencode setup            write ~/.config/opencode/opencode.json with the MCP entry
 //   cu-opencode setup --print    print the config fragment instead of writing
 //   cu-opencode status           daemon health + active session
-//   cu-opencode session cleanup  stop the active session
+//   cu-opencode session cleanup  stop the sessions this machine owns
 //   cu-opencode doctor           environment check
 //   cu-opencode help
 import { connect, defaultSocketPath } from "@computer-use/sdk";
@@ -42,7 +42,10 @@ Usage:
   cu-opencode status [--socket <path>]
       Show daemon health and the active session.
   cu-opencode session cleanup [--socket <path>]
-      Stop the active session (idempotent).
+      Stop the sessions this machine owns — the ones it holds control
+      credentials for (~/.local/state/oc-computer-use/credentials, written
+      by "cu session start"). A session owned by another client is reported
+      as such: knowing its id does not grant control (idempotent).
   cu-opencode doctor [--socket <path>]
       Check binaries, socket, and daemon health.
   cu-opencode help

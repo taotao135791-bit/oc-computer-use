@@ -31,7 +31,6 @@ import {
   type ComputerUseClient,
   type RequestOptions,
   type SessionAction,
-  type SessionResult,
 } from "@computer-use/sdk";
 
 // ---------------------------------------------------------------------------
@@ -55,59 +54,51 @@ const PI_CLIENT_INFO = {
 
 async function getClient(): Promise<ComputerUseClient> {
   if (!client) {
-    client = await connect({ socketPath: process.env.COMPUTER_USE_SOCKET });
+    client = await connect({
+      socketPath: process.env.COMPUTER_USE_SOCKET,
+      clientInfo: PI_CLIENT_INFO,
+    });
   }
   return client;
 }
 
 /**
  * What to do when a session owned by *another* client is already active.
- * - `reject` (default): refuse to use it (CONTROL_LOCKED).
- * - `attach`: observe/act on it, without the ability to stop it.
+ * - `reject` (default): refuse to use it — the daemon answers the start
+ *   attempt with CONTROL_LOCKED, carrying the owner's identity (never a token).
+ * - `read_only`: observe the existing session, but never act on or stop it —
+ *   this extension holds no token for it (the daemon refuses mutating
+ *   requests without one).
  * A `start_new` policy is deliberately not implemented: the runtime holds a
  * single active-session control lock, so a second session cannot exist.
+ * `attach_with_token` is not offered either — Pi has no way to obtain another
+ * client's token, and attaching without one would be silently powerless.
  */
-type ExistingSessionPolicy = "reject" | "attach";
+type ExistingSessionPolicy = "reject" | "read_only";
 
 function existingSessionPolicy(): ExistingSessionPolicy {
   const v = process.env.COMPUTER_USE_EXISTING_SESSION_POLICY;
-  return v === "attach" ? "attach" : "reject";
+  return v === "attach" ? "read_only" : "reject";
 }
 
-/** Resolve the current session, starting one if none exists. */
+/**
+ * Resolve the current session, starting one if none exists. Ownership and the
+ * control token live in the SDK's SessionCredential: a session this extension
+ * starts is held (token issued once at start), and `ownsSession` mirrors that
+ * — an extension without the credential never claims to own anything.
+ */
 async function ensureSession(options?: RequestOptions): Promise<string> {
-  if (sessionId) return sessionId;
+  if (sessionId) {
+    // Cached — but re-confirm the credential matches (it is dropped if the
+    // daemon says the session is gone, e.g. another owner stopped it).
+    const cred = client?.getSessionCredential();
+    if (!cred || cred.sessionId !== sessionId) sessionId = null;
+    else return sessionId;
+  }
   const c = await getClient();
-  let s: SessionResult;
-  try {
-    s = await c.session("status", {}, options);
-  } catch (err) {
-    if (err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND") {
-      // First use: we create the session, so we own it.
-      s = await c.session("start", { ...PI_CLIENT_INFO }, options);
-      ownsSession = true;
-      sessionId = s.session_id;
-      return sessionId;
-    }
-    throw err;
-  }
-  // A session already exists — who owns it?
-  if (s.owner_client_id && s.owner_client_id !== PI_CLIENT_INFO.client_id) {
-    if (existingSessionPolicy() === "reject") {
-      throw new ComputerUseError(-32004, "Another client owns the active computer-use session.", {
-        code: "CONTROL_LOCKED",
-        message: "Another client owns the active computer-use session.",
-        owner_client_id: s.owner_client_id,
-        owner_client_name: s.owner_client_name ?? null,
-      });
-    }
-    // attach: use the session, but never stop it.
-    ownsSession = false;
-  } else {
-    // Owned by us (or started before ownership was recorded — adopt it).
-    ownsSession = true;
-  }
+  const s = await c.ensureSession(undefined, options, PI_CLIENT_INFO, existingSessionPolicy());
   sessionId = s.session_id;
+  ownsSession = c.getSessionCredential()?.sessionId === s.session_id;
   return sessionId;
 }
 
@@ -256,6 +247,9 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
       "Sessions gate access to the keyboard and mouse: actions are rejected while the " +
       "session is paused or while the user holds control (takeover). `release` returns " +
       "control from the human to the agent; `resume` only works while paused. " +
+      "Only the client that started a session owns it: knowing a session id grants no " +
+      "control, and `stop` is honored only for the owner (the daemon verifies a token " +
+      "issued once at start). " +
       "Omit session_id to act on the current session. " +
       "Output: session id, state, paused, user_takeover, lock_held, started_by.",
     promptSnippet: "Start or inspect a computer-use session, or manage pause/takeover state.",
@@ -280,8 +274,10 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
         { signal },
       );
       sessionId = result.session_id;
-      if (params.action === "start") ownsSession = true;
-      if (params.action === "stop") ownsSession = false;
+      if (params.action === "stop") sessionId = null;
+      // Ownership is whatever token we hold: the SDK stores the token issued
+      // by start (and drops it on stop), so this mirrors the daemon exactly.
+      ownsSession = c.getSessionCredential()?.sessionId === result.session_id;
       const lines = [
         `session_id: ${result.session_id}`,
         `state: ${result.state}`,
@@ -526,11 +522,8 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
             ...(action === "start" ? { ...PI_CLIENT_INFO } : {}),
           });
           sessionId = s.session_id;
-          if (action === "start") ownsSession = true;
-          if (action === "stop") {
-            ownsSession = false;
-            sessionId = null;
-          }
+          if (action === "stop") sessionId = null;
+          ownsSession = c.getSessionCredential()?.sessionId === s.session_id;
           ctx.ui.notify(
             `${verb}: ${s.session_id} state=${s.state} paused=${s.paused} takeover=${s.user_takeover} lock=${s.lock_held}`,
             "info",
@@ -557,9 +550,14 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
         try {
           const s = await c.session("status", {});
           // Read-only: never adopt a foreign session here (that would bypass
-          // the existing-session policy for later observe/act calls).
+          // the existing-session policy for later observe/act calls). Shows
+          // the owner's identity (non-secret metadata) — never a control
+          // token, which status does not carry and must never print.
           sessionLine = `session: ${s.session_id} state=${s.state} paused=${s.paused} takeover=${s.user_takeover} lock=${s.lock_held}`;
           if (s.owner_client_name) sessionLine += ` owner=${s.owner_client_name}`;
+          if (s.owner_client_id && s.owner_client_id !== PI_CLIENT_INFO.client_id) {
+            sessionLine += ` (client ${s.owner_client_id})`;
+          }
           if (s.current_frame_id) sessionLine += ` frame=${s.current_frame_id}`;
           if (s.trace_dir) sessionLine += ` trace=${s.trace_dir}`;
         } catch (err) {

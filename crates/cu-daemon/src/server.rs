@@ -11,6 +11,7 @@
 //! - `runtime.shutdown` cancels the accept loop for a graceful stop.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cu_core::{ErrorCode, RpcRequest, RpcResponse};
@@ -95,6 +96,12 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         ctrl_c_shutdown.cancel();
     });
 
+    // Each connection gets a unique id. The id is part of the request key
+    // `(connection_id, request_id)` that makes `computer.cancel` precise: two
+    // clients may both send `request_id: 1`, and cancelling one never touches
+    // the other. Ids start at 1 and wrap is impossible in practice (u64).
+    let connection_counter = AtomicU64::new(1);
+
     tracing::info!(path = %socket.display(), version = %cu_core::config::RUNTIME_VERSION, "computer-use daemon listening");
 
     loop {
@@ -106,8 +113,9 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                         let runtime = runtime.clone();
                         let shutdown = app_shutdown.clone();
                         let timeout = config.request_timeout_secs;
+                        let connection_id = connection_counter.fetch_add(1, Ordering::Relaxed);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, runtime, shutdown, timeout).await {
+                            if let Err(e) = handle_connection(stream, connection_id, runtime, shutdown, timeout).await {
                                 tracing::debug!(error = %e, "connection handler ended");
                             }
                         });
@@ -132,8 +140,12 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
 /// `computer.cancel` can reach the runtime while a `computer.act` batch is
 /// still executing. Responses may arrive out of order; clients match them by
 /// JSON-RPC id.
+///
+/// `connection_id` seeds every request key on this connection, so request
+/// cancellation is scoped to the connection that issued it.
 async fn handle_connection(
     stream: UnixStream,
+    connection_id: u64,
     runtime: Arc<Runtime>,
     app_shutdown: CancellationToken,
     timeout_secs: u64,
@@ -164,7 +176,7 @@ async fn handle_connection(
         let shutdown = app_shutdown.clone();
         let writer = writer.clone();
         inflight.push(tokio::spawn(async move {
-            let fut = dispatch(&runtime, &shutdown, request.clone());
+            let fut = dispatch(&runtime, &shutdown, connection_id, request.clone());
             let timeout = tokio::time::Duration::from_secs(timeout_secs);
             let resp = match tokio::time::timeout(timeout, fut).await {
                 Ok(resp) => resp,

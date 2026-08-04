@@ -42,6 +42,20 @@ pub enum ErrorCode {
     /// Capturing the screen failed (driver/capture failure, e.g. the screen
     /// recording session dropped).
     CaptureFailed,
+    /// A mutating operation was attempted without a control token.
+    ControlTokenRequired,
+    /// A control token was presented but did not verify. The error is
+    /// deliberately non-descriptive — it must not hint whether the token was
+    /// malformed, wrong-length, or simply not this session's.
+    InvalidControlToken,
+    /// A mutating operation targeted a session that is already stopped.
+    SessionStopped,
+    /// The SDK-side request deadline expired. Distinct from `ActionTimeout`
+    /// (daemon-side): the client timed out waiting, and reports whether the
+    /// runtime confirmed the cancellation.
+    RequestTimeout,
+    /// The client's protocol version is incompatible with the daemon's.
+    ProtocolVersionMismatch,
 }
 
 impl ErrorCode {
@@ -73,6 +87,11 @@ impl ErrorCode {
             UserTakeoverActive => -32016,
             ActionTimeout => -32017,
             CaptureFailed => -32018,
+            ControlTokenRequired => -32019,
+            InvalidControlToken => -32020,
+            SessionStopped => -32021,
+            RequestTimeout => -32022,
+            ProtocolVersionMismatch => -32023,
         }
     }
 
@@ -102,6 +121,11 @@ impl ErrorCode {
             UserTakeoverActive => "USER_TAKEOVER_ACTIVE",
             ActionTimeout => "ACTION_TIMEOUT",
             CaptureFailed => "CAPTURE_FAILED",
+            ControlTokenRequired => "CONTROL_TOKEN_REQUIRED",
+            InvalidControlToken => "INVALID_CONTROL_TOKEN",
+            SessionStopped => "SESSION_STOPPED",
+            RequestTimeout => "REQUEST_TIMEOUT",
+            ProtocolVersionMismatch => "PROTOCOL_VERSION_MISMATCH",
         }
     }
 }
@@ -170,8 +194,14 @@ pub enum CuError {
     Permission(PermissionIssue),
     #[error("stale frame: referenced {0:?} is out of date")]
     StaleFrame(StaleFrameDetail),
+    /// Another client owns the active session. `holder` is the other session
+    /// id; `owner` is the identity the holder's creator reported (non-secret
+    /// metadata, useful for "Owner: OpenCode" style errors — never a token).
     #[error("control lock is held by {holder}")]
-    ControlLocked { holder: String },
+    ControlLocked {
+        holder: String,
+        owner: Option<crate::protocol::ClientInfo>,
+    },
     #[error("session is paused")]
     Paused,
     #[error("user takeover is active")]
@@ -189,8 +219,27 @@ pub enum CuError {
     UnknownFrame(String),
     #[error("{0}")]
     SessionNotFound(String),
+    /// A mutating operation required this session's control token, and none
+    /// was supplied.
+    #[error("This operation requires the session control token. Only the client that started the session has it; a session id alone grants no control.")]
+    ControlTokenRequired,
+    /// A control token was supplied but did not verify. The message must not
+    /// reveal whether the token was malformed, wrong-length, or not this
+    /// session's — that would leak verification details.
+    #[error("Invalid control token for this session.")]
+    InvalidControlToken,
+    /// A mutating operation targeted a session that is already stopped.
+    #[error("session is stopped")]
+    SessionStopped,
     #[error("invalid session state: {0}")]
     InvalidSessionState(String),
+    /// The SDK-side request deadline expired; `confirmed` records whether the
+    /// runtime acknowledged the cancellation.
+    #[error("request timed out: {0}")]
+    RequestTimeout(String),
+    /// Protocol version mismatch between client and daemon.
+    #[error("protocol version mismatch: daemon expects v{expected}, client is {got:?}")]
+    ProtocolVersionMismatch { expected: u32, got: Option<u32> },
     #[error("confirmation required")]
     ConfirmationRequired(ConfirmationDetail),
     #[error("operation cancelled")]
@@ -221,6 +270,11 @@ impl CuError {
             UserTakeoverActive => ErrorCode::UserTakeoverActive,
             ActionTimeout(_) => ErrorCode::ActionTimeout,
             CaptureFailed(_) => ErrorCode::CaptureFailed,
+            ControlTokenRequired => ErrorCode::ControlTokenRequired,
+            InvalidControlToken => ErrorCode::InvalidControlToken,
+            SessionStopped => ErrorCode::SessionStopped,
+            RequestTimeout(_) => ErrorCode::RequestTimeout,
+            ProtocolVersionMismatch { .. } => ErrorCode::ProtocolVersionMismatch,
             OutOfBounds(_) => ErrorCode::OutOfBounds,
             UnknownFrame(_) => ErrorCode::UnknownFrame,
             SessionNotFound(_) => ErrorCode::SessionNotFound,
@@ -274,8 +328,22 @@ impl CuError {
                     serde_json::to_value(detail).unwrap_or(serde_json::Value::Null),
                 );
             }
-            CuError::ControlLocked { holder } => {
+            CuError::ControlLocked { holder, owner } => {
                 map.insert("holder".into(), holder.clone().into());
+                if let Some(o) = owner {
+                    map.insert(
+                        "owner".into(),
+                        serde_json::to_value(o).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+            }
+            CuError::ProtocolVersionMismatch { expected, got } => {
+                map.insert("expected".into(), (*expected).into());
+                map.insert(
+                    "got".into(),
+                    got.map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                );
             }
             _ => {}
         }

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use cu_core::{ClientInfo, CuError, SessionState};
+use cu_core::{ClientInfo, CuError, SecretTokenHash, SessionState};
 
 /// The runtime-level session object (not the wire-level [`cu_core::SessionStatus`]).
 pub struct Session {
@@ -21,6 +21,11 @@ pub struct Session {
     /// the creating client may stop the session it started; other clients must
     /// attach without stopping it.
     pub owner: Option<ClientInfo>,
+    /// SHA-256 hash of the session's control token — the **only** stored form.
+    /// Mutating operations verify the presented token against this before any
+    /// side effect. The plaintext token is issued once, on `start`, and never
+    /// persisted by the runtime.
+    pub control_token_hash: SecretTokenHash,
     state: Mutex<SessionState>,
     paused: AtomicBool,
     user_takeover: AtomicBool,
@@ -28,9 +33,11 @@ pub struct Session {
     pub current_frame_id: Mutex<Option<String>>,
     /// Root token; never cancelled directly, only used to derive fresh children.
     cancel_root: tokio_util::sync::CancellationToken,
-    /// Token for the currently in-flight `act` batch. Swapped per batch so a
-    /// paused/resumed session can run a new batch with a fresh token.
-    current_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
+    /// One token per in-flight batch (a batch begins before it acquires the
+    /// session's `busy` lock, so a waiting request can be cancelled precisely
+    /// without touching the executing batch). Pause/takeover/stop cancel
+    /// **all** of them; `computer.cancel` cancels exactly one, by request key.
+    batch_tokens: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>,
     pub trace: Option<cu_trace::TraceRecorder>,
     /// Serializes observe/act on this session so two concurrent batches can
     /// never interleave their pointer events.
@@ -43,6 +50,7 @@ impl Session {
         display_id: String,
         started_by: String,
         owner: Option<ClientInfo>,
+        control_token_hash: SecretTokenHash,
         trace: Option<cu_trace::TraceRecorder>,
     ) -> Self {
         Self {
@@ -51,15 +59,28 @@ impl Session {
             created_at: Utc::now(),
             started_by,
             owner,
+            control_token_hash,
             state: Mutex::new(SessionState::Active),
             paused: AtomicBool::new(false),
             user_takeover: AtomicBool::new(false),
             last_action_at: Mutex::new(None),
             current_frame_id: Mutex::new(None),
             cancel_root: tokio_util::sync::CancellationToken::new(),
-            current_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
+            batch_tokens: std::sync::Mutex::new(Vec::new()),
             trace,
             busy: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Verify a presented control token. `None` (no token supplied) is
+    /// `CONTROL_TOKEN_REQUIRED`; a mismatch is `INVALID_CONTROL_TOKEN` — the
+    /// two are deliberately distinct, but a mismatch never says *why* (length,
+    /// hash, wrong session — all look identical).
+    pub fn verify_control_token(&self, token: Option<&str>) -> Result<(), CuError> {
+        match token {
+            None => Err(CuError::ControlTokenRequired),
+            Some(t) if self.control_token_hash.verify(t) => Ok(()),
+            Some(_) => Err(CuError::InvalidControlToken),
         }
     }
 
@@ -133,17 +154,29 @@ impl Session {
         Ok(())
     }
 
-    /// Cancel any in-flight action batch.
+    /// Cancel **every** in-flight batch (pause / takeover / stop). Request-
+    /// specific cancellation never comes through here — it targets one token
+    /// via the runtime's request registry.
     pub fn cancel_in_flight(&self) {
-        self.current_cancel.lock().unwrap().cancel();
+        for t in self.batch_tokens.lock().unwrap().iter() {
+            t.cancel();
+        }
     }
 
     /// Begin a new batch: register a fresh child token and return it. The batch
-    /// loop holds the returned token and aborts when it is cancelled.
+    /// loop holds the returned token and aborts when it is cancelled. A batch
+    /// registers before it acquires `busy`, so a queued request can be
+    /// cancelled while waiting — and cancelling it never touches the batch
+    /// that is executing.
     pub fn begin_batch(&self) -> tokio_util::sync::CancellationToken {
         let token = self.cancel_root.child_token();
-        *self.current_cancel.lock().unwrap() = token.clone();
+        self.batch_tokens.lock().unwrap().push(token.clone());
         token
+    }
+
+    /// The batch finished (ran, errored, or was cancelled): drop its token.
+    pub fn end_batch(&self, token: &tokio_util::sync::CancellationToken) {
+        self.batch_tokens.lock().unwrap().retain(|t| t != token);
     }
 }
 
@@ -165,11 +198,16 @@ impl ControlLock {
         }
     }
 
-    /// Try to acquire the lock for `session_id`. Fails if another session holds it.
+    /// Try to acquire the lock for `session_id`. Fails if another session holds
+    /// it. The error carries only the holder's session id; the runtime attaches
+    /// the holder's (non-secret) owner identity before it reaches the wire.
     pub fn try_acquire(&self, session_id: &str) -> Result<(), CuError> {
         let mut guard = self.holder.lock().unwrap();
         match guard.as_ref() {
-            Some(h) if h != session_id => Err(CuError::ControlLocked { holder: h.clone() }),
+            Some(h) if h != session_id => Err(CuError::ControlLocked {
+                holder: h.clone(),
+                owner: None,
+            }),
             _ => {
                 *guard = Some(session_id.to_string());
                 Ok(())
@@ -220,6 +258,7 @@ mod tests {
             "1".into(),
             "test".into(),
             None,
+            cu_core::SecretTokenHash::from_token(&cu_core::generate_control_token()),
             None,
         ));
         assert_eq!(s.state(), SessionState::Active);
@@ -241,6 +280,7 @@ mod tests {
             "1".into(),
             "test".into(),
             None,
+            cu_core::SecretTokenHash::from_token(&cu_core::generate_control_token()),
             None,
         ));
         s.transition(SessionState::UserTakeover).unwrap();
@@ -263,6 +303,7 @@ mod tests {
             "1".into(),
             "test".into(),
             None,
+            cu_core::SecretTokenHash::from_token(&cu_core::generate_control_token()),
             None,
         ));
         s.transition(SessionState::Paused).unwrap();
@@ -278,6 +319,7 @@ mod tests {
             "1".into(),
             "test".into(),
             None,
+            cu_core::SecretTokenHash::from_token(&cu_core::generate_control_token()),
             None,
         ));
         let batch = s.begin_batch();

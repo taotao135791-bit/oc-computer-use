@@ -13,6 +13,17 @@ use crate::actions::{ComputerAction, WaitPolicy};
 use crate::coordinates::Region;
 use crate::sessions::{SessionAction, SessionState};
 
+/// Identifies one in-flight JSON-RPC request across **all** connections.
+///
+/// Cancellation is scoped by this key: `computer.cancel` may only cancel the
+/// request it names on the connection it arrived on — client A canceling
+/// `request_id: 1` must never cancel client B's `request_id: 1`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestKey {
+    pub connection_id: u64,
+    pub request_id: serde_json::Value,
+}
+
 pub const JSONRPC_VERSION: &str = "2.0";
 
 /// A JSON-RPC 2.0 request as received by the daemon.
@@ -124,6 +135,10 @@ pub struct ActParams {
     pub session_id: String,
     pub frame_id: String,
     pub actions: Vec<ComputerAction>,
+    /// The session's control token. Required: without it the batch is rejected
+    /// before any action is parsed, queued, or executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_policy: Option<WaitPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,6 +264,10 @@ pub struct SessionParams {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_id: Option<String>,
+    /// The session's control token. Required for `pause`/`resume`/`takeover`/
+    /// `release`/`stop`; `start` and `status` do not need one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
     /// Identity of the client performing the action; recorded on `start`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
@@ -275,6 +294,12 @@ pub struct SessionResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_dir: Option<String>,
     pub started_by: String,
+    /// The session's control token. **Only present in the `start` response** —
+    /// it is issued exactly once, on creation, and never repeated by `status`
+    /// or any other read-only call. Keep it in memory (or the CLI's 0600
+    /// credential file), never in logs or traces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
     /// Who created this session (backward-compatible name of the starting
     /// client). The owner_* fields carry the structured identity; only the
     /// creating client may stop the session on exit.
@@ -286,6 +311,32 @@ pub struct SessionResult {
     pub owner_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// `computer.cancel` request.
+///
+/// Cancellation is **precise**: with `request_id` set, only the request with
+/// that JSON-RPC id (on the *same connection*) is cancelled — the runtime
+/// keys the in-flight batch by `(connection_id, request_id)`, so cancelling
+/// request A never touches request B, and client A can never cancel client B's
+/// request even with an identical id. Without `request_id` the whole session's
+/// in-flight batch is cancelled (still token-verified).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelParams {
+    pub session_id: String,
+    /// The session's control token — required; cancelling is a mutating op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
+    /// JSON-RPC id of the specific request to cancel (same connection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<serde_json::Value>,
+}
+
+/// `computer.cancel` result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelResult {
+    pub cancelled: bool,
+    pub session_id: String,
 }
 
 /// `trace.list` entry.
@@ -365,12 +416,14 @@ mod tests {
             risk_level: Some("high".into()),
             requires_confirmation: Some(true),
             policy_context: Some("user-requested file deletion".into()),
+            control_token: Some("secret-token".into()),
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: ActParams = serde_json::from_value(v).unwrap();
         assert_eq!(back.session_id, "s1");
         assert_eq!(back.risk_level.as_deref(), Some("high"));
         assert_eq!(back.requires_confirmation, Some(true));
+        assert_eq!(back.control_token.as_deref(), Some("secret-token"));
     }
 
     #[test]

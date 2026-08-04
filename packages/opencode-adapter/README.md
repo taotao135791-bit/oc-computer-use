@@ -17,7 +17,7 @@ as an OpenCode plugin — MCP is the single supported wiring.
 | `cu-opencode setup` | adds the computer-use MCP server to `~/.config/opencode/opencode.json` (JSONC-aware merge, see below) |
 | `cu-opencode setup --print` | prints the config fragment to stdout |
 | `cu-opencode status` | daemon health (version, permissions, active sessions) + current session state |
-| `cu-opencode session cleanup` | stops the active session (idempotent) |
+| `cu-opencode session cleanup` | stops the sessions **this machine owns** — the ones started by this machine's clients (idempotent) |
 | `cu-opencode doctor` | checks `cu`/`computer-use-mcp` binaries, socket, and daemon health; exits nonzero on issues |
 | `cu-opencode help` | usage |
 
@@ -40,9 +40,10 @@ commonly present. `cu-opencode setup` therefore:
   "config already up to date" message);
 - is idempotent — repeated runs converge.
 
-Covered by 20 tests, including plain JSON, line/block comments, trailing
-commas, pre-existing MCP entries, corrupt configs (never overwritten), and
-idempotency.
+Covered by 23 tests, including plain JSON, line/block comments, trailing
+commas, pre-existing MCP entries, corrupt configs (never overwritten),
+idempotency, and session-cleanup ownership (stops only sessions this machine
+owns, via its stored credentials).
 
 ## Install
 
@@ -98,7 +99,12 @@ object; no JSON-string-inside-JSON).
 owned by the MCP server (`mcp-server` / "Computer Use MCP"); OpenCode is the
 only client that stops it. A Pi extension or other client attempting to use
 that session gets `CONTROL_LOCKED` by default and will not stop it — see
-[packages/pi-extension](../pi-extension/README.md).
+[packages/pi-extension](../pi-extension/README.md). **Knowing a session ID
+does not grant control**: mutating calls require the session's control
+token, which the daemon issues exactly once at `start` — the MCP server holds
+it in memory and injects it into its own calls; after a daemon restart the
+token is invalid and stale operations fail cleanly (`SESSION_NOT_FOUND` /
+`INVALID_CONTROL_TOKEN`) instead of pretending to work.
 
 ## Smoke test (OpenCode)
 
@@ -144,6 +150,7 @@ scripts and tests can drive it without spawning the CLI.
 ## Tests
 
 ```bash
-pnpm test   # 20 tests: JSONC merge scenarios (comments, trailing commas,
+pnpm test   # 23 tests: JSONC merge scenarios (comments, trailing commas,
             # pre-existing entries, corrupt config, idempotency) + fake-daemon wiring
+            # + cleanup ownership (stops only sessions this machine owns)
 ```

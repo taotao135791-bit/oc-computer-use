@@ -13,6 +13,14 @@
 /** Coordinate space used when describing a location or region. */
 export type CoordinateSpace = "normalized_1000" | "image_pixels";
 
+/**
+ * Wire protocol version of this SDK. Round 3 introduced server-side session
+ * ownership (control tokens), a breaking protocol change: this SDK checks the
+ * daemon's `runtime.version.protocol_version` on connect and refuses to talk
+ * to daemons with a different version.
+ */
+export const PROTOCOL_VERSION = 2;
+
 export interface Point {
   x: number;
   y: number;
@@ -128,7 +136,32 @@ export interface SessionParams {
   client_id?: string;
   client_name?: string;
   client_instance_id?: string;
+  /**
+   * The session's control token. Required for every mutating action
+   * (`pause`/`resume`/`takeover`/`release`/`stop`); never sent for `start`
+   * (which issues the token) or `status` (read-only). The SDK injects the
+   * token it holds automatically — only a caller that never started the
+   * session is missing it, and the daemon will say CONTROL_TOKEN_REQUIRED.
+   */
+  control_token?: string;
 }
+
+/**
+ * The capability that grants control of a session. Issued **once**, in the
+ * `start` response; the daemon stores only a hash of it and never repeats it.
+ * Knowing a session id grants nothing — a client without this token cannot
+ * act, cancel, pause, resume, take over, release, or stop the session.
+ */
+export interface SessionCredential {
+  sessionId: string;
+  controlToken: string;
+  /** Identity the owner reported when it started the session. */
+  ownerClientId?: string;
+  ownerInstanceId?: string;
+}
+
+/** What to do when an active session exists that this client does not own. */
+export type ExistingSessionPolicy = "reject" | "read_only" | "attach_with_token";
 
 /**
  * Identity of the client that started a session. The owner is the only client
@@ -157,6 +190,12 @@ export interface SessionResult {
   owner_client_name?: string;
   owner_instance_id?: string;
   message?: string;
+  /**
+   * The session's control token — **only present in the `start` response**,
+   * and never in `status` or any other read-only result. Keep it in memory
+   * (or a 0600 credential file), never in logs.
+   */
+  control_token?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +249,12 @@ export interface ActParams {
   risk_level?: string;
   requires_confirmation?: boolean;
   policy_context?: string;
+  /**
+   * The session's control token. Required — the daemon refuses the batch
+   * before executing anything without it. The SDK injects the token it holds
+   * automatically; a caller that is not the session's owner cannot act.
+   */
+  control_token?: string;
 }
 
 export interface ActionResultReport {
@@ -355,6 +400,8 @@ export interface Health {
 export interface RuntimeVersion {
   name: string;
   version: string;
+  /** Wire protocol version of the daemon. Absent on pre-round-3 daemons. */
+  protocol_version?: number;
 }
 
 export interface DisplayInfo {
@@ -384,9 +431,25 @@ export interface PointerInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Session-less params (computer.cancel)
+// computer.cancel
 // ---------------------------------------------------------------------------
 
-export interface SessionOnlyParams {
+/**
+ * Cancellation is **precise**: with `request_id` set, only the request with
+ * that JSON-RPC id (on the *same connection*) is cancelled. Two clients may
+ * both use `request_id: 1` and cancelling one never touches the other. Without
+ * `request_id` the whole session's in-flight batch is cancelled. Either way a
+ * valid `control_token` is required.
+ */
+export interface CancelParams {
+  session_id: string;
+  /** The session's control token — required; cancelling is a mutating op. */
+  control_token?: string;
+  /** JSON-RPC id of the specific request to cancel (same connection). */
+  request_id?: number;
+}
+
+export interface CancelResult {
+  cancelled: boolean;
   session_id: string;
 }

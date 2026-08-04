@@ -54,6 +54,43 @@ SDK") — the daemon records it as the session owner, and the owner fields
 (`owner_client_id`, `owner_client_name`, `owner_instance_id`) are returned
 in every session result.
 
+## Session credentials (capability)
+
+The daemon issues a session's **control token exactly once**, in the `start`
+response. **Knowing a session ID does not grant control**: the SDK stores the
+token in a `SessionCredential` (`{sessionId, controlToken, ownerClientId,
+ownerInstanceId}`) and automatically injects it into the mutating calls it
+owns — `act`, `cancel`, `pause`, `resume`, `takeover`, `release`, `stop` (an
+explicit `control_token` in the params always wins). `stop` clears the
+credential. `close()` only closes the socket — it never stops a session.
+
+**Existing sessions: default `reject`.** When `ensureSession` finds an active
+session it does not own, it must not silently attach. The `existingPolicy`
+argument controls this:
+
+- `reject` (default): a `start` probe surfaces the daemon's `CONTROL_LOCKED`
+  (with the owner's non-secret identity in `data`) — nothing is disturbed.
+- `read_only`: returns the foreign session for observe-only use; no
+  credential is held, so mutating calls are refused by the daemon
+  (`CONTROL_TOKEN_REQUIRED`).
+- `attach_with_token`: adopt the session only with a token the caller
+  supplies (e.g. from its own credential store); the adopted credential is
+  injected into later mutating calls.
+
+## Timeouts & cancellation
+
+A request that exceeds its timeout is rejected with `RequestTimeoutError`
+(code `REQUEST_TIMEOUT`, -32022). The SDK then sends a **precise**
+`computer.cancel` for that exact request — keyed by connection + request id
++ session + control token, so client A can never cancel client B's request —
+and waits `cancelGracePeriodMs` (default 1000 ms, clamped 500–1500 ms) for
+the daemon's acknowledgement. `err.runtimeCancellationConfirmed` is `true`
+**only** when the daemon acknowledged the cancel: the SDK never claims the
+runtime stopped without proof. Pending requests are settled (`settlePending`)
+on timeout, abort, close, and daemon death — no listener or pending entry
+outlives its request. `AbortSignal` maps to the same cancel path (a cancel
+is only sent when a session id and token are known).
+
 ## Errors
 
 All failures throw `ComputerUseError` with `.code` (machine code like

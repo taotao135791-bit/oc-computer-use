@@ -249,7 +249,12 @@ try {
 }
 check(
   "observe on foreign session → CONTROL_LOCKED (reject policy)",
-  locked?.code === "CONTROL_LOCKED" && locked?.message === "Another client owns the active computer-use session.",
+  locked?.code === "CONTROL_LOCKED" &&
+    // Wire message is the code itself; the non-secret owner identity rides
+    // in data (a token never does).
+    locked?.message === "CONTROL_LOCKED" &&
+    locked?.data?.owner?.client_id === "cu-cli" &&
+    locked?.data?.owner?.client_name === "cu",
   locked ? `${locked.code}: ${locked.message}` : "no error",
 );
 
