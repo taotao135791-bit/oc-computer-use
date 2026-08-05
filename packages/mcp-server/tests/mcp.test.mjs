@@ -556,6 +556,7 @@ test("MCP tool params conform to the core protocol schema", { timeout: 20000 }, 
     await client.callTool("computer_session", { action: "status" });
     await client.callTool("computer_cancel", { session_id: "s_started" });
     await client.callTool("trace_get", { session_id: "s_started" });
+    await client.callTool("trace_list", { session_id: "s_started" });
 
     const byDef = {
       "computer.session": "SessionParams",
@@ -564,6 +565,7 @@ test("MCP tool params conform to the core protocol schema", { timeout: 20000 }, 
       "computer.inspect": "InspectParams",
       "computer.cancel": "CancelParams",
       "trace.get": "TraceGetParams",
+      "trace.list": "TraceListParams",
     };
     const seen = new Set();
     for (const req of fake.requests) {
@@ -579,6 +581,46 @@ test("MCP tool params conform to the core protocol schema", { timeout: 20000 }, 
     }
     // Every tool actually talked to the daemon during this test.
     assert.deepEqual([...seen].sort(), Object.keys(byDef).sort());
+  } finally {
+    proc.kill();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("trace_list is session-scoped: explicit id, credential default, and no-session error", { timeout: 15000 }, async () => {
+  const fake = startFakeDaemon();
+  const { proc, client } = spawnServer(fake);
+  try {
+    await client.initialize();
+
+    // No session at all → a clear error, not a tokenless daemon round-trip.
+    const none = await client.callTool("trace_list", {});
+    assert.ok(none.isError, "trace_list without any session must fail");
+    assert.match(JSON.stringify(none.content), /no session/);
+
+    // Start a session: the server now holds its capability credential.
+    await client.callTool("computer_session", { action: "start" });
+
+    // No explicit id → defaults to the credential's session, and the trace
+    // request carries that session's observation token (session-scoped read).
+    await client.callTool("trace_list", {});
+    const defaulted = fake.requests.filter((r) => r.method === "trace.list").at(-1);
+    assert.equal(defaulted.params.session_id, "s_started", "defaults to the owned session");
+    assert.equal(
+      defaulted.params.observation_token,
+      "mcp-fake-observation-token",
+      "the owned session's observation token rides along",
+    );
+
+    // An explicit id wins over the credential.
+    await client.callTool("trace_list", { session_id: "s_other" });
+    const explicit = fake.requests.filter((r) => r.method === "trace.list").at(-1);
+    assert.equal(explicit.params.session_id, "s_other");
+    assert.equal(
+      explicit.params.observation_token,
+      undefined,
+      "a token for a session this server does not own is never injected",
+    );
   } finally {
     proc.kill();
     stopFakeDaemon(fake);

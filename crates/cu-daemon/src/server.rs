@@ -98,19 +98,35 @@ pub(crate) async fn serve_with(
         }
     }
 
-    // Generate and persist the daemon admin token BEFORE the socket binds, so
-    // the daemon never accepts shutdown requests it could not authorize (and
-    // never runs without a way for the CLI to stop it). A persistence failure
-    // refuses to start — a silent fallback would leave the daemon unstoppable.
+    // Generate and persist the daemon admin credential BEFORE the socket
+    // binds, so the daemon never accepts shutdown requests it could not
+    // authorize (and never runs without a way for the CLI to stop it). A
+    // persistence failure refuses to start — a silent fallback would leave
+    // the daemon unstoppable. Any credential a previous run left behind is
+    // validated first and cleaned if it fails the read-side checks (a
+    // tampered store must not be papered over by the rename).
     let admin_token = cu_core::security::generate_daemon_admin_token();
+    let daemon_instance_id = cu_core::security::generate_daemon_instance_id();
     let admin_token_path = &config.admin_token_path;
-    if let Err(e) = cu_core::security::save_daemon_admin_token_to(&admin_token, admin_token_path) {
+    match cu_core::security::validate_and_cleanup_admin_store(admin_token_path) {
+        Ok(true) => tracing::warn!("cleaned an invalid admin credential from a previous run"),
+        Ok(false) => {}
+        Err(e) => anyhow::bail!(
+            "cannot clean previous daemon admin credential at {}: {e} — refusing to start",
+            admin_token_path.display()
+        ),
+    }
+    if let Err(e) = cu_core::security::save_daemon_admin_token_to(
+        &admin_token,
+        &daemon_instance_id,
+        admin_token_path,
+    ) {
         anyhow::bail!(
             "cannot persist daemon admin token at {}: {e} — refusing to start",
             admin_token_path.display()
         );
     }
-    tracing::info!(path = %admin_token_path.display(), "daemon admin token stored (0600)");
+    tracing::info!(path = %admin_token_path.display(), instance = %daemon_instance_id, "daemon admin token stored (0600)");
     let admin_hash = SecretTokenHash::from_token(&admin_token);
 
     let socket = &config.socket_path;
@@ -158,9 +174,10 @@ pub(crate) async fn serve_with(
                         let shutdown = app_shutdown.clone();
                         let timeout = config.request_timeout_secs;
                         let admin_hash = admin_hash.clone();
+                        let instance_id = daemon_instance_id.clone();
                         let connection_id = connection_counter.fetch_add(1, Ordering::Relaxed);
                         connections.spawn(async move {
-                            if let Err(e) = handle_connection(stream, connection_id, runtime, shutdown, admin_hash, timeout).await {
+                            if let Err(e) = handle_connection(stream, connection_id, runtime, shutdown, admin_hash, timeout, &instance_id).await {
                                 tracing::debug!(error = %e, "connection handler ended");
                             }
                         });
@@ -211,7 +228,9 @@ pub(crate) async fn serve_with(
 /// cancellation is scoped to the connection that issued it.
 ///
 /// `admin_hash` is the digest of the daemon's admin token; `runtime.shutdown`
-/// only honors a request presenting the matching token.
+/// only honors a request presenting the matching token. `daemon_instance_id`
+/// identifies this daemon run in `runtime.version`, so the CLI can prove an
+/// admin credential belongs to the daemon it is talking to.
 async fn handle_connection(
     stream: UnixStream,
     connection_id: u64,
@@ -219,6 +238,7 @@ async fn handle_connection(
     app_shutdown: CancellationToken,
     admin_hash: SecretTokenHash,
     timeout_secs: u64,
+    daemon_instance_id: &str,
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -258,6 +278,7 @@ async fn handle_connection(
         let runtime = runtime.clone();
         let shutdown = app_shutdown.clone();
         let admin_hash = admin_hash.clone();
+        let instance_id = daemon_instance_id.to_string();
         let writer = writer.clone();
         inflight.push(tokio::spawn(async move {
             let fut = dispatch(
@@ -266,6 +287,7 @@ async fn handle_connection(
                 connection_id,
                 request.clone(),
                 &admin_hash,
+                &instance_id,
             );
             let timeout = tokio::time::Duration::from_secs(timeout_secs);
             let resp = match tokio::time::timeout(timeout, fut).await {

@@ -65,7 +65,7 @@ enum Command {
     Drag(DragArgs),
     /// Wait (no-op action) for a duration.
     Wait(WaitArgs),
-    /// Trace inspection: list / get / export / replay / summaries.
+    /// Trace inspection: list / get / export / replay.
     Trace(TraceArgs),
 }
 
@@ -307,7 +307,7 @@ struct TraceArgs {
 
 #[derive(Subcommand)]
 enum TraceAction {
-    /// List all trace files.
+    /// List trace files across all sessions (daemon manager only, admin token).
     List,
     /// Print a trace's JSONL entries.
     Get { session_id: String },
@@ -425,9 +425,14 @@ fn print_json(value: Value) -> Result<(), ClientError> {
 }
 
 /// Build the token fields for the **cross-session** sensitive reads
-/// (`runtime.pointer`, `runtime.active_application`, `trace.list`): any
-/// capability credential this CLI holds. No credentials → the params stay
+/// (`runtime.pointer`, `runtime.active_application`, `runtime.desktop_layout`):
+/// any capability credential this CLI holds. No credentials → the params stay
 /// empty and the daemon refuses with OBSERVATION_TOKEN_REQUIRED.
+///
+/// Note: the trace reads are **not** cross-session since round 6 — they take
+/// an explicit `session_id` plus that session's token (`trace.get` reads the
+/// session credential; the cross-session `trace.admin_list` uses the daemon
+/// admin token).
 fn token_params() -> Value {
     let token = credentials::all()
         .into_iter()
@@ -755,8 +760,8 @@ async fn daemon_stop() -> Result<(), ClientError> {
     // runtime.shutdown is authorized only by the daemon admin token, which
     // the daemon persisted at startup (0600). Read it back — never guess, and
     // never fall back to a tokenless request.
-    let token = match cu_core::security::load_daemon_admin_token() {
-        Ok(t) => t,
+    let cred = match cu_core::security::load_daemon_admin_credential() {
+        Ok(c) => c,
         Err(cu_core::security::AdminTokenFileError::Missing) => {
             // The file is written before the socket binds and removed on
             // graceful exit — usually no file means no daemon (idempotent
@@ -790,7 +795,51 @@ async fn daemon_stop() -> Result<(), ClientError> {
             });
         }
     };
-    match request("runtime.shutdown", json!({ "admin_token": token.as_str() })).await {
+
+    // The credential is bound to the daemon instance that wrote it. Prove the
+    // running daemon *is* that instance before using the token: a credential
+    // from a different install (or an older build) must never be used to shut
+    // anything down.
+    let version = match request("runtime.version", Value::Null).await {
+        Ok(v) => v,
+        Err(ClientError::Connect(_, _)) => {
+            // No daemon behind the socket; the credential file is stale from
+            // an earlier run. Idempotent stop, like the Missing case above.
+            println!("daemon is not running");
+            return Ok(());
+        }
+        Err(other) => return Err(other),
+    };
+    let running_instance =
+        version["daemon_instance_id"]
+            .as_str()
+            .ok_or_else(|| ClientError::Rpc {
+                code: -32000,
+                message:
+                    "daemon did not report a daemon_instance_id (is it an old pre-v3 daemon?); "
+                        .to_string()
+                        + "stop it manually and start it again with this cu",
+                data: None,
+            })?;
+    if running_instance != cred.daemon_instance_id {
+        return Err(ClientError::Rpc {
+            code: -32000,
+            message: format!(
+                "admin credential belongs to daemon instance {} but the running daemon is {} — \
+                 the credential is stale (different install or older build) and must never be \
+                 used to shut this daemon down",
+                cred.daemon_instance_id, running_instance
+            ),
+            data: None,
+        });
+    }
+
+    match request(
+        "runtime.shutdown",
+        json!({ "admin_token": cred.admin_token.as_str() }),
+    )
+    .await
+    {
         Ok(_) => {
             // Wait for the socket to disappear.
             let sock = cu_core::config::socket_path();
@@ -1425,10 +1474,42 @@ async fn run_wait(args: WaitArgs) -> Result<(), ClientError> {
 async fn run_trace(args: TraceArgs) -> Result<(), ClientError> {
     match args.action {
         TraceAction::List => {
-            // The trace listing is a sensitive read since round 5: a token is
-            // required (any capability credential this CLI holds). Entries
-            // are metadata only — no filesystem paths.
-            let resp = request("trace.list", token_params()).await?;
+            // The cross-session trace listing is daemon-manager only since
+            // round 6: `trace.admin_list` requires the daemon admin token — a
+            // session capability must never reveal which other sessions ran
+            // on the machine. This CLI holds the admin credential; same
+            // missing/corrupt handling as `daemon_stop` (never guess).
+            let admin = match cu_core::security::load_daemon_admin_token() {
+                Ok(t) => t,
+                Err(cu_core::security::AdminTokenFileError::Missing) => {
+                    match request("runtime.health", Value::Null).await {
+                        Ok(_) => {
+                            return Err(ClientError::Rpc {
+                                code: -32000,
+                                message:
+                                    "daemon is running but has no admin token file (is it an old "
+                                        .to_string()
+                                        + "pre-v3 daemon?); no admin credential to list traces with",
+                                data: None,
+                            });
+                        }
+                        Err(ClientError::Connect(_, _)) => {
+                            println!("daemon is not running");
+                            return Ok(());
+                        }
+                        Err(other) => return Err(other),
+                    }
+                }
+                Err(e @ cu_core::security::AdminTokenFileError::Corrupt(_)) => {
+                    return Err(ClientError::Rpc {
+                        code: -32000,
+                        message: format!("cannot read daemon admin token ({e}); refusing to guess"),
+                        data: None,
+                    });
+                }
+            };
+            let resp =
+                request("trace.admin_list", json!({ "admin_token": admin.as_str() })).await?;
             if let Some(traces) = resp.get("traces").and_then(|v| v.as_array()) {
                 if traces.is_empty() {
                     println!("no traces yet");
@@ -1450,7 +1531,8 @@ async fn run_trace(args: TraceArgs) -> Result<(), ClientError> {
         }
         TraceAction::Get { session_id } => {
             // Trace contents are a sensitive read — the observation credential
-            // is required (trace.list stays public, like session.summary).
+            // is required; trace.list is likewise session-scoped since round 6
+            // (only the daemon-manager `trace.admin_list` sees across sessions).
             let mut p = json!({ "session_id": session_id });
             if let Some(t) = credentials::read_token(&session_id) {
                 p["observation_token"] = json!(t);

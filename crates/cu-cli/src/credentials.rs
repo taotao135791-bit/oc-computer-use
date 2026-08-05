@@ -13,35 +13,19 @@
 //! with mode 0600 (directory 0700), and are deleted when the session is
 //! stopped. Credentials are never printed, logged, traced, or committed.
 //!
-//! # Write safety
-//!
-//! Saves are atomic: the JSON is written to a fresh temporary file in the
-//! same directory (`create_new`, so an attacker-placed file is never reused
-//! or followed; `O_NOFOLLOW` refuses opening through a symlink; mode 0600
-//! from birth), `fsync`ed, `rename`d onto the target (which atomically
-//! replaces any link *itself*, never what it points to), and then the parent
-//! directory is `fsync`ed so the rename survives a crash. A symlink already
-//! parked at the target is refused up front — the directory has been
-//! tampered with. If any step fails, the temporary file is removed, leaving
-//! the previous credential (or nothing) intact.
-//!
-//! # Read safety
-//!
-//! `load` refuses to even open a file that is a symlink, is not a regular
-//! file, is owned by another user, is writable/readable beyond 0600, or is
-//! larger than a credential we could ever have written. Parsed files must
-//! carry a format version we understand and a `session_id` matching the
-//! request, so a stray, truncated, or replayed file authenticates nothing.
-//! (The checks race a concurrent attacker — but the remaining window can
-//! only deliver a file that still passes JSON/size/version/id checks, and
-//! the directory is 0700.)
+//! All filesystem access (private directory creation, atomic private writes,
+//! validated reads, removal) is delegated to `cu_core::private_file`, the
+//! single shared implementation of the private-file guarantees; see its
+//! module docs. This module adds the credential-specific content checks:
+//! format version we understand, non-empty `client_instance_id`, and a
+//! `session_id` matching the request — a stray, truncated, or replayed file
+//! authenticates nothing.
 
-use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use cu_core::private_file;
 
 /// On-disk credential format version. `load` refuses files claiming a newer
 /// version — never read a format we don't understand (protocol compat).
@@ -50,7 +34,7 @@ const FORMAT_VERSION: u32 = 1;
 /// A credential file is two tokens plus identity — kilobytes at most.
 /// Anything larger is not a credential we wrote and is refused, bounding a
 /// hostile read of an odd file the path resolution could still hit.
-const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
+const MAX_CREDENTIAL_BYTES: u64 = private_file::DEFAULT_MAX_PRIVATE_FILE_BYTES;
 
 /// One credential file's contents.
 ///
@@ -112,8 +96,8 @@ fn credential_path(session_id: &str) -> PathBuf {
 }
 
 /// Save the tokens issued by a `start` response. The directory is created
-/// 0700 and the file 0600 — readable only by the current user. See the
-/// module docs for the atomic-write and symlink guarantees.
+/// 0700 and the file 0600 — readable only by the current user — via the
+/// shared atomic private-write implementation (see `cu_core::private_file`).
 pub fn save(
     session_id: &str,
     control_token: &str,
@@ -121,10 +105,6 @@ pub fn save(
     client_instance_id: &str,
     created_at: &str,
 ) -> std::io::Result<()> {
-    let dir = credentials_dir();
-    fs::create_dir_all(&dir)?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-
     let cred = StoredCredential {
         session_id: session_id.to_string(),
         control_token: cu_core::SecretToken::new(control_token),
@@ -133,68 +113,16 @@ pub fn save(
         created_at: created_at.to_string(),
         format_version: FORMAT_VERSION,
     };
-    let path = credential_path(session_id);
-
-    // A symlink parked at the target means the 0700 directory has been
-    // tampered with. `rename` would atomically replace the *link* itself
-    // (never follow it), but silently "fixing" tampering hides the problem —
-    // refuse instead, and the caller surfaces the warning.
-    if fs::symlink_metadata(&path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "credential target is a symlink",
-        ));
-    }
-
-    atomic_write_private_json(&path, &cred)
-}
-
-/// Atomically and privately write `value` as pretty JSON to `path`.
-///
-/// The content goes to a fresh temporary file in the same directory
-/// (`create_new` + `O_NOFOLLOW`, mode 0600), is `fsync`ed, and only then
-/// `rename`d over the target — readers never see a partial credential. The
-/// parent directory is `fsync`ed so the rename itself is durable. On any
-/// failure the temporary file is removed and the previous state is intact.
-fn atomic_write_private_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
-    let dir = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "credential path has no parent",
-        )
-    })?;
-    let tmp = path.with_extension("json.tmp");
-    let result = (|| {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        serde_json::to_writer_pretty(&mut f, value).map_err(std::io::Error::other)?;
-        f.flush()?;
-        f.sync_all()?;
-        fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        // Never leave a partial credential or a half-written temp file behind.
-        let _ = fs::remove_file(&tmp);
-    }
-    result?;
-    // fsync the directory so the rename survives a crash.
-    fs::File::open(dir)?.sync_all()?;
-    Ok(())
+    private_file::atomic_write_private_json(&credential_path(session_id), &cred)
 }
 
 /// Load the credential for a session, if this CLI holds one.
 ///
-/// The file is validated before it is read: not a symlink, a regular file,
-/// owned by the current user, no wider than 0600, and small enough to be a
-/// credential we wrote. Parsed content must carry a format version we
-/// understand and a `session_id` matching the request.
+/// The file passes every shared read-side check first (not a symlink, a
+/// regular file, owned by the current user, no wider than 0600, small enough
+/// to be a credential we wrote), then the content checks below: a format
+/// version we understand, a non-empty `client_instance_id`, and a
+/// `session_id` matching the request.
 pub fn load(session_id: &str) -> Option<StoredCredential> {
     read_validated(&credential_path(session_id), Some(session_id))
 }
@@ -202,29 +130,12 @@ pub fn load(session_id: &str) -> Option<StoredCredential> {
 /// Read and validate one credential file. With `expected_session_id` the
 /// session id must match the request; without it (the `all()` sweep) the
 /// file must at least be internally consistent.
-fn read_validated(path: &Path, expected_session_id: Option<&str>) -> Option<StoredCredential> {
-    // All checks use symlink_metadata (never follows links) so a link parked
-    // here is refused, and the uid/mode/len checks run on the file itself.
-    let meta = fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() {
-        return None; // symlink, directory, fifo, …: not a credential
-    }
-    // Owned by the current user: a file planted by another user (or one made
-    // world-visible) is not ours to trust.
-    if meta.uid() != unsafe { libc::geteuid() } {
-        return None;
-    }
-    // No wider than 0600 — a credential that has been chmod'd open is a
-    // credential that has already leaked; refuse to use it.
-    if meta.permissions().mode() & 0o077 != 0 {
-        return None;
-    }
-    if meta.len() > MAX_CREDENTIAL_BYTES {
-        return None;
-    }
-
-    let text = fs::read_to_string(path).ok()?;
-    let cred: StoredCredential = serde_json::from_str(&text).ok()?;
+fn read_validated(
+    path: &std::path::Path,
+    expected_session_id: Option<&str>,
+) -> Option<StoredCredential> {
+    let cred: StoredCredential =
+        private_file::read_private_json(path, MAX_CREDENTIAL_BYTES).ok()?;
     if cred.format_version > FORMAT_VERSION {
         return None; // written by a newer CLI — never read what we may not understand
     }
@@ -243,10 +154,10 @@ fn read_validated(path: &Path, expected_session_id: Option<&str>) -> Option<Stor
 
 /// Delete the credential for a session (after a successful `stop`).
 ///
-/// `remove_file` unlinks the path itself and never follows a symlink, so a
-/// link parked here would be removed, not its target.
+/// The shared removal unlinks the path itself and never follows a symlink, so
+/// a link parked here would be removed, not its target.
 pub fn delete(session_id: &str) {
-    let _ = fs::remove_file(credential_path(session_id));
+    let _ = private_file::remove_private_file(&credential_path(session_id));
 }
 
 /// The read credential for a session, if this CLI holds one: its observation
@@ -264,7 +175,7 @@ pub fn read_token(session_id: &str) -> Option<cu_core::SecretToken> {
 /// Every credential this CLI holds, in arbitrary order. Each file passes
 /// the same read-side validation as `load`.
 pub fn all() -> Vec<StoredCredential> {
-    let Ok(entries) = fs::read_dir(credentials_dir()) else {
+    let Ok(entries) = std::fs::read_dir(credentials_dir()) else {
         return Vec::new();
     };
     entries

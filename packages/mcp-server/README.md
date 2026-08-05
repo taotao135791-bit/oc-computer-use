@@ -39,7 +39,7 @@ Requires the daemon to be running (`cu daemon start`).
 | `computer_act` | `session_id?`, `frame_id?`, `actions` (structured array), `wait_policy?`, `return_screenshot?` | per-action results + post-batch screenshot |
 | `computer_inspect` | `session_id?`, `frame_id?`, `region` (structured object), `scale?` | cropped image + global-origin mapping |
 | `computer_cancel` | `session_id?` | cancellation ack |
-| `trace_list` | — | trace summary table |
+| `trace_list` | `session_id?` (defaults to the current session) | trace summary table — session-scoped: only the addressed session's trace is listed |
 | `trace_get` | `session_id` | parsed trace entries |
 
 **No JSON-string-inside-JSON.** `computer_act` takes `actions` as a

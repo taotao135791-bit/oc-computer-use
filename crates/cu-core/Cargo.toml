@@ -17,3 +17,6 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 anyhow = { workspace = true }
 schemars = { workspace = true }
+libc = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }

@@ -129,9 +129,13 @@ not by the client, so every adapter gets the same guarantees.
 |---|---|---|---|---|
 | `status` | `OBSERVATION_TOKEN_REQUIRED` | ✅ | ✅ | — |
 | `observe` / `inspect` | `OBSERVATION_TOKEN_REQUIRED` | ✅ | ✅ | — |
-| trace list / get / export / replay | `OBSERVATION_TOKEN_REQUIRED` | ✅ | ✅ | — |
+| `trace.list` / `trace.summaries` / `trace.get` / `trace.export` / `trace.replay` | `OBSERVATION_TOKEN_REQUIRED` (session-scoped: the token must belong to the addressed session) | ✅ * | ✅ * | — |
+| `trace.admin_list` (cross-session listing) | `DAEMON_ADMIN_TOKEN_REQUIRED` | ❌ | ❌ | ✅ |
 | `act` / `cancel` / `pause` / `resume` / `takeover` / `release` / `stop` | `CONTROL_TOKEN_REQUIRED` | ❌ | ✅ | — |
 | `runtime.shutdown` | `DAEMON_ADMIN_TOKEN_REQUIRED` | ❌ | ❌ | ✅ |
+
+\* the session's **own** observation/control token, for the **addressed**
+session only — a token from session A can never read session B's trace.
 
 The control token includes observation permission (it verifies for reads
 too); the observation token never grants mutation. Token errors are
@@ -184,7 +188,7 @@ the trace cannot be recorded), or `disabled` (no recorder).
 ## Tests
 
 ```bash
-cargo test --workspace                    # 219 tests (Rust: core, driver, runtime, daemon protocol, ownership matrix)
+cargo test --workspace                    # 238 tests (Rust: core, driver, runtime, daemon protocol, ownership matrix)
 cargo test -p cu-daemon --test integration -- --ignored   # live security-matrix test
 pnpm install && pnpm -r build && pnpm -r test             # SDK / Pi / OpenCode adapter / MCP suites
 pnpm run ci                               # the full TypeScript gate in one command:
@@ -192,7 +196,11 @@ pnpm run ci                               # the full TypeScript gate in one comm
                                           #   (a *repo* script; not `pnpm ci`, which is the
                                           #   lockfile-only install command)
 pnpm scan:secrets                         # gitleaks over the whole repo
-./scripts/smoke.sh                        # automated smoke: gates + Pi/OpenCode wiring snapshots
+./scripts/smoke.sh                        # strict smoke: exit 0 = all green, 1 = any gate failed,
+                                          # 2 = usage error — every gate is judged by exit code
+                                          # only (no grep-guessing); --fast skips the slow
+                                          # artifact gates (npm tarballs + release checksums),
+                                          # --self-test proves a failing gate fails the run
 ```
 
 Real-environment acceptance (needs a logged-in GUI session, Screen
@@ -207,6 +215,10 @@ node scripts/ownership-scenario-a.mjs     # ownership: MCP-owned session vs. the
 See [docs/acceptance-manual.md](docs/acceptance-manual.md) for the full
 manual checklists (Pi 20 steps, OpenCode 14 steps, ownership A/B/C) and the
 results recorded during the round-2 through round-5 acceptance runs.
+Round 6's real-host Pi/OpenCode run is recorded as NOT VERIFIED (this
+session has no interactive WindowServer — `cu observe` times out at the
+ScreenCaptureKit bridge), with the daemon-level trace verification that
+*was* possible live documented in the same place.
 
 ## Documentation
 

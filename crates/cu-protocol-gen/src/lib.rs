@@ -24,8 +24,9 @@ use cu_core::protocol::{
     ActParams, ActResult, ActionResultReport, CancelParams, CancelResult, CapabilityTokenParams,
     ClientInfo, InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult,
     RpcError, RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams, SessionResult,
-    SessionSummary, ShutdownParams, StabilizationInfo, TraceEntry, TraceExport, TraceExportParams,
-    TraceGetParams, TraceReplayParams, TraceReport, TraceSummary, JSONRPC_VERSION,
+    SessionSummary, ShutdownParams, StabilizationInfo, TraceAdminListParams, TraceEntry,
+    TraceExport, TraceExportParams, TraceGetParams, TraceListParams, TraceReplayParams,
+    TraceReport, TraceSummariesParams, TraceSummary, JSONRPC_VERSION,
 };
 use cu_core::security::{
     MAX_CLIENT_PROTOCOL_VERSION, MIN_CLIENT_PROTOCOL_VERSION, PROTOCOL_VERSION,
@@ -87,16 +88,23 @@ const CONTROL_ONLY: &[&str] = &["ActParams", "CancelParams"];
 /// least one of `observation_token` / `control_token` is required (the daemon
 /// refuses both-missing with OBSERVATION_TOKEN_REQUIRED and a mismatch with
 /// INVALID_OBSERVATION_TOKEN). These are the session-addressed reads
-/// (`ObserveParams`, `InspectParams`, the trace reads) plus the cross-session
-/// capability-token reads (`CapabilityTokenParams`).
+/// (`ObserveParams`, `InspectParams`, the session-scoped trace reads) plus
+/// the cross-session capability-token reads (`CapabilityTokenParams`).
 const OBSERVATION_ONE_OF: &[&str] = &[
     "ObserveParams",
     "InspectParams",
+    "TraceListParams",
+    "TraceSummariesParams",
     "TraceGetParams",
     "TraceExportParams",
     "TraceReplayParams",
     "CapabilityTokenParams",
 ];
+
+/// **Admin-only** requests: authorized by the daemon admin token alone, never
+/// by a session capability. The schema requires `admin_token` exactly like
+/// the daemon refuses a missing one (DAEMON_ADMIN_TOKEN_REQUIRED).
+const ADMIN_ONLY: &[&str] = &["ShutdownParams", "TraceAdminListParams"];
 
 /// Drop the `null` alternative from an optional property schema (the wire
 /// omits `skip_serializing_if` fields entirely; they are never `null`).
@@ -155,7 +163,8 @@ fn is_unconstrained_value(v: &Value) -> bool {
 /// - `CONTROL_ONLY` defs get `required: ["control_token"]`;
 /// - `OBSERVATION_ONE_OF` defs get
 ///   `anyOf: [{required:[observation_token]}, {required:[control_token]}]`;
-/// - `ShutdownParams` gets `required: ["admin_token"]`;
+/// - `ADMIN_ONLY` defs (shutdown, the cross-session trace listing) get
+///   `required: ["admin_token"]`;
 /// - `SessionParams` gets the action-conditional rule (see below).
 ///
 /// The requirements live here, next to the wire types, so the machine-readable
@@ -196,7 +205,7 @@ fn assert_capability_requirements(def_name: &str, map: &mut Map<String, Value>) 
         map.insert("anyOf".into(), Value::Array(vec![obs_branch, ctl_branch]));
         changed = true;
     }
-    if def_name == "ShutdownParams"
+    if ADMIN_ONLY.contains(&def_name)
         && map.contains_key("properties")
         && !required.contains(&"admin_token".to_string())
     {
@@ -364,9 +373,12 @@ pub fn build_protocol_schema() -> Value {
     register!(gen, CancelParams);
     register!(gen, CancelResult);
     // Cross-session sensitive reads (runtime.pointer / active_application /
-    // desktop_layout / trace.list / trace.summaries).
+    // desktop_layout).
     register!(gen, CapabilityTokenParams);
-    // Traces.
+    // Traces — session-scoped reads plus the admin listing (round 6).
+    register!(gen, TraceListParams);
+    register!(gen, TraceSummariesParams);
+    register!(gen, TraceAdminListParams);
     register!(gen, TraceGetParams);
     register!(gen, TraceExportParams);
     register!(gen, TraceReplayParams);

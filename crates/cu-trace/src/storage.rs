@@ -36,6 +36,17 @@ pub fn list_traces(dir: &Path) -> Result<Vec<TraceSummary>, CuError> {
     Ok(out)
 }
 
+/// Summarize only one session's trace (the session-scoped listing used by
+/// `trace.list` / `trace.summaries`, which verify the session's own tokens
+/// before scanning). Returns at most one entry — a session has one trace.
+pub fn list_session_traces(dir: &Path, session_id: &str) -> Result<Vec<TraceSummary>, CuError> {
+    let path = dir.join(format!("{session_id}.jsonl"));
+    Ok(match summarize(&path)? {
+        Some(s) => vec![s],
+        None => Vec::new(),
+    })
+}
+
 fn summarize(path: &Path) -> Result<Option<TraceSummary>, CuError> {
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let session_id = file_name

@@ -51,6 +51,7 @@ import {
   type TraceEntry,
   type TraceExport,
   type TraceList,
+  type TraceSummary,
 } from "./types.js";
 
 /** Default socket path: `~/.computer-use/runtime.sock`. */
@@ -810,13 +811,46 @@ export class ComputerUseClient {
   // -------------------------------------------------------------------------
 
   /**
-   * List trace metadata. Sensitive since round 5: the daemon requires an
-   * observation or control token (presented from this client's own session
-   * credential) — a listing reveals which sessions ever ran on the machine.
-   * Entries carry metadata only, never filesystem paths.
+   * List trace metadata for one session. Session-scoped since round 6: the
+   * params must address a single `session_id` and carry that session's
+   * observation or control token (injected from this client's credential
+   * unless an explicit token is given) — a token from one session can never
+   * list another session's traces. Entries carry metadata only, never
+   * filesystem paths.
    */
-  traceList(): Promise<TraceList> {
-    return this.request<TraceList>("trace.list", this.capabilityTokenParams());
+  traceList(
+    sessionId: string,
+    opts?: { observationToken?: string; controlToken?: string },
+  ): Promise<TraceList> {
+    return this.request<TraceList>(
+      "trace.list",
+      this.withObservationTokens({
+        session_id: sessionId,
+        observation_token: opts?.observationToken,
+        control_token: opts?.controlToken,
+      }),
+    );
+  }
+
+  /**
+   * Summaries of one session's trace (event count, size, timestamps).
+   * Session-scoped like `traceList` since round 6 — `session_id` plus that
+   * session's observation or control token is required.
+   */
+  traceSummaries(
+    sessionId: string,
+    opts?: { observationToken?: string; controlToken?: string; limit?: number },
+  ): Promise<TraceSummary[]> {
+    const { limit, ...tokens } = opts ?? {};
+    return this.request<TraceSummary[]>(
+      "trace.summaries",
+      this.withObservationTokens({
+        session_id: sessionId,
+        observation_token: tokens.observationToken,
+        control_token: tokens.controlToken,
+        ...(limit !== undefined ? { limit } : {}),
+      }),
+    );
   }
 
   /** Trace contents are a sensitive read — the observation credential is injected. */

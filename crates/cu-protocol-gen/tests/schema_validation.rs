@@ -302,7 +302,20 @@ fn capability_token_requirements_are_in_the_schema() {
     )
     .unwrap();
 
-    // Trace reads: same one-of rule (get/export/replay).
+    // Trace reads: same one-of rule (list/summaries since round 6, then
+    // get/export/replay) — session-scoped, token required.
+    assert!(validate("TraceListParams", &json!({ "session_id": "s1" })).is_err());
+    validate(
+        "TraceListParams",
+        &json!({ "session_id": "s1", "observation_token": "fake-obs-token" }),
+    )
+    .unwrap();
+    assert!(validate("TraceSummariesParams", &json!({ "session_id": "s1" })).is_err());
+    validate(
+        "TraceSummariesParams",
+        &json!({ "session_id": "s1", "control_token": "fake-ctl-token" }),
+    )
+    .unwrap();
     assert!(validate("TraceGetParams", &json!({ "session_id": "s1" })).is_err());
     validate(
         "TraceGetParams",
@@ -393,6 +406,23 @@ fn capability_token_requirements_are_in_the_schema() {
         &json!({ "admin_token": "fake-admin-token" }),
     )
     .unwrap();
+
+    // trace.admin_list: daemon-manager only — admin token required, and a
+    // session capability token must never satisfy it.
+    assert!(validate("TraceAdminListParams", &json!({})).is_err());
+    validate(
+        "TraceAdminListParams",
+        &json!({ "admin_token": "fake-admin-token" }),
+    )
+    .unwrap();
+    assert!(
+        validate(
+            "TraceAdminListParams",
+            &json!({ "observation_token": "fake-obs-token" })
+        )
+        .is_err(),
+        "a session observation token must never satisfy the admin-only schema"
+    );
 
     // Session actions: start is tokenless; status needs one of the two;
     // mutations need the control token.

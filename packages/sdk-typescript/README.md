@@ -30,7 +30,8 @@ await client.session("pause");
 await client.session("resume");
 await client.session("stop");
 
-const traces = await client.traceList();
+// Traces are session-scoped: a session id plus that session's credential.
+const traces = await client.traceList("s_abc");
 const entries = await client.traceGet("s_abc");
 client.close();
 ```
@@ -43,7 +44,12 @@ client.close();
 - **Session**: `ensureSession()`, `session(action, params?)` (start / status /
   pause / resume / takeover / release / stop).
 - **Computer**: `observe(params)`, `act(params)`, `inspect(params)`, `cancel(params)`.
-- **Traces**: `traceList()`, `traceGet(sessionId)`, `traceExport(sessionId, dest)`, `traceReplay(sessionId)`.
+- **Traces**: `traceList(sessionId)`, `traceSummaries(sessionId)`,
+  `traceGet(sessionId)`, `traceExport(sessionId, dest)`, `traceReplay(sessionId)`
+  — every trace read addresses exactly one session and requires that session's
+  observation/control token (injected from the client's credential; an
+  explicit token wins). Cross-session listing is daemon-manager only
+  (`cu trace list`, admin token).
 
 `observe()` auto-resolves the session: `ensureSession()` queries
 `session("status")` and starts one **only** when the daemon reports

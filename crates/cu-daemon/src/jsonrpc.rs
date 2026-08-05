@@ -11,8 +11,8 @@ use cu_core::security::SecretTokenHash;
 use cu_core::{
     ActParams, CancelParams, CancelResult, CapabilityTokenParams, CuError, InspectParams,
     ObserveParams, RequestKey, RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams,
-    SessionSummary, ShutdownParams, TraceExportParams, TraceGetParams, TraceReplayParams,
-    TraceSummary,
+    SessionSummary, ShutdownParams, TraceAdminListParams, TraceExportParams, TraceGetParams,
+    TraceListParams, TraceReplayParams, TraceSummariesParams, TraceSummary,
 };
 use cu_runtime::Runtime;
 use serde::de::DeserializeOwned;
@@ -62,12 +62,15 @@ fn validate_session_id(id: &str) -> Result<(), CuError> {
 /// `admin_hash` is the digest of the daemon's admin token, the only
 /// credential that authorizes `runtime.shutdown` (session capability tokens
 /// never do — a leaked control token must not be able to kill the daemon).
+/// `daemon_instance_id` is reported in `runtime.version` so the CLI can prove
+/// the admin credential it holds belongs to the daemon it is talking to.
 pub async fn dispatch(
     runtime: &std::sync::Arc<Runtime>,
     app_shutdown: &CancellationToken,
     connection_id: u64,
     req: RpcRequest,
     admin_hash: &SecretTokenHash,
+    daemon_instance_id: &str,
 ) -> RpcResponse {
     let id = req.id.clone();
     let method = req.method.clone();
@@ -120,6 +123,7 @@ pub async fn dispatch(
                 protocol_version: cu_core::security::PROTOCOL_VERSION,
                 minimum_client_protocol_version: cu_core::security::MIN_CLIENT_PROTOCOL_VERSION,
                 maximum_client_protocol_version: cu_core::security::MAX_CLIENT_PROTOCOL_VERSION,
+                daemon_instance_id: daemon_instance_id.to_string(),
             })
         }
         "runtime.permissions" => runtime.permissions().await.and_then(to_result),
@@ -290,28 +294,65 @@ pub async fn dispatch(
         }
 
         // --- trace management ---
-        // Trace contents are a sensitive read: every trace method verifies an
-        // observation or control token BEFORE touching any file. A
-        // session-id-only caller gets OBSERVATION_TOKEN_REQUIRED and no file
-        // I/O happens.
+        // Trace contents are a sensitive read: every trace method verifies a
+        // capability BEFORE touching any file. Round 6: trace access is
+        // strictly session-scoped — a session's tokens authorize only that
+        // session's traces (verified against the live session, or against the
+        // persisted access manifest after a restart). The cross-session
+        // listing (`trace.admin_list`) is daemon-manager only: it requires
+        // the admin token, never a session capability. A session-id-only
+        // caller gets OBSERVATION_TOKEN_REQUIRED and no file I/O happens.
         "trace.list" => {
-            // The listing spans sessions (it has no session_id), so it verifies
-            // the caller's capability against any session: a valid token
-            // proves a trusted client. The summaries are metadata only — the
-            // absolute filesystem path never crosses the wire. No token →
-            // OBSERVATION_TOKEN_REQUIRED, and the trace directory is not even
-            // scanned.
-            let p: CapabilityTokenParams = match parse_params(&params) {
+            let p: TraceListParams = match parse_params(&params) {
                 Ok(p) => p,
                 Err(e) => return error_response(id, e),
             };
-            if let Err(e) =
-                runtime.verify_any_token(p.observation_token.as_deref(), p.control_token.as_deref())
-            {
+            if let Err(e) = validate_session_id(&p.session_id) {
                 return error_response(id, e);
             }
-            cu_trace::list_traces(runtime.traces_dir())
-                .and_then(|list| to_result(serde_json::json!({ "traces": list })))
+            if let Err(e) = runtime.verify_trace_access(
+                &p.session_id,
+                p.observation_token.as_deref(),
+                p.control_token.as_deref(),
+            ) {
+                return error_response(id, e);
+            }
+            let mut list = match cu_trace::list_session_traces(runtime.traces_dir(), &p.session_id)
+            {
+                Ok(l) => l,
+                Err(e) => return error_response(id, e),
+            };
+            if let Some(limit) = p.limit {
+                list.truncate(limit as usize);
+            }
+            to_result(serde_json::json!({ "traces": list }))
+        }
+        "trace.admin_list" => {
+            // The daemon-manager listing across all sessions. Authorized by
+            // the daemon admin token alone — a session capability must never
+            // reveal which other sessions ever ran on the machine. Same
+            // error mapping as runtime.shutdown: missing token →
+            // DAEMON_ADMIN_TOKEN_REQUIRED, wrong token (including any session
+            // token) → INVALID_DAEMON_ADMIN_TOKEN.
+            let p: TraceAdminListParams = match parse_params(&params) {
+                Ok(p) => p,
+                Err(e) => return error_response(id, e),
+            };
+            match p.admin_token.as_deref() {
+                None => return error_response(id, CuError::DaemonAdminTokenRequired),
+                Some(presented) if !admin_hash.verify(presented) => {
+                    return error_response(id, CuError::InvalidDaemonAdminToken);
+                }
+                Some(_) => {}
+            }
+            let mut list = match cu_trace::list_traces(runtime.traces_dir()) {
+                Ok(l) => l,
+                Err(e) => return error_response(id, e),
+            };
+            if let Some(limit) = p.limit {
+                list.truncate(limit as usize);
+            }
+            to_result(serde_json::json!({ "traces": list }))
         }
         "trace.get" => {
             let p: TraceGetParams = match parse_params(&params) {
@@ -321,7 +362,7 @@ pub async fn dispatch(
             if let Err(e) = validate_session_id(&p.session_id) {
                 return error_response(id, e);
             }
-            if let Err(e) = runtime.verify_session_read(
+            if let Err(e) = runtime.verify_trace_access(
                 &p.session_id,
                 p.observation_token.as_deref(),
                 p.control_token.as_deref(),
@@ -339,7 +380,7 @@ pub async fn dispatch(
             if let Err(e) = validate_session_id(&p.session_id) {
                 return error_response(id, e);
             }
-            if let Err(e) = runtime.verify_session_read(
+            if let Err(e) = runtime.verify_trace_access(
                 &p.session_id,
                 p.observation_token.as_deref(),
                 p.control_token.as_deref(),
@@ -367,7 +408,7 @@ pub async fn dispatch(
             if let Err(e) = validate_session_id(&p.session_id) {
                 return error_response(id, e);
             }
-            if let Err(e) = runtime.verify_session_read(
+            if let Err(e) = runtime.verify_trace_access(
                 &p.session_id,
                 p.observation_token.as_deref(),
                 p.control_token.as_deref(),
@@ -378,20 +419,29 @@ pub async fn dispatch(
             cu_trace::replay_from_file(&p.session_id, &path).and_then(to_result)
         }
         "trace.summaries" => {
-            // Same token-gated, metadata-only treatment as `trace.list`.
-            let p: CapabilityTokenParams = match parse_params(&params) {
+            // Same session-scoped, metadata-only treatment as `trace.list`.
+            let p: TraceSummariesParams = match parse_params(&params) {
                 Ok(p) => p,
                 Err(e) => return error_response(id, e),
             };
-            if let Err(e) =
-                runtime.verify_any_token(p.observation_token.as_deref(), p.control_token.as_deref())
-            {
+            if let Err(e) = validate_session_id(&p.session_id) {
                 return error_response(id, e);
             }
-            let list = match cu_trace::list_traces(runtime.traces_dir()) {
+            if let Err(e) = runtime.verify_trace_access(
+                &p.session_id,
+                p.observation_token.as_deref(),
+                p.control_token.as_deref(),
+            ) {
+                return error_response(id, e);
+            }
+            let mut list = match cu_trace::list_session_traces(runtime.traces_dir(), &p.session_id)
+            {
                 Ok(l) => l,
                 Err(e) => return error_response(id, e),
             };
+            if let Some(limit) = p.limit {
+                list.truncate(limit as usize);
+            }
             to_result::<Vec<TraceSummary>>(list)
         }
 
@@ -436,12 +486,14 @@ mod tests {
             params,
             &admin_hash,
             &CancellationToken::new(),
+            "d_test",
         )
         .await
     }
 
     /// Dispatch against an explicit admin hash and shutdown token (so shutdown
     /// tests can observe what was cancelled and what was not).
+    #[allow(clippy::too_many_arguments)] // test helper; every knob is exercised
     async fn call_with(
         rt: &Arc<Runtime>,
         conn: u64,
@@ -450,6 +502,7 @@ mod tests {
         params: serde_json::Value,
         admin_hash: &SecretTokenHash,
         app_shutdown: &CancellationToken,
+        daemon_instance_id: &str,
     ) -> RpcResponse {
         dispatch(
             rt,
@@ -462,6 +515,7 @@ mod tests {
                 params: Some(params),
             },
             admin_hash,
+            daemon_instance_id,
         )
         .await
     }
@@ -617,10 +671,21 @@ mod tests {
     }
 
     async fn test_runtime_with_driver() -> (Arc<Runtime>, Arc<FakeDriver>) {
+        test_runtime_with_driver_tagged("").await
+    }
+
+    /// A runtime with a **unique** traces dir per tag: trace-sensitive tests
+    /// must not see each other's sessions in the shared pid-scoped dir.
+    /// An empty tag keeps the shared pid-scoped dir (the default).
+    async fn test_runtime_with_driver_tagged(tag: &str) -> (Arc<Runtime>, Arc<FakeDriver>) {
         let driver = Arc::new(FakeDriver::default());
+        let mut config = test_config();
+        if !tag.is_empty() {
+            config.traces_dir = config.traces_dir.join(tag);
+        }
         let rt = Arc::new(Runtime::new(
             driver.clone() as Arc<dyn cu_driver::ComputerDriver>,
-            test_config(),
+            config,
         ));
         (rt, driver)
     }
@@ -643,6 +708,9 @@ mod tests {
             result["runtime_version"],
             serde_json::json!("0.2.0-alpha.1")
         );
+        // The daemon's instance identity is on the wire so a client can prove
+        // the admin credential it holds belongs to this exact daemon.
+        assert_eq!(result["daemon_instance_id"], serde_json::json!("d_test"));
 
         // An old client that advertises protocol 1 is told explicitly that it
         // cannot talk to this daemon.
@@ -1295,34 +1363,45 @@ mod tests {
             "observation token must read a stopped session's trace"
         );
 
-        // The list is token-gated: it is no longer public (round 5 — a trace
-        // listing reveals which sessions ever ran on this machine).
+        // The list is token-gated and session-scoped (round 6): a session
+        // listing reveals which sessions ever ran on this machine, so only
+        // the owning session's tokens — or the daemon admin token via
+        // trace.admin_list — may see it.
         let resp = call(&rt, 1, "trace.list", 25, serde_json::Value::Null).await;
         assert_eq!(
             error_code(&resp),
-            Some(("OBSERVATION_TOKEN_REQUIRED", -32024)),
-            "trace.list without a capability token must be refused"
+            Some(("INVALID_PARAMS", -32602)),
+            "trace.list without a session_id is a malformed request"
         );
-
-        // With the observation token it works — metadata only, no paths, no
-        // tokens.
         let resp = call(
             &rt,
             1,
             "trace.list",
             26,
-            serde_json::json!({ "observation_token": observation }),
+            serde_json::json!({ "session_id": sid }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024)),
+            "trace.list with a session id but no token must be refused"
+        );
+
+        // With the session's own observation token it works — metadata only,
+        // no paths, no tokens.
+        let resp = call(
+            &rt,
+            1,
+            "trace.list",
+            27,
+            serde_json::json!({ "session_id": sid, "observation_token": observation }),
         )
         .await;
         let list = resp.result.expect("trace.list with a token must succeed");
-        let ids: Vec<&str> = list["traces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["session_id"].as_str().unwrap())
-            .collect();
-        assert!(ids.contains(&sid.as_str()));
-        for entry in list["traces"].as_array().unwrap() {
+        let entries = list["traces"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "session-scoped: exactly this session");
+        assert_eq!(entries[0]["session_id"], serde_json::json!(sid));
+        for entry in entries {
             assert!(
                 entry.get("path").is_none(),
                 "trace.list must never expose filesystem paths"
@@ -1463,6 +1542,7 @@ mod tests {
             serde_json::json!({}),
             &admin_hash,
             &shutdown,
+            "d_test",
         )
         .await;
         assert_eq!(
@@ -1481,6 +1561,7 @@ mod tests {
             serde_json::json!({ "admin_token": "not-the-admin-token" }),
             &admin_hash,
             &shutdown,
+            "d_test",
         )
         .await;
         assert_eq!(
@@ -1500,6 +1581,7 @@ mod tests {
             serde_json::json!({ "admin_token": control_token }),
             &admin_hash,
             &shutdown,
+            "d_test",
         )
         .await;
         assert_eq!(
@@ -1518,6 +1600,7 @@ mod tests {
             serde_json::json!({ "admin_token": admin_token.as_str() }),
             &admin_hash,
             &shutdown,
+            "d_test",
         )
         .await;
         let result = resp.result.expect("authorized shutdown must succeed");
@@ -1540,6 +1623,7 @@ mod tests {
             serde_json::json!({ "admin_token": 42 }),
             &admin_hash,
             &shutdown,
+            "d_test",
         )
         .await;
         assert_eq!(
@@ -1550,46 +1634,74 @@ mod tests {
         assert!(!shutdown.is_cancelled());
     }
 
-    /// §四.1: `trace.list` / `trace.summaries` are sensitive reads — no token →
-    /// OBSERVATION_TOKEN_REQUIRED, wrong token → INVALID_OBSERVATION_TOKEN,
-    /// observation token → success, control token → success. The trace
-    /// directory is not even scanned on the failure path.
+    /// §四.1 (round 6): `trace.list` / `trace.summaries` are **session
+    /// scoped** — a session's capability authorizes only that session's
+    /// traces, never a cross-session listing. Missing `session_id` →
+    /// INVALID_PARAMS; session id + no token → OBSERVATION_TOKEN_REQUIRED;
+    /// session id + wrong token (including **another** session's valid token)
+    /// → INVALID_OBSERVATION_TOKEN; own session + observation/control token →
+    /// success with metadata only.
     #[tokio::test]
-    async fn trace_list_requires_a_capability_token() {
-        let (rt, _fake) = test_runtime_with_driver().await;
+    async fn trace_list_is_session_scoped() {
+        let (rt, _fake) = test_runtime_with_driver_tagged("trace-list").await;
         let (sid, token, observation) = start_and_observe(&rt, 1).await;
+        // A second session (the first is stopped to release the control lock;
+        // its trace stays on disk): its tokens must never open the first
+        // session's traces, and vice versa.
+        let stop = call(
+            &rt,
+            1,
+            "computer.session",
+            11,
+            serde_json::json!({
+                "action": "stop",
+                "session_id": sid,
+                "control_token": token,
+            }),
+        )
+        .await;
+        assert!(stop.result.is_some(), "session 1 must stop");
+        let (sid2, _token2, observation2) = start_and_observe(&rt, 2).await;
 
-        // 1) No token → OBSERVATION_TOKEN_REQUIRED.
+        // 1) No session_id → INVALID_PARAMS (the listing is unaddressable).
         let resp = call(&rt, 1, "trace.list", 1, serde_json::Value::Null).await;
-        assert_eq!(
-            error_code(&resp),
-            Some(("OBSERVATION_TOKEN_REQUIRED", -32024))
-        );
+        assert_eq!(error_code(&resp), Some(("INVALID_PARAMS", -32602)));
         let resp = call(&rt, 1, "trace.summaries", 2, serde_json::Value::Null).await;
-        assert_eq!(
-            error_code(&resp),
-            Some(("OBSERVATION_TOKEN_REQUIRED", -32024))
-        );
+        assert_eq!(error_code(&resp), Some(("INVALID_PARAMS", -32602)));
 
-        // 2) Wrong token → INVALID_OBSERVATION_TOKEN (non-descriptive).
+        // 2) Session id, no token → OBSERVATION_TOKEN_REQUIRED.
         let resp = call(
             &rt,
             1,
             "trace.list",
             3,
-            serde_json::json!({ "observation_token": "wrong-token" }),
+            serde_json::json!({ "session_id": sid }),
         )
         .await;
         assert_eq!(
             error_code(&resp),
-            Some(("INVALID_OBSERVATION_TOKEN", -32025))
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024))
         );
         let resp = call(
             &rt,
             1,
             "trace.summaries",
             4,
-            serde_json::json!({ "control_token": "wrong-token" }),
+            serde_json::json!({ "session_id": sid }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024))
+        );
+
+        // 3) Wrong token → INVALID_OBSERVATION_TOKEN (non-descriptive).
+        let resp = call(
+            &rt,
+            1,
+            "trace.list",
+            5,
+            serde_json::json!({ "session_id": sid, "observation_token": "wrong-token" }),
         )
         .await;
         assert_eq!(
@@ -1597,42 +1709,161 @@ mod tests {
             Some(("INVALID_OBSERVATION_TOKEN", -32025))
         );
 
-        // 3) Observation token → success; entries are metadata only.
+        // 4) Session 2's *valid* token must not list session 1's trace — the
+        // cross-session leak this round fixes.
         let resp = call(
             &rt,
             1,
             "trace.list",
-            5,
-            serde_json::json!({ "observation_token": observation }),
+            6,
+            serde_json::json!({ "session_id": sid, "observation_token": observation2 }),
         )
         .await;
-        let list = resp.result.expect("observation token must list traces");
-        let ids: Vec<&str> = list["traces"]
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_OBSERVATION_TOKEN", -32025)),
+            "another session's valid token must never open this trace"
+        );
+        let resp = call(
+            &rt,
+            1,
+            "trace.summaries",
+            7,
+            serde_json::json!({ "session_id": sid, "control_token": observation2 }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_OBSERVATION_TOKEN", -32025)),
+            "another session's valid token must never open this trace"
+        );
+
+        // 5) Own observation token → the own session's trace only, metadata
+        // only (no filesystem path on the wire).
+        let resp = call(
+            &rt,
+            1,
+            "trace.list",
+            8,
+            serde_json::json!({ "session_id": sid, "observation_token": observation }),
+        )
+        .await;
+        let list = resp
+            .result
+            .expect("own observation token must list the trace");
+        let entries = list["traces"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "session-scoped: exactly this session");
+        assert_eq!(entries[0]["session_id"], serde_json::json!(sid));
+        assert!(
+            entries[0].get("path").is_none(),
+            "no filesystem paths on the wire"
+        );
+        assert!(entries[0]["size_bytes"].is_u64());
+
+        // 6) Own control token → success too (control includes observation),
+        // and still only this session's trace.
+        let resp = call(
+            &rt,
+            1,
+            "trace.summaries",
+            9,
+            serde_json::json!({ "session_id": sid, "control_token": token }),
+        )
+        .await;
+        let list = resp.result.expect("control token must also list the trace");
+        let entries = list.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["session_id"], serde_json::json!(sid));
+
+        // 7) Session 1's tokens must not list session 2's trace either.
+        let resp = call(
+            &rt,
+            1,
+            "trace.list",
+            10,
+            serde_json::json!({ "session_id": sid2, "control_token": token }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_OBSERVATION_TOKEN", -32025)),
+            "session 1's token must never open session 2's trace"
+        );
+    }
+
+    /// §四.1 (round 6): `trace.admin_list` is the daemon-manager listing —
+    /// authorized by the daemon admin token alone. A session capability must
+    /// never reveal which other sessions ever ran; the admin listing sees
+    /// everything.
+    #[tokio::test]
+    async fn trace_admin_list_requires_the_admin_token() {
+        let (rt, _fake) = test_runtime_with_driver_tagged("trace-admin-list").await;
+        let (sid, token, _observation) = start_and_observe(&rt, 1).await;
+        // Stop session 1 to release the control lock, then start session 2 —
+        // both traces must survive on disk for the admin listing.
+        let stop = call(
+            &rt,
+            1,
+            "computer.session",
+            4,
+            serde_json::json!({
+                "action": "stop",
+                "session_id": sid,
+                "control_token": token,
+            }),
+        )
+        .await;
+        assert!(stop.result.is_some(), "session 1 must stop");
+        let (sid2, _token2, _obs2) = start_and_observe(&rt, 2).await;
+        let (admin_token, _admin_hash) = test_admin();
+
+        // 1) No admin token → DAEMON_ADMIN_TOKEN_REQUIRED.
+        let resp = call(&rt, 1, "trace.admin_list", 1, serde_json::Value::Null).await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("DAEMON_ADMIN_TOKEN_REQUIRED", -32026))
+        );
+
+        // 2) A session's control token must never authorize the listing.
+        let resp = call(
+            &rt,
+            1,
+            "trace.admin_list",
+            2,
+            serde_json::json!({ "admin_token": "not-the-admin-token" }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_DAEMON_ADMIN_TOKEN", -32027))
+        );
+
+        // 3) The admin token sees both sessions' traces.
+        let resp = call(
+            &rt,
+            1,
+            "trace.admin_list",
+            3,
+            serde_json::json!({ "admin_token": admin_token.as_str() }),
+        )
+        .await;
+        let list = resp.result.expect("admin listing must succeed");
+        let mut ids: Vec<&str> = list["traces"]
             .as_array()
             .unwrap()
             .iter()
             .map(|t| t["session_id"].as_str().unwrap())
             .collect();
-        assert!(ids.contains(&sid.as_str()));
+        ids.sort();
+        let mut want = vec![sid.as_str(), sid2.as_str()];
+        want.sort();
+        assert_eq!(ids, want, "the operator sees every session's trace");
         for entry in list["traces"].as_array().unwrap() {
             assert!(
                 entry.get("path").is_none(),
                 "no filesystem paths on the wire"
             );
-            assert_eq!(entry["event_count"], entry["event_count"]);
-            assert!(entry["size_bytes"].is_u64());
         }
-
-        // 4) Control token → success too (control includes observation).
-        let resp = call(
-            &rt,
-            1,
-            "trace.summaries",
-            6,
-            serde_json::json!({ "control_token": token }),
-        )
-        .await;
-        assert!(resp.result.is_some(), "control token must also list traces");
     }
 
     /// §四.4/§四.5: `runtime.pointer`, `runtime.active_application` and

@@ -473,13 +473,29 @@ export function createComputerUseServer(
     "trace_list",
     {
       title: "List recorded traces",
-      description: "List all recorded session traces with entry counts and sizes.",
-      inputSchema: z.object({}),
+      description:
+        "List the recorded trace of one session with entry counts and sizes. " +
+        "Session-scoped: the session_id must be given, and the daemon requires " +
+        "that session's observation credential (held by this server when the " +
+        "session belongs to it) — traces of other sessions are never revealed.",
+      inputSchema: z.object({
+        session_id: z.string().optional().describe("Defaults to the current session"),
+      }),
     },
-    async () => {
+    async ({ session_id }) => {
       try {
         const c = await getClient();
-        const { traces } = await c.traceList();
+        const cred = c.getSessionCredential();
+        const sid = session_id ?? cred?.sessionId;
+        if (!sid) {
+          return {
+            content: [
+              textBlock("no session: pass session_id, or start a session first"),
+            ],
+            isError: true,
+          };
+        }
+        const { traces } = await c.traceList(sid);
         if (traces.length === 0) return { content: [textBlock("no traces recorded")] };
         const lines = traces.map(
           (t) =>
@@ -520,6 +536,32 @@ export function createComputerUseServer(
 
 /** Entry point: run on stdio until the parent closes the pipe. */
 export async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (argv.includes("--help") || argv.includes("-h")) {
+    // `--help` prints usage and exits — it must never block on stdio (an
+    // MCP server with no stdin would otherwise hang forever).
+    process.stdout.write(
+      [
+        `computer-use-mcp ${SERVER_VERSION} — MCP server for the computer-use runtime`,
+        "",
+        "Speaks the Model Context Protocol over stdio and drives the daemon",
+        "through @computer-use/sdk. Requires a running daemon (`cu daemon start`).",
+        "",
+        "Usage:",
+        "  computer-use-mcp               serve MCP over stdio (default)",
+        "  computer-use-mcp --help        print this help and exit",
+        "",
+        "Environment:",
+        "  COMPUTER_USE_SOCKET            daemon socket path",
+        "                                 (default ~/.computer-use/runtime.sock)",
+        "",
+        "Tools: computer_session, computer_observe, computer_act,",
+        "       computer_inspect, computer_cancel, trace_list, trace_get",
+        "",
+      ].join("\n") + "\n",
+    );
+    return;
+  }
   const server = createComputerUseServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);

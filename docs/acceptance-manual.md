@@ -193,6 +193,28 @@ the npm-installed copy did not. Fix: `chmod +x` on the installed copy.
 If that ever recurs, run `computer-use-mcp` directly and check the file
 mode before blaming the script.
 
+**Round 6 (2026-08-05)** — session-scoped traces, MCP npm-executable
+package, strict smoke. The Pi/OpenCode acceptance scripts could **not** be
+re-run on this host: `cu observe` fails with `CAPTURE_FAILED — bridge
+request timed out after 30s (is a macOS permission dialog pending?)` even
+though TCC reports `screen_recording: true` — the session has no
+interactive WindowServer for ScreenCaptureKit to stream from. **Real-host
+Pi/OpenCode acceptance: NOT VERIFIED this round** (environment, not a code
+failure). What *was* verified live against the real daemon this round:
+
+- `cu trace list` (daemon-manager `trace.admin_list`): lists both sessions'
+  traces; wrong admin token → `INVALID_DAEMON_ADMIN_TOKEN` (-32027);
+  tokenless → `DAEMON_ADMIN_TOKEN_REQUIRED` (-32026, covered by the
+  integration suite).
+- `cu trace get <session>`: observation-token path works against the live
+  daemon.
+- **Trace access survives a daemon restart**: start a session, stop the
+  daemon, start it again — `cu trace get` on the old session still succeeds
+  via the persisted access manifest (token hashes only), proving the
+  restart-persistence property end-to-end.
+- `cu daemon stop` with a stale admin credential is refused (the CLI proves
+  `daemon_instance_id` before shutting anything down).
+
 ## Failure record (round 2)
 
 | Date | Step # | Observed | Root cause / fix |

@@ -212,7 +212,7 @@
           ]
         }
       ],
-      "description": "Shared token fields for **cross-session** sensitive reads: `runtime.pointer`, `runtime.active_application`, `runtime.desktop_layout`, `trace.list`, `trace.summaries`. Unlike the session-addressed reads these methods have no `session_id`, so any valid observation or control token is accepted — the token proves the caller is a trusted client of this daemon. No token → `OBSERVATION_TOKEN_REQUIRED`; a token matching nothing → `INVALID_OBSERVATION_TOKEN`.",
+      "description": "Shared token fields for the remaining **cross-session** sensitive reads: `runtime.pointer`, `runtime.active_application`, `runtime.desktop_layout`. (The trace reads became session-scoped in round 6.) These methods have no `session_id`, so any valid observation or control token is accepted — the token proves the caller is a trusted client of this daemon. No token → `OBSERVATION_TOKEN_REQUIRED`; a token matching nothing → `INVALID_OBSERVATION_TOKEN`.",
       "properties": {
         "control_token": {
           "type": "string"
@@ -1183,6 +1183,10 @@
     "RuntimeVersionResult": {
       "description": "`runtime.version` result — the protocol-version contract.",
       "properties": {
+        "daemon_instance_id": {
+          "description": "Identity of the running daemon instance, generated at startup. A client holding an admin credential compares this against the instance id recorded in its credential file before using it to shut the daemon down — a credential from a different daemon install is stale.",
+          "type": "string"
+        },
         "maximum_client_protocol_version": {
           "format": "uint32",
           "minimum": 0.0,
@@ -1208,6 +1212,7 @@
         }
       },
       "required": [
+        "daemon_instance_id",
         "maximum_client_protocol_version",
         "minimum_client_protocol_version",
         "name",
@@ -1618,6 +1623,25 @@
       ],
       "type": "string"
     },
+    "TraceAdminListParams": {
+      "description": "`trace.admin_list` request — the **daemon-manager** listing across all sessions, authorized by the daemon admin token (never by a session capability). Session tokens must not reveal which other sessions ever ran on the machine; only the operator (CLI / LaunchAgent) may see that.",
+      "properties": {
+        "admin_token": {
+          "description": "The daemon admin token, same credential as `runtime.shutdown`.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum entries to return (newest first). Absent = all.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "admin_token"
+      ],
+      "type": "object"
+    },
     "TraceEntry": {
       "description": "One entry inside a trace file (JSONL).",
       "properties": {
@@ -1816,6 +1840,76 @@
       ],
       "type": "object"
     },
+    "TraceListParams": {
+      "anyOf": [
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "limit": {
+              "description": "Maximum entries to return (newest first). Absent = all.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "observation_token": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "observation_token"
+          ]
+        },
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "limit": {
+              "description": "Maximum entries to return (newest first). Absent = all.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "observation_token": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "control_token"
+          ]
+        }
+      ],
+      "description": "`trace.list` request (round 6): **session-scoped**. A session's capability tokens authorize reads of *that session's* traces only — never a cross-session listing. Verified against the live session, or against the persisted trace access manifest after a daemon restart.",
+      "properties": {
+        "control_token": {
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum entries to return (newest first). Absent = all.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "observation_token": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
     "TraceMode": {
       "description": "How strictly traces are recorded.",
       "oneOf": [
@@ -1916,6 +2010,76 @@
       "required": [
         "degraded",
         "mode"
+      ],
+      "type": "object"
+    },
+    "TraceSummariesParams": {
+      "anyOf": [
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "limit": {
+              "description": "Maximum entries to return (newest first). Absent = all.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "observation_token": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "observation_token"
+          ]
+        },
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "limit": {
+              "description": "Maximum entries to return (newest first). Absent = all.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "observation_token": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "control_token"
+          ]
+        }
+      ],
+      "description": "`trace.summaries` request — same session-scoped shape and verification as `trace.list`; the response is the raw summary array.",
+      "properties": {
+        "control_token": {
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum entries to return (newest first). Absent = all.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "observation_token": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
       ],
       "type": "object"
     },

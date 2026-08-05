@@ -18,8 +18,6 @@
 //! - `Debug`/`Display` on any token-bearing type redact the value;
 //! - hashes are compared without short-circuiting (constant-time-ish).
 
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -105,7 +103,12 @@ impl Drop for ObservationToken {
 }
 
 /// A plaintext daemon-admin token (shutdown capability).
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Serializes transparently (a plain string) — the only place it is
+/// persisted is the daemon admin credential file, written with the shared
+/// private-file API. `Debug`/`Display` always redact.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct DaemonAdminToken(String);
 
 impl DaemonAdminToken {
@@ -278,7 +281,12 @@ impl SecretLike for DaemonAdminToken {
 
 /// SHA-256 hash of a secret token. This is the **only** form the runtime
 /// stores; verifying a presented token hashes it and compares digests.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Serializes as lowercase hex — the persisted form used by the trace access
+/// manifest (hashes of a stopped session's tokens, so historical traces stay
+/// readable after a daemon restart). Plaintext is never persisted.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub struct SecretTokenHash([u8; 32]);
 
 impl SecretTokenHash {
@@ -301,10 +309,30 @@ impl SecretTokenHash {
         acc == 0
     }
 
-    /// Hex form for serialization (not currently persisted; kept for clarity).
-    #[allow(dead_code)]
+    /// Hex form for serialization (the persisted form in the trace access
+    /// manifest).
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
+    }
+
+    /// Parse the hex form. Rejects malformed input (never a zeroed hash).
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let bytes = hex::decode(s).ok()?;
+        let arr: [u8; 32] = bytes.try_into().ok()?;
+        Some(Self(arr))
+    }
+}
+
+impl From<SecretTokenHash> for String {
+    fn from(h: SecretTokenHash) -> String {
+        h.to_hex()
+    }
+}
+
+impl TryFrom<String> for SecretTokenHash {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        SecretTokenHash::from_hex(&s).ok_or_else(|| format!("invalid token hash hex: {s}"))
     }
 }
 
@@ -321,7 +349,7 @@ impl std::fmt::Debug for SecretTokenHash {
 pub enum AdminTokenFileError {
     /// No token file exists (the daemon is not running, or never started).
     Missing,
-    /// The file exists but is unreadable or malformed.
+    /// The file exists but is unreadable, insecure, or malformed.
     Corrupt(String),
 }
 
@@ -336,12 +364,63 @@ impl std::fmt::Display for AdminTokenFileError {
     }
 }
 
-/// Write the daemon admin token to `~/.local/state/oc-computer-use/
-/// daemon-admin.json` (state dir 0700, file 0600, fsync'd). The daemon calls
-/// this at startup; a failure to persist **refuses to start** — running
+/// On-disk admin credential format version. `load` refuses files claiming a
+/// newer version — never read a format we don't understand.
+const ADMIN_CREDENTIAL_FORMAT_VERSION: u32 = 1;
+
+/// A daemon admin credential file's contents.
+///
+/// Persisted with the shared private-file API (state dir 0700, file 0600,
+/// atomic rename, symlink/owner/mode/size validated on read) at
+/// `~/.local/state/oc-computer-use/daemon-admin.json`. The `admin_token`
+/// field is typed so `Debug` redacts it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonAdminCredential {
+    /// On-disk format version. Absent in v1 files → 1 (compatible).
+    #[serde(default = "default_admin_format_version")]
+    pub format_version: u32,
+    /// Per-install identity of the daemon that wrote this credential. The CLI
+    /// compares it against the running daemon's `runtime.version` before
+    /// shutting down — a credential from a *different* daemon install (or an
+    /// older build) is stale and never used to shut anything down.
+    #[serde(default)]
+    pub daemon_instance_id: String,
+    /// The admin token itself (shutdown capability).
+    pub admin_token: DaemonAdminToken,
+    /// The wire protocol version this daemon speaks. Load refuses
+    /// incompatible versions — a credential written by a different protocol
+    /// generation must not be replayed against this one.
+    #[serde(default)]
+    pub protocol_version: u32,
+    /// UTC RFC 3339 timestamp of the daemon startup that wrote this file.
+    pub created_at: String,
+}
+
+fn default_admin_format_version() -> u32 {
+    1
+}
+
+/// Fresh daemon instance id — an opaque per-start identity, recorded in the
+/// admin credential and returned by `runtime.version` so the CLI can prove
+/// the credential it holds belongs to the daemon it is talking to.
+pub fn generate_daemon_instance_id() -> String {
+    format!("d_{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
+}
+
+/// Write the daemon admin credential to `~/.local/state/oc-computer-use/
+/// daemon-admin.json` via the shared atomic private write (state dir 0700,
+/// file 0600, random temp file, fsync, rename, parent fsync). The daemon
+/// calls this at startup; a failure to persist **refuses to start** — running
 /// without a stored admin token would make the daemon unstoppable.
-pub fn save_daemon_admin_token(token: &DaemonAdminToken) -> std::io::Result<PathBuf> {
-    save_daemon_admin_token_to(token, &crate::config::daemon_admin_path())
+pub fn save_daemon_admin_token(
+    token: &DaemonAdminToken,
+    daemon_instance_id: &str,
+) -> std::io::Result<PathBuf> {
+    save_daemon_admin_token_to(
+        token,
+        daemon_instance_id,
+        &crate::config::daemon_admin_path(),
+    )
 }
 
 /// Same as [`save_daemon_admin_token`] but to an explicit path (the daemon
@@ -349,49 +428,105 @@ pub fn save_daemon_admin_token(token: &DaemonAdminToken) -> std::io::Result<Path
 /// real user state dir is never touched).
 pub fn save_daemon_admin_token_to(
     token: &DaemonAdminToken,
+    daemon_instance_id: &str,
     path: &Path,
 ) -> std::io::Result<PathBuf> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("admin token path has no parent"))?;
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    let payload = serde_json::json!({
-        "admin_token": token.as_str(),
-        "created_at": chrono::Utc::now().to_rfc3339(),
-    });
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    serde_json::to_writer_pretty(&mut f, &payload).map_err(std::io::Error::other)?;
-    f.flush()?;
-    f.sync_all()?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let credential = DaemonAdminCredential {
+        format_version: ADMIN_CREDENTIAL_FORMAT_VERSION,
+        daemon_instance_id: daemon_instance_id.to_string(),
+        admin_token: token.clone(),
+        protocol_version: PROTOCOL_VERSION,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    crate::private_file::atomic_write_private_json(path, &credential)?;
     Ok(path.to_path_buf())
 }
 
-/// Load the admin token the daemon persisted at startup. `Missing` when no
-/// file exists; `Corrupt` when it exists but cannot be parsed — the CLI must
-/// surface that loudly instead of guessing.
+/// Validate a credential file **before** it is read: symlink/owner/mode/size
+/// checks from the shared read path plus schema-level validation. Returns
+/// `Corrupt(why)` with the reason on any failure.
+fn read_admin_credential(path: &Path) -> Result<DaemonAdminCredential, AdminTokenFileError> {
+    let cred: DaemonAdminCredential = match crate::private_file::read_private_json(
+        path,
+        crate::private_file::DEFAULT_MAX_PRIVATE_FILE_BYTES,
+    ) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AdminTokenFileError::Missing);
+        }
+        Err(e) => return Err(AdminTokenFileError::Corrupt(e.to_string())),
+    };
+    if cred.format_version > ADMIN_CREDENTIAL_FORMAT_VERSION {
+        return Err(AdminTokenFileError::Corrupt(format!(
+            "unsupported format_version {} (this build understands <= {ADMIN_CREDENTIAL_FORMAT_VERSION})",
+            cred.format_version
+        )));
+    }
+    if cred.daemon_instance_id.is_empty() {
+        return Err(AdminTokenFileError::Corrupt(
+            "missing daemon_instance_id".into(),
+        ));
+    }
+    if cred.protocol_version != PROTOCOL_VERSION {
+        return Err(AdminTokenFileError::Corrupt(format!(
+            "protocol_version {} != {PROTOCOL_VERSION} — written by an incompatible build",
+            cred.protocol_version
+        )));
+    }
+    if cred.admin_token.as_str().is_empty() {
+        return Err(AdminTokenFileError::Corrupt("empty admin_token".into()));
+    }
+    Ok(cred)
+}
+
+/// Load the admin credential the daemon persisted at startup. `Missing` when
+/// no file exists; `Corrupt` when it exists but fails any read-side check —
+/// the CLI must surface that loudly instead of guessing.
+pub fn load_daemon_admin_credential() -> Result<DaemonAdminCredential, AdminTokenFileError> {
+    load_daemon_admin_credential_from(&crate::config::daemon_admin_path())
+}
+
+/// Same as [`load_daemon_admin_credential`] but from an explicit path.
+pub fn load_daemon_admin_credential_from(
+    path: &Path,
+) -> Result<DaemonAdminCredential, AdminTokenFileError> {
+    read_admin_credential(path)
+}
+
+/// Load the admin token the daemon persisted at startup (the token alone —
+/// most callers only need the credential to authenticate `runtime.shutdown`).
 pub fn load_daemon_admin_token() -> Result<DaemonAdminToken, AdminTokenFileError> {
     load_daemon_admin_token_from(&crate::config::daemon_admin_path())
 }
 
 /// Same as [`load_daemon_admin_token`] but from an explicit path.
 pub fn load_daemon_admin_token_from(path: &Path) -> Result<DaemonAdminToken, AdminTokenFileError> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Err(AdminTokenFileError::Missing);
-    };
-    let parsed: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| AdminTokenFileError::Corrupt(format!("not valid JSON: {e}")))?;
-    match parsed.get("admin_token").and_then(|v| v.as_str()) {
-        Some(t) if !t.is_empty() => Ok(DaemonAdminToken(t.to_string())),
-        _ => Err(AdminTokenFileError::Corrupt(
-            "missing admin_token field".into(),
-        )),
+    load_daemon_admin_credential_from(path).map(|c| c.admin_token)
+}
+
+/// Daemon-startup hygiene: validate any credential left by a previous run
+/// **before** it is replaced. A file that fails the read-side validation
+/// (symlink, foreign owner, open mode, malformed JSON) is removed — the store
+/// has been tampered with or corrupted, and silently renaming over it would
+/// paper over that. A *valid* file from an earlier crash is left alone (it is
+/// replaced by the fresh credential in the normal save).
+///
+/// Returns `Ok(true)` when an invalid file was removed (the caller should log
+/// it), `Ok(false)` when the store was clean or absent, and `Err` when the
+/// cleanup itself failed (the caller should refuse to start — an invalid
+/// credential must not be papered over).
+pub fn validate_and_cleanup_admin_store(path: &Path) -> std::io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    match read_admin_credential(path) {
+        Ok(_) => Ok(false),
+        Err(AdminTokenFileError::Missing) => Ok(false),
+        Err(AdminTokenFileError::Corrupt(why)) => {
+            crate::private_file::remove_private_file(path)?;
+            tracing::warn!(path = %path.display(), %why, "removed invalid daemon admin credential from a previous run");
+            Ok(true)
+        }
     }
 }
 
@@ -403,12 +538,13 @@ pub fn remove_daemon_admin_token() {
 
 /// Same as [`remove_daemon_admin_token`] but for an explicit path.
 pub fn remove_daemon_admin_token_from(path: &Path) {
-    let _ = std::fs::remove_file(path);
+    let _ = crate::private_file::remove_private_file(path);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn tokens_are_256_bits_of_randomness() {
@@ -516,8 +652,9 @@ mod tests {
         let _guard = HOME_LOCK.lock().unwrap();
         let home = temp_home("admin-roundtrip");
         let token = generate_daemon_admin_token();
+        let instance = generate_daemon_instance_id();
 
-        let path = save_daemon_admin_token(&token).unwrap();
+        let path = save_daemon_admin_token(&token, &instance).unwrap();
         assert_eq!(path, crate::config::daemon_admin_path());
 
         // Directory 0700, file 0600 — the token must never be world-readable.
@@ -529,12 +666,27 @@ mod tests {
         assert_eq!(fperm.mode() & 0o777, 0o600);
 
         // The file stores the token (the daemon's only way to hand it to the
-        // CLI) and never a hash.
+        // CLI), the instance id, and the protocol version — and no temp file
+        // survives the atomic write.
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(token.as_str()), "file must contain the token");
+        assert!(
+            text.contains(&instance),
+            "file must record the daemon instance id"
+        );
         assert!(text.contains("created_at"), "file records its creation");
+        let names: Vec<String> = std::fs::read_dir(crate::config::state_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["daemon-admin.json".to_string()]);
 
-        // Load returns the exact token; removal makes the store report Missing.
+        // Load returns the exact credential and token; removal makes the
+        // store report Missing.
+        let cred = load_daemon_admin_credential().unwrap();
+        assert_eq!(cred.daemon_instance_id, instance);
+        assert_eq!(cred.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(cred.format_version, 1);
         let loaded = load_daemon_admin_token().unwrap();
         assert_eq!(loaded.as_str(), token.as_str());
         remove_daemon_admin_token();
@@ -566,8 +718,46 @@ mod tests {
             AdminTokenFileError::Corrupt(_)
         ));
 
+        // Valid JSON, token present, but no daemon_instance_id — corrupt.
+        std::fs::write(
+            &path,
+            r#"{"format_version": 1, "admin_token": "tok", "protocol_version": 3, "created_at": "2026-08-04T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_daemon_admin_token().unwrap_err(),
+            AdminTokenFileError::Corrupt(_)
+        ));
+
+        // Wrong protocol version — corrupt (a credential from another
+        // protocol generation must never be replayed).
+        std::fs::write(
+            &path,
+            r#"{"format_version": 1, "daemon_instance_id": "d_x", "admin_token": "tok", "protocol_version": 2, "created_at": "2026-08-04T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_daemon_admin_token().unwrap_err(),
+            AdminTokenFileError::Corrupt(_)
+        ));
+
+        // Future format version — corrupt.
+        std::fs::write(
+            &path,
+            r#"{"format_version": 99, "daemon_instance_id": "d_x", "admin_token": "tok", "protocol_version": 3, "created_at": "2026-08-04T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_daemon_admin_token().unwrap_err(),
+            AdminTokenFileError::Corrupt(_)
+        ));
+
         // Empty token — corrupt.
-        std::fs::write(&path, r#"{"admin_token": ""}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"format_version": 1, "daemon_instance_id": "d_x", "admin_token": "", "protocol_version": 3, "created_at": "2026-08-04T00:00:00Z"}"#,
+        )
+        .unwrap();
         assert!(matches!(
             load_daemon_admin_token().unwrap_err(),
             AdminTokenFileError::Corrupt(_)
@@ -587,11 +777,14 @@ mod tests {
         // location must remain untouched (a real daemon run must never leave
         // a test's token in the user's real state dir).
         let token = generate_daemon_admin_token();
-        save_daemon_admin_token_to(&token, &path).unwrap();
+        let instance = generate_daemon_instance_id();
+        save_daemon_admin_token_to(&token, &instance, &path).unwrap();
         assert!(path.exists());
         assert!(!crate::config::daemon_admin_path().exists());
         let loaded = load_daemon_admin_token_from(&path).unwrap();
         assert_eq!(loaded.as_str(), token.as_str());
+        let cred = load_daemon_admin_credential_from(&path).unwrap();
+        assert_eq!(cred.daemon_instance_id, instance);
 
         // Missing / corrupt semantics on the explicit path too.
         let missing = path.parent().unwrap().join("nope.json");
@@ -608,6 +801,66 @@ mod tests {
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn startup_hygiene_validates_then_cleans() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let home = temp_home("admin-hygiene");
+        let path = crate::config::daemon_admin_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // No file at all → nothing to clean.
+        assert!(
+            !validate_and_cleanup_admin_store(&path).unwrap(),
+            "absent store has nothing to clean"
+        );
+
+        // A valid credential from an earlier crash is left alone (the fresh
+        // save replaces it normally).
+        let token = generate_daemon_admin_token();
+        save_daemon_admin_token_to(&token, "d_old", &path).unwrap();
+        assert!(
+            !validate_and_cleanup_admin_store(&path).unwrap(),
+            "a valid previous credential is not removed"
+        );
+        assert!(path.exists());
+
+        // A tampered file (symlink, open mode, garbage) is removed.
+        remove_daemon_admin_token_from(&path);
+        std::fs::write(&path, "garbage {{{").unwrap();
+        assert!(
+            validate_and_cleanup_admin_store(&path).unwrap(),
+            "an invalid previous credential must be cleaned"
+        );
+        assert!(!path.exists(), "the invalid file is gone");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn instance_ids_are_unique_and_well_formed() {
+        let a = generate_daemon_instance_id();
+        let b = generate_daemon_instance_id();
+        assert_ne!(a, b);
+        assert!(a.starts_with("d_"));
+        assert_eq!(a.len(), 10);
+    }
+
+    #[test]
+    fn hash_hex_round_trip_and_manifest_shape() {
+        let token = generate_control_token();
+        let hash = SecretTokenHash::from_token(&token);
+        let hex_form = hash.to_hex();
+        assert_eq!(hex_form.len(), 64);
+        // The serde path (what the trace access manifest uses) round-trips.
+        let json = serde_json::to_value(&hash).unwrap();
+        assert_eq!(json, serde_json::json!(hex_form));
+        let back: SecretTokenHash = serde_json::from_value(json).unwrap();
+        assert_eq!(back, hash);
+        assert!(back.verify(token.as_str()));
+        // Malformed hex is refused.
+        assert!(SecretTokenHash::from_hex("xyz").is_none());
+        assert!(SecretTokenHash::from_hex("abcd").is_none());
     }
 
     #[test]

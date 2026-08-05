@@ -418,6 +418,62 @@ test("sensitive reads carry the observation token from the credential", async ()
   }
 });
 
+test("trace list/summaries are session-scoped since round 6", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const started = await client.session("start");
+
+    // traceList(sessionId) injects the session's observation token and
+    // addresses exactly that session.
+    const list = await client.traceList(started.session_id);
+    assert.equal(list.traces.length, 1);
+    assert.equal(list.traces[0].session_id, started.session_id);
+    const listReq = fake.requests.find((r) => r.method === "trace.list");
+    assert.ok(listReq, "trace.list was sent");
+    assert.equal(listReq.params.session_id, started.session_id, "session-scoped params");
+    assert.equal(listReq.params.observation_token, START_OBSERVATION_TOKEN);
+
+    // traceSummaries(sessionId) behaves the same, returning the bare array.
+    const summaries = await client.traceSummaries(started.session_id);
+    assert.equal(summaries.length, 1);
+    const sumsReq = fake.requests.find((r) => r.method === "trace.summaries");
+    assert.ok(sumsReq, "trace.summaries was sent");
+    assert.equal(sumsReq.params.session_id, started.session_id);
+    assert.equal(sumsReq.params.observation_token, START_OBSERVATION_TOKEN);
+
+    // An explicit token still wins (supplied by the caller, verified against
+    // the session like any presented token); a limit rides along untouched.
+    await client.traceSummaries(started.session_id, {
+      observationToken: START_OBSERVATION_TOKEN,
+      limit: 5,
+    });
+    const explicit = fake.requests.filter((r) => r.method === "trace.summaries").at(-1);
+    assert.equal(explicit.params.observation_token, START_OBSERVATION_TOKEN);
+    assert.equal(explicit.params.limit, 5);
+
+    // A token for another session must never be injected: a client holding a
+    // credential for session A calling traceList(B) sends no token at all,
+    // and the daemon refuses the request (OBSERVATION_TOKEN_REQUIRED) — a
+    // cross-session capability never leaks.
+    await client.session("stop");
+    const again = await client.session("start");
+    assert.notEqual(again.session_id, started.session_id);
+    await assert.rejects(
+      () => client.traceList(started.session_id),
+      (err) => err.data?.code !== undefined,
+      "a session-A token must not read session-B traces",
+    );
+    const cross = fake.requests.filter((r) => r.method === "trace.list").at(-1);
+    assert.equal(cross.params.session_id, started.session_id);
+    assert.equal(cross.params.observation_token, undefined, "no token injected cross-session");
+    assert.equal(cross.params.control_token, undefined);
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
 test("session.summary is the public tokenless view", async () => {
   const fake = startFakeDaemon();
   const client = await connect({ socketPath: fake.socketPath });

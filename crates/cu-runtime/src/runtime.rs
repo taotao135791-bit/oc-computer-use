@@ -258,6 +258,21 @@ impl Runtime {
         let observation_token = generate_observation_token();
         let observation_token_hash = SecretTokenHash::from_token(&observation_token);
 
+        // Persist the trace access manifest (token hashes only — plaintext
+        // never touches disk): after a daemon restart the session is gone
+        // from memory but its trace files remain, and the manifest is what
+        // lets the token holder prove access again. A failure degrades
+        // gracefully: live access still works, only restart-persistence
+        // is lost.
+        if let Err(e) = cu_trace::manifest::write_manifest(
+            &self.config.traces_dir,
+            &id,
+            &control_token_hash,
+            &observation_token_hash,
+        ) {
+            tracing::warn!(session = %id, error = %e, "trace access manifest unavailable; trace access will not survive a daemon restart");
+        }
+
         let trace = match self.config.trace_mode {
             // Disabled: no recorder at all; trace RPCs simply find nothing.
             TraceMode::Disabled => None,
@@ -302,6 +317,9 @@ impl Runtime {
             if let Some(t) = session.trace.as_ref() {
                 let _ = t.close().await;
             }
+            // The session never went live and its tokens never left the
+            // daemon — do not leave an access record behind.
+            let _ = cu_trace::manifest::remove_manifest(&self.config.traces_dir, &id);
             return Err(self.with_holder_owner(e));
         }
 
@@ -524,6 +542,11 @@ impl Runtime {
                 .record_event("session.stop", serde_json::json!({ "reason": "requested" }))
                 .await;
             let _ = t.close().await;
+        }
+        // Stamp the trace access manifest so history shows the session ended.
+        // Best-effort: a missing manifest only loses the timestamp.
+        if let Err(e) = cu_trace::manifest::mark_stopped(&self.config.traces_dir, &session_id) {
+            tracing::warn!(session = %session_id, error = %e, "could not stamp trace manifest stopped_at");
         }
         session.set_state(SessionState::Stopped);
         self.control_lock.release(&session_id);
@@ -1137,18 +1160,42 @@ impl Runtime {
             .ok_or_else(|| CuError::SessionNotFound(format!("session not found: {id}")))
     }
 
-    /// Verify a capability token for a sensitive read addressed by session id
-    /// (used by the daemon's trace methods, which read files off the session's
-    /// trace dir). Works for stopped sessions too — their traces remain
-    /// readable to the token holder after `stop`.
-    pub fn verify_session_read(
+    /// Verify a capability token for a session's **trace** (used by the
+    /// daemon's trace methods, which read files off the session's trace dir).
+    ///
+    /// Round 6: trace access is strictly session-scoped. A live session
+    /// verifies its own tokens as before. After a daemon restart the session
+    /// is gone from memory, but its trace files remain — the trace access
+    /// manifest persisted at `session_start` (token *hashes* only, never
+    /// plaintext) proves the token holder again. A session with no live
+    /// record and no manifest is `SESSION_NOT_FOUND`; a manifest that exists
+    /// but matches nothing is the non-descriptive token error, so a wrong
+    /// token never distinguishes "exists but denied" from "you don't hold
+    /// this session's credential".
+    pub fn verify_trace_access(
         &self,
         session_id: &str,
         observation_token: Option<&str>,
         control_token: Option<&str>,
     ) -> Result<(), CuError> {
-        let session = self.get_session(session_id)?;
-        session.verify_read_tokens(observation_token, control_token)
+        if let Ok(session) = self.get_session(session_id) {
+            return session.verify_read_tokens(observation_token, control_token);
+        }
+        match cu_trace::manifest::check_access(
+            &self.config.traces_dir,
+            session_id,
+            observation_token,
+            control_token,
+        ) {
+            Some(true) => Ok(()),
+            Some(false) => match (observation_token, control_token) {
+                (None, None) => Err(CuError::ObservationTokenRequired),
+                _ => Err(CuError::InvalidObservationToken),
+            },
+            None => Err(CuError::SessionNotFound(format!(
+                "session not found: {session_id}"
+            ))),
+        }
     }
 
     /// Verify a capability token against **any** session known to the daemon.
@@ -2735,5 +2782,71 @@ mod tests {
                 .contains(token.as_str()),
             "the error must never contain the control token"
         );
+    }
+
+    /// Round 6: trace access survives a daemon restart through the persisted
+    /// access manifest — the token holder can still read the session's trace,
+    /// while a stranger's token and a never-existed session stay denied.
+    #[tokio::test]
+    async fn trace_access_survives_restart_via_manifest() {
+        let mut cfg = test_config();
+        cfg.traces_dir = cfg
+            .traces_dir
+            .join(format!("restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg.traces_dir);
+
+        // First daemon: start a session and stop it (the trace file stays).
+        let rt = runtime_with_config(cfg.clone()).await;
+        let started = rt.session_start(None, test_client()).await.unwrap();
+        let sid = started.session_id.clone();
+        let control = started.control_token.clone().unwrap();
+        let observation = started.observation_token.clone().unwrap();
+        rt.session_stop(&sid, Some(control.as_str())).await.unwrap();
+
+        // The manifest exists and the session's own tokens still verify
+        // through the live daemon (stopped sessions stay in memory).
+        assert!(rt
+            .verify_trace_access(&sid, None, Some(control.as_str()))
+            .is_ok());
+        assert!(rt
+            .verify_trace_access(&sid, Some(observation.as_str()), None)
+            .is_ok());
+
+        // "Restart": a brand-new runtime over the same traces dir — the
+        // session is gone from memory.
+        let rt2 = runtime_with_config(cfg).await;
+        assert_eq!(
+            rt2.verify_trace_access(&sid, None, None)
+                .unwrap_err()
+                .code(),
+            ErrorCode::ObservationTokenRequired,
+            "no token, no access after restart"
+        );
+        assert!(
+            rt2.verify_trace_access(&sid, None, Some(control.as_str()))
+                .is_ok(),
+            "the control token holder keeps trace access after restart"
+        );
+        assert!(
+            rt2.verify_trace_access(&sid, Some(observation.as_str()), None)
+                .is_ok(),
+            "the observation token holder keeps trace access after restart"
+        );
+        let stranger = generate_control_token();
+        assert_eq!(
+            rt2.verify_trace_access(&sid, Some(stranger.as_str()), None)
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidObservationToken,
+            "a stranger's token is denied after restart"
+        );
+        assert_eq!(
+            rt2.verify_trace_access("s_never", None, Some(control.as_str()))
+                .unwrap_err()
+                .code(),
+            ErrorCode::SessionNotFound,
+            "a session that never existed is SESSION_NOT_FOUND"
+        );
+        let _ = std::fs::remove_dir_all(&rt2.config.traces_dir);
     }
 }

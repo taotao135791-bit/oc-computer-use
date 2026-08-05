@@ -13,9 +13,10 @@ and the concrete protections each layer provides.
   below are *defense in depth* against mistakes, other local processes, and
   accidental exposure (shell history, logs, backups, screenshots, `ps`),
   not against a malicious process running as the same user.
-- **No remote surface**: the daemon binds a Unix socket with mode `0600`
-  (owner rw only). `runtime.shutdown` additionally requires a daemon admin
-  token — a random peer on the machine cannot ask the daemon to stop.
+- **No remote surface**: the daemon binds a Unix socket with mode `0700`
+  (owner only, inside a `0700` runtime directory). `runtime.shutdown`
+  additionally requires a daemon admin token — a random peer on the machine
+  cannot ask the daemon to stop.
 - **One active session**: the runtime holds a single session (control lock).
   The session's **owner** is the client that created it; only the owner
   stops it.
@@ -24,8 +25,8 @@ and the concrete protections each layer provides.
 
 | Secret | Created | Stored | Mode | Lifecycle |
 |---|---|---|---|---|
-| session `observation_token` (256-bit CSPRNG) | `session start` | SHA-256 hash only, daemon memory | — | issued exactly once; `stop` or daemon restart invalidates it |
-| session `control_token` (256-bit CSPRNG) | `session start` | SHA-256 hash only, daemon memory | — | issued exactly once; never repeated by `status` |
+| session `observation_token` (256-bit CSPRNG) | `session start` | SHA-256 hash in daemon memory **and** the trace access manifest (`traces/<sid>.manifest.json`, `0600`, atomically written) | — | issued exactly once; `stop` invalidates it; the hashed manifest keeps trace reads working across daemon restarts |
+| session `control_token` (256-bit CSPRNG) | `session start` | SHA-256 hash in daemon memory **and** the trace access manifest | — | issued exactly once; never repeated by `status` |
 | daemon admin token (256-bit CSPRNG) | daemon startup | `~/.local/state/oc-computer-use/` admin token file | `0600` | deleted on shutdown; corrupt store refuses startup |
 | CLI credential files | `cu session start` | `~/.local/state/oc-computer-use/credentials/<sid>.json` | `0600` | deleted with the session |
 
@@ -74,6 +75,22 @@ methods) require a verified observation/control token. The capability
 matrix lives in [README.md](README.md#capability-matrix) and
 [docs/protocol.md](docs/protocol.md); a matrix test suite runs against a
 live daemon (`cargo test -p cu-daemon --test integration -- --ignored`).
+
+### Trace reads are session-scoped
+
+- Every trace read addresses exactly **one session** and requires that
+  session's observation/control token: a token from session A can never list
+  or read session B's trace (`INVALID_OBSERVATION_TOKEN`), and a session id
+  alone grants nothing (`OBSERVATION_TOKEN_REQUIRED`).
+- The **cross-session** listing (`trace.admin_list`) is daemon-manager only:
+  it requires the daemon admin token, never a session capability — a client
+  that legitimately reads one session's trace learns nothing about which
+  other sessions ever ran.
+- Access survives daemon restarts through a per-session access manifest
+  (`traces/<session_id>.manifest.json`) written via the shared private-file
+  API (0600, atomic, symlink-refusing) recording only **SHA-256 hashes** of
+  the issued tokens — plaintext tokens never touch disk, and a missing,
+  corrupt, oversized, or symlinked manifest never grants access.
 
 ## Reporting a vulnerability
 

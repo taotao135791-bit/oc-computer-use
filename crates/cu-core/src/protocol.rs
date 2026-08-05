@@ -373,6 +373,11 @@ pub struct RuntimeVersionResult {
     /// gets `PROTOCOL_VERSION_MISMATCH`.
     pub minimum_client_protocol_version: u32,
     pub maximum_client_protocol_version: u32,
+    /// Identity of the running daemon instance, generated at startup. A client
+    /// holding an admin credential compares this against the instance id
+    /// recorded in its credential file before using it to shut the daemon
+    /// down — a credential from a different daemon install is stale.
+    pub daemon_instance_id: String,
 }
 
 /// `computer.session` result (shape depends on `action`).
@@ -485,6 +490,50 @@ pub struct ShutdownParams {
     pub admin_token: Option<SecretToken>,
 }
 
+/// `trace.list` request (round 6): **session-scoped**. A session's capability
+/// tokens authorize reads of *that session's* traces only — never a
+/// cross-session listing. Verified against the live session, or against the
+/// persisted trace access manifest after a daemon restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TraceListParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<SecretToken>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<SecretToken>,
+    /// Maximum entries to return (newest first). Absent = all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `trace.summaries` request — same session-scoped shape and verification as
+/// `trace.list`; the response is the raw summary array.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TraceSummariesParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<SecretToken>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<SecretToken>,
+    /// Maximum entries to return (newest first). Absent = all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `trace.admin_list` request — the **daemon-manager** listing across all
+/// sessions, authorized by the daemon admin token (never by a session
+/// capability). Session tokens must not reveal which other sessions ever ran
+/// on the machine; only the operator (CLI / LaunchAgent) may see that.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TraceAdminListParams {
+    /// The daemon admin token, same credential as `runtime.shutdown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_token: Option<SecretToken>,
+    /// Maximum entries to return (newest first). Absent = all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 /// `trace.list` / `trace.summaries` entry — metadata only. The absolute
 /// filesystem path never crosses the wire (a path would leak the install
 /// layout and invite path-based probing); contents are read via `trace.get`
@@ -500,12 +549,12 @@ pub struct TraceSummary {
     pub event_count: usize,
 }
 
-/// Shared token fields for **cross-session** sensitive reads:
-/// `runtime.pointer`, `runtime.active_application`, `runtime.desktop_layout`,
-/// `trace.list`, `trace.summaries`. Unlike the session-addressed reads these
-/// methods have no `session_id`, so any valid observation or control token is
-/// accepted — the token proves the caller is a trusted client of this daemon.
-/// No token → `OBSERVATION_TOKEN_REQUIRED`; a token matching nothing →
+/// Shared token fields for the remaining **cross-session** sensitive reads:
+/// `runtime.pointer`, `runtime.active_application`, `runtime.desktop_layout`.
+/// (The trace reads became session-scoped in round 6.) These methods have no
+/// `session_id`, so any valid observation or control token is accepted — the
+/// token proves the caller is a trusted client of this daemon. No token →
+/// `OBSERVATION_TOKEN_REQUIRED`; a token matching nothing →
 /// `INVALID_OBSERVATION_TOKEN`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, schemars::JsonSchema)]
 pub struct CapabilityTokenParams {

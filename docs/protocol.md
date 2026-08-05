@@ -135,8 +135,11 @@ plaintext.
   `resume`, `takeover`, `release`, `stop`, `computer.act`, `computer.cancel`)
   and doubles as an observation credential.
 - **`observation_token`** — authorizes sensitive reads (`status`, `observe`,
-  `inspect`, trace methods). The control token verifies there too; either
-  token opens a read, a mutating operation always needs the control token.
+  `inspect`, session-scoped trace methods). The control token verifies there
+  too; either token opens a read, a mutating operation always needs the
+  control token. Trace reads are additionally bound to **one session**: the
+  token must belong to the addressed session, and the cross-session
+  `trace.admin_list` accepts only the daemon admin token.
 
 A mutating operation without a token is `CONTROL_TOKEN_REQUIRED`; a wrong
 token is `INVALID_CONTROL_TOKEN` with no side effects. A read with no token
@@ -297,12 +300,23 @@ can translate cropped pixels back to global coordinates.
 
 ### Traces
 
+Trace reads are **session-scoped**: every method addresses exactly one
+`session_id` and requires that session's observation or control token (a
+token from another session is `INVALID_OBSERVATION_TOKEN`; no token is
+`OBSERVATION_TOKEN_REQUIRED`). Access survives daemon restarts through a
+per-session access manifest (`traces/<session_id>.manifest.json`, written
+0600 through the shared private-file API) recording only **hashes** of the
+issued tokens — plaintext tokens never touch disk, and a missing, corrupt,
+or symlinked manifest never grants access.
+
 | Method | Params | Result |
 |---|---|---|
-| `trace.list` | — | `{traces: [{session_id, path, entries, bytes, started_at}]}` |
-| `trace.get` | `{session_id}` | `{entries: [...]}` (parsed JSONL) |
-| `trace.export` | `{session_id, dest}` | `{path, format, exported_at}` |
-| `trace.replay` | `{session_id}` | replay summary |
+| `trace.list` | `{session_id, observation_token?, control_token?, limit?}` | `{traces: [{session_id, trace_id, event_count, size_bytes, created_at}]}` — this session's trace metadata only |
+| `trace.summaries` | `{session_id, observation_token?, control_token?, limit?}` | `[{session_id, trace_id, event_count, size_bytes, created_at}]` — same scoping, bare array |
+| `trace.admin_list` | `{admin_token, limit?}` | `{traces: [...]}` — **daemon-manager only**: lists every session's trace; authorized by the daemon admin token alone (missing → `DAEMON_ADMIN_TOKEN_REQUIRED`, wrong → `INVALID_DAEMON_ADMIN_TOKEN`) — a session capability must never reveal which other sessions ran |
+| `trace.get` | `{session_id, observation_token?, control_token?}` | `{entries: [...]}` (parsed JSONL) |
+| `trace.export` | `{session_id, dest, observation_token?, control_token?}` | `{path, format, exported_at}` |
+| `trace.replay` | `{session_id, observation_token?, control_token?}` | replay summary |
 
 ## Reference clients
 

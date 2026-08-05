@@ -93,7 +93,7 @@ export type CoordinateSpace = "normalized_1000" | "image_pixels";
  */
 export type WaitPolicy = "none" | "fixed" | "until_stable";
 /**
- * Shared token fields for **cross-session** sensitive reads: `runtime.pointer`, `runtime.active_application`, `runtime.desktop_layout`, `trace.list`, `trace.summaries`. Unlike the session-addressed reads these methods have no `session_id`, so any valid observation or control token is accepted — the token proves the caller is a trusted client of this daemon. No token → `OBSERVATION_TOKEN_REQUIRED`; a token matching nothing → `INVALID_OBSERVATION_TOKEN`.
+ * Shared token fields for the remaining **cross-session** sensitive reads: `runtime.pointer`, `runtime.active_application`, `runtime.desktop_layout`. (The trace reads became session-scoped in round 6.) These methods have no `session_id`, so any valid observation or control token is accepted — the token proves the caller is a trusted client of this daemon. No token → `OBSERVATION_TOKEN_REQUIRED`; a token matching nothing → `INVALID_OBSERVATION_TOKEN`.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
  * via the `definition` "CapabilityTokenParams".
@@ -382,6 +382,33 @@ export type TraceGetParams =
       [k: string]: unknown;
     };
 /**
+ * `trace.list` request (round 6): **session-scoped**. A session's capability tokens authorize reads of *that session's* traces only — never a cross-session listing. Verified against the live session, or against the persisted trace access manifest after a daemon restart.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "TraceListParams".
+ */
+export type TraceListParams =
+  | {
+      control_token?: string;
+      /**
+       * Maximum entries to return (newest first). Absent = all.
+       */
+      limit?: number;
+      observation_token: string;
+      session_id?: string;
+      [k: string]: unknown;
+    }
+  | {
+      control_token: string;
+      /**
+       * Maximum entries to return (newest first). Absent = all.
+       */
+      limit?: number;
+      observation_token?: string;
+      session_id?: string;
+      [k: string]: unknown;
+    };
+/**
  * How strictly traces are recorded.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
@@ -403,6 +430,33 @@ export type TraceReplayParams =
     }
   | {
       control_token: string;
+      observation_token?: string;
+      session_id?: string;
+      [k: string]: unknown;
+    };
+/**
+ * `trace.summaries` request — same session-scoped shape and verification as `trace.list`; the response is the raw summary array.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "TraceSummariesParams".
+ */
+export type TraceSummariesParams =
+  | {
+      control_token?: string;
+      /**
+       * Maximum entries to return (newest first). Absent = all.
+       */
+      limit?: number;
+      observation_token: string;
+      session_id?: string;
+      [k: string]: unknown;
+    }
+  | {
+      control_token: string;
+      /**
+       * Maximum entries to return (newest first). Absent = all.
+       */
+      limit?: number;
       observation_token?: string;
       session_id?: string;
       [k: string]: unknown;
@@ -737,6 +791,10 @@ export interface RpcResponse {
  * via the `definition` "RuntimeVersionResult".
  */
 export interface RuntimeVersionResult {
+  /**
+   * Identity of the running daemon instance, generated at startup. A client holding an admin credential compares this against the instance id recorded in its credential file before using it to shut the daemon down — a credential from a different daemon install is stale.
+   */
+  daemon_instance_id: string;
   maximum_client_protocol_version: number;
   /**
    * Inclusive lower bound of the client protocol versions this daemon accepts. A client below this (or above `maximum_client_protocol_version`) gets `PROTOCOL_VERSION_MISMATCH`.
@@ -836,6 +894,23 @@ export interface StaleFrameDetail {
   current_frame_id: string;
   reason: string;
   referenced_frame_id: string;
+  [k: string]: unknown;
+}
+/**
+ * `trace.admin_list` request — the **daemon-manager** listing across all sessions, authorized by the daemon admin token (never by a session capability). Session tokens must not reveal which other sessions ever ran on the machine; only the operator (CLI / LaunchAgent) may see that.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "TraceAdminListParams".
+ */
+export interface TraceAdminListParams {
+  /**
+   * The daemon admin token, same credential as `runtime.shutdown`.
+   */
+  admin_token: string;
+  /**
+   * Maximum entries to return (newest first). Absent = all.
+   */
+  limit?: number;
   [k: string]: unknown;
 }
 /**

@@ -10,6 +10,7 @@ pub mod config;
 pub mod coordinates;
 pub mod errors;
 pub mod frames;
+pub mod private_file;
 pub mod protocol;
 pub mod security;
 pub mod sessions;
@@ -24,8 +25,9 @@ pub use protocol::{
     ActParams, ActResult, ActionResultReport, CancelParams, CancelResult, CapabilityTokenParams,
     ClientInfo, InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult,
     RequestKey, RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams, SessionResult,
-    SessionSummary, ShutdownParams, StabilizationInfo, TraceEntry, TraceExport, TraceExportParams,
-    TraceGetParams, TraceReplayParams, TraceReport, TraceSummary,
+    SessionSummary, ShutdownParams, StabilizationInfo, TraceAdminListParams, TraceEntry,
+    TraceExport, TraceExportParams, TraceGetParams, TraceListParams, TraceReplayParams,
+    TraceReport, TraceSummariesParams, TraceSummary,
 };
 pub use security::{
     generate_control_token, generate_daemon_admin_token, generate_observation_token, redact_json,

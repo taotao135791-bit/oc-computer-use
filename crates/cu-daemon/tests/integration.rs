@@ -223,14 +223,30 @@ async fn daemon_refuses_to_start_when_the_admin_token_cannot_be_persisted() {
 #[tokio::test]
 async fn trace_list_is_empty_on_fresh_home() {
     let d = spawn_daemon().await;
-    // trace.list is token-gated since round 5: with no session at all there
-    // is no credential to present, so it must refuse — the daemon never
-    // leaks "which sessions ever ran" to anonymous callers.
+    // trace.list is session-scoped since round 6: with no session_id at all
+    // it is a malformed request — the daemon never leaks "which sessions
+    // ever ran" to anonymous callers.
     let err = request(&d.socket, "trace.list", json!({})).await;
     assert_eq!(
         err["code"],
-        json!(-32024),
-        "trace.list without a capability token must be refused"
+        json!(-32602),
+        "trace.list without a session_id must be refused"
+    );
+    // And with an unknown session id the typed SESSION_NOT_FOUND — a
+    // session id alone grants nothing.
+    let err = request(&d.socket, "trace.list", json!({ "session_id": "s_nope" })).await;
+    assert_eq!(
+        err["code"],
+        json!(-32009),
+        "trace.list for an unknown session must be SESSION_NOT_FOUND"
+    );
+    // trace.admin_list without the admin token is refused too — anonymous
+    // callers must not list which sessions ever ran.
+    let err = request(&d.socket, "trace.admin_list", json!({})).await;
+    assert_eq!(
+        err["code"],
+        json!(-32026),
+        "trace.admin_list without the admin token must be refused"
     );
     shutdown_daemon(d).await;
 }

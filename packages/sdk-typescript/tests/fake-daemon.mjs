@@ -292,6 +292,38 @@ export function startFakeDaemon({
             state.shutDown = true;
             respond({ jsonrpc: "2.0", id: req.id, result: { status: "shutting_down" } });
           }
+        } else if (req.method === "trace.list" || req.method === "trace.summaries") {
+          // Session-scoped since round 6: the request must address exactly one
+          // session with that session's observation/control token. The fake
+          // mirrors the real daemon — a token from a different session is
+          // refused; a missing token is refused with OBSERVATION_TOKEN_REQUIRED.
+          const sid = req.params?.session_id;
+          if (typeof sid !== "string" || !sid) {
+            respond({
+              jsonrpc: "2.0",
+              id: req.id,
+              error: {
+                code: -32602,
+                message: "INVALID_PARAMS",
+                data: { code: "INVALID_PARAMS", message: "Missing required parameter: session_id" },
+              },
+            });
+          } else if (state.session?.session_id !== sid) {
+            respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
+          } else if (!hasToken(req.params)) {
+            respond({ jsonrpc: "2.0", id: req.id, error: OBSERVATION_REQUIRED_ERROR });
+          } else {
+            const summary = {
+              trace_id: sid,
+              session_id: sid,
+              event_count: 2,
+              size_bytes: 128,
+              created_at: "2026-08-03T00:00:00Z",
+            };
+            const result =
+              req.method === "trace.list" ? { traces: [summary] } : [summary];
+            respond({ jsonrpc: "2.0", id: req.id, result });
+          }
         } else {
           respond({ jsonrpc: "2.0", id: req.id, result: null });
         }
