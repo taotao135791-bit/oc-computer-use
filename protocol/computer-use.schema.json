@@ -43,7 +43,8 @@
       "required": [
         "actions",
         "frame_id",
-        "session_id"
+        "session_id",
+        "control_token"
       ],
       "type": "object"
     },
@@ -161,7 +162,8 @@
         }
       },
       "required": [
-        "session_id"
+        "session_id",
+        "control_token"
       ],
       "type": "object"
     },
@@ -179,6 +181,46 @@
         "cancelled",
         "session_id"
       ],
+      "type": "object"
+    },
+    "CapabilityTokenParams": {
+      "anyOf": [
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "observation_token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "observation_token"
+          ]
+        },
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "observation_token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "control_token"
+          ]
+        }
+      ],
+      "description": "Shared token fields for **cross-session** sensitive reads: `runtime.pointer`, `runtime.active_application`, `runtime.desktop_layout`, `trace.list`, `trace.summaries`. Unlike the session-addressed reads these methods have no `session_id`, so any valid observation or control token is accepted — the token proves the caller is a trusted client of this daemon. No token → `OBSERVATION_TOKEN_REQUIRED`; a token matching nothing → `INVALID_OBSERVATION_TOKEN`.",
+      "properties": {
+        "control_token": {
+          "type": "string"
+        },
+        "observation_token": {
+          "type": "string"
+        }
+      },
       "type": "object"
     },
     "ClientInfo": {
@@ -598,6 +640,13 @@
             "INVALID_DAEMON_ADMIN_TOKEN"
           ],
           "type": "string"
+        },
+        {
+          "description": "The daemon is shutting down: new requests are refused until it exits. In-flight work was cancelled (or is draining within the grace period).",
+          "enum": [
+            "DAEMON_SHUTTING_DOWN"
+          ],
+          "type": "string"
         }
       ]
     },
@@ -651,6 +700,64 @@
       "type": "object"
     },
     "InspectParams": {
+      "anyOf": [
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "frame_id": {
+              "type": "string"
+            },
+            "observation_token": {
+              "description": "Observation (or control) token — required; a session id alone grants no observation permission.",
+              "type": "string"
+            },
+            "region": {
+              "$ref": "#/$defs/Region"
+            },
+            "scale": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "observation_token"
+          ]
+        },
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "frame_id": {
+              "type": "string"
+            },
+            "observation_token": {
+              "description": "Observation (or control) token — required; a session id alone grants no observation permission.",
+              "type": "string"
+            },
+            "region": {
+              "$ref": "#/$defs/Region"
+            },
+            "scale": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "control_token"
+          ]
+        }
+      ],
       "description": "`computer.inspect` request.",
       "properties": {
         "control_token": {
@@ -732,6 +839,96 @@
       "type": "string"
     },
     "ObserveParams": {
+      "anyOf": [
+        {
+          "properties": {
+            "control_token": {
+              "description": "The session's control token — accepted in place of the observation token (control includes observation).",
+              "type": "string"
+            },
+            "display_id": {
+              "type": "string"
+            },
+            "image_format": {
+              "type": "string"
+            },
+            "include_cursor": {
+              "type": "boolean"
+            },
+            "include_image": {
+              "description": "When true, the response carries the image as base64. Off by default so a plain `observe` stays cheap; adapters that need pixels (MCP, vision harnesses) turn it on.",
+              "type": "boolean"
+            },
+            "jpeg_quality": {
+              "format": "uint8",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "max_width": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "observation_token": {
+              "description": "The session's **observation token**. Required — observing captures the desktop; a session id alone grants no observation permission. A valid control token is accepted in its place.",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "observation_token"
+          ]
+        },
+        {
+          "properties": {
+            "control_token": {
+              "description": "The session's control token — accepted in place of the observation token (control includes observation).",
+              "type": "string"
+            },
+            "display_id": {
+              "type": "string"
+            },
+            "image_format": {
+              "type": "string"
+            },
+            "include_cursor": {
+              "type": "boolean"
+            },
+            "include_image": {
+              "description": "When true, the response carries the image as base64. Off by default so a plain `observe` stays cheap; adapters that need pixels (MCP, vision harnesses) turn it on.",
+              "type": "boolean"
+            },
+            "jpeg_quality": {
+              "format": "uint8",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "max_width": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "observation_token": {
+              "description": "The session's **observation token**. Required — observing captures the desktop; a session id alone grants no observation permission. A valid control token is accepted in its place.",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "control_token"
+          ]
+        }
+      ],
       "description": "`computer.observe` request.",
       "properties": {
         "control_token": {
@@ -949,7 +1146,7 @@
       "type": "object"
     },
     "RpcRequest": {
-      "description": "A JSON-RPC 2.0 request as received by the daemon.",
+      "description": "A JSON-RPC 2.0 request as received by the daemon.\n\n`Debug` is redacting by hand: `params` may carry capability tokens (`control_token` / `observation_token` / `admin_token`), so the derived form would print them. `{request:?}` in a log is always safe.",
       "properties": {
         "id": true,
         "jsonrpc": {
@@ -967,7 +1164,7 @@
       "type": "object"
     },
     "RpcResponse": {
-      "description": "A JSON-RPC 2.0 response written by the daemon.",
+      "description": "A JSON-RPC 2.0 response written by the daemon.\n\n`Debug` redacts `result`/`error.data` (the one-time `start` response carries both capability tokens in `result`).",
       "properties": {
         "error": {
           "$ref": "#/$defs/RpcError"
@@ -1033,6 +1230,126 @@
       "type": "string"
     },
     "SessionParams": {
+      "anyOf": [
+        {
+          "properties": {
+            "action": {
+              "const": "start"
+            }
+          }
+        },
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "action": {
+                  "$ref": "#/$defs/SessionAction"
+                },
+                "client_id": {
+                  "description": "Identity of the client performing the action; recorded on `start`.",
+                  "type": "string"
+                },
+                "client_instance_id": {
+                  "type": "string"
+                },
+                "client_name": {
+                  "type": "string"
+                },
+                "control_token": {
+                  "description": "The session's control token. Required for `pause`/`resume`/`takeover`/ `release`/`stop`; `start` does not need one. `status` needs either this or the observation token (full status is a sensitive read).",
+                  "type": "string"
+                },
+                "display_id": {
+                  "type": "string"
+                },
+                "observation_token": {
+                  "description": "The session's observation token — accepted for `status` in place of the control token.",
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "observation_token"
+              ]
+            },
+            {
+              "properties": {
+                "action": {
+                  "$ref": "#/$defs/SessionAction"
+                },
+                "client_id": {
+                  "description": "Identity of the client performing the action; recorded on `start`.",
+                  "type": "string"
+                },
+                "client_instance_id": {
+                  "type": "string"
+                },
+                "client_name": {
+                  "type": "string"
+                },
+                "control_token": {
+                  "description": "The session's control token. Required for `pause`/`resume`/`takeover`/ `release`/`stop`; `start` does not need one. `status` needs either this or the observation token (full status is a sensitive read).",
+                  "type": "string"
+                },
+                "display_id": {
+                  "type": "string"
+                },
+                "observation_token": {
+                  "description": "The session's observation token — accepted for `status` in place of the control token.",
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "control_token"
+              ]
+            }
+          ],
+          "properties": {
+            "action": {
+              "const": "status"
+            }
+          }
+        },
+        {
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/SessionAction"
+            },
+            "client_id": {
+              "description": "Identity of the client performing the action; recorded on `start`.",
+              "type": "string"
+            },
+            "client_instance_id": {
+              "type": "string"
+            },
+            "client_name": {
+              "type": "string"
+            },
+            "control_token": {
+              "description": "The session's control token. Required for `pause`/`resume`/`takeover`/ `release`/`stop`; `start` does not need one. `status` needs either this or the observation token (full status is a sensitive read).",
+              "type": "string"
+            },
+            "display_id": {
+              "type": "string"
+            },
+            "observation_token": {
+              "description": "The session's observation token — accepted for `status` in place of the control token.",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "control_token"
+          ]
+        }
+      ],
       "description": "`computer.session` request.",
       "properties": {
         "action": {
@@ -1216,6 +1533,9 @@
           "type": "string"
         }
       },
+      "required": [
+        "admin_token"
+      ],
       "type": "object"
     },
     "StabilizationInfo": {
@@ -1383,6 +1703,46 @@
       "type": "object"
     },
     "TraceExportParams": {
+      "anyOf": [
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "dest": {
+              "type": "string"
+            },
+            "observation_token": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "observation_token"
+          ]
+        },
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "dest": {
+              "type": "string"
+            },
+            "observation_token": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "control_token"
+          ]
+        }
+      ],
       "description": "`trace.export` request — exporting a trace requires an observation or control token.",
       "properties": {
         "control_token": {
@@ -1405,6 +1765,40 @@
       "type": "object"
     },
     "TraceGetParams": {
+      "anyOf": [
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "observation_token": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "observation_token"
+          ]
+        },
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "observation_token": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "control_token"
+          ]
+        }
+      ],
       "description": "`trace.get` / `trace.replay` request — trace contents are a sensitive read; an observation or control token is required.",
       "properties": {
         "control_token": {
@@ -1449,6 +1843,40 @@
       ]
     },
     "TraceReplayParams": {
+      "anyOf": [
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "observation_token": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "observation_token"
+          ]
+        },
+        {
+          "properties": {
+            "control_token": {
+              "type": "string"
+            },
+            "observation_token": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "control_token"
+          ]
+        }
+      ],
       "description": "`trace.replay` request (token-verified like `trace.get`).",
       "properties": {
         "control_token": {
@@ -1492,39 +1920,36 @@
       "type": "object"
     },
     "TraceSummary": {
-      "description": "`trace.list` entry.",
+      "description": "`trace.list` / `trace.summaries` entry — metadata only. The absolute filesystem path never crosses the wire (a path would leak the install layout and invite path-based probing); contents are read via `trace.get` and exported via `trace.export`, both token-gated.",
       "properties": {
-        "bytes": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
         },
-        "entries": {
+        "event_count": {
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
         },
-        "last_entry_at": {
-          "format": "date-time",
-          "type": "string"
-        },
-        "path": {
-          "type": "string"
-        },
         "session_id": {
           "type": "string"
         },
-        "started_at": {
-          "format": "date-time",
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "trace_id": {
+          "description": "Stable id of this trace. One trace per session — `trace_id` is the trace-file stem, which is currently the session id.",
           "type": "string"
         }
       },
       "required": [
-        "bytes",
-        "entries",
-        "path",
+        "created_at",
+        "event_count",
         "session_id",
-        "started_at"
+        "size_bytes",
+        "trace_id"
       ],
       "type": "object"
     },

@@ -9,9 +9,10 @@ use std::path::Path;
 
 use cu_core::security::SecretTokenHash;
 use cu_core::{
-    ActParams, CancelParams, CancelResult, CuError, InspectParams, ObserveParams, RequestKey,
-    RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams, SessionSummary, ShutdownParams,
-    TraceExportParams, TraceGetParams, TraceReplayParams, TraceSummary,
+    ActParams, CancelParams, CancelResult, CapabilityTokenParams, CuError, InspectParams,
+    ObserveParams, RequestKey, RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams,
+    SessionSummary, ShutdownParams, TraceExportParams, TraceGetParams, TraceReplayParams,
+    TraceSummary,
 };
 use cu_runtime::Runtime;
 use serde::de::DeserializeOwned;
@@ -77,6 +78,14 @@ pub async fn dispatch(
     });
     let params = req.params.clone().unwrap_or(serde_json::Value::Null);
 
+    // The daemon is stopping: refuse new work. The runtime sets the flag at
+    // the very start of shutdown and cancels in-flight batches, so a request
+    // that races the drain window gets a typed DAEMON_SHUTTING_DOWN instead
+    // of starting work it cannot finish.
+    if runtime.is_shutting_down() {
+        return error_response(id, CuError::DaemonShuttingDown);
+    }
+
     let result = match method.as_str() {
         // --- runtime introspection ---
         "runtime.health" => runtime.health().await,
@@ -114,10 +123,51 @@ pub async fn dispatch(
             })
         }
         "runtime.permissions" => runtime.permissions().await.and_then(to_result),
+        // Display count/identity is public (like `session.summary`); the
+        // *precise* desktop geometry below is a sensitive read.
         "runtime.displays" => runtime.displays().await.and_then(to_result),
-        "runtime.desktop_layout" => runtime.desktop_layout().await.and_then(to_result),
-        "runtime.pointer" => runtime.pointer_location().await.and_then(to_result),
-        "runtime.active_application" => runtime.active_application().await.and_then(to_result),
+        "runtime.desktop_layout" => {
+            let p: CapabilityTokenParams = match parse_params(&params) {
+                Ok(p) => p,
+                Err(e) => return error_response(id, e),
+            };
+            // Precise layout (display bounds, primary id) reveals the
+            // desktop's exact geometry — observation or control token only.
+            if let Err(e) =
+                runtime.verify_any_token(p.observation_token.as_deref(), p.control_token.as_deref())
+            {
+                return error_response(id, e);
+            }
+            runtime.desktop_layout().await.and_then(to_result)
+        }
+        "runtime.pointer" => {
+            let p: CapabilityTokenParams = match parse_params(&params) {
+                Ok(p) => p,
+                Err(e) => return error_response(id, e),
+            };
+            // Cursor location is a sensitive read — observation or control
+            // token only.
+            if let Err(e) =
+                runtime.verify_any_token(p.observation_token.as_deref(), p.control_token.as_deref())
+            {
+                return error_response(id, e);
+            }
+            runtime.pointer_location().await.and_then(to_result)
+        }
+        "runtime.active_application" => {
+            let p: CapabilityTokenParams = match parse_params(&params) {
+                Ok(p) => p,
+                Err(e) => return error_response(id, e),
+            };
+            // The active application/window title is a sensitive read —
+            // observation or control token only.
+            if let Err(e) =
+                runtime.verify_any_token(p.observation_token.as_deref(), p.control_token.as_deref())
+            {
+                return error_response(id, e);
+            }
+            runtime.active_application().await.and_then(to_result)
+        }
         "runtime.shutdown" => {
             // Only the daemon's admin token may shut it down. The token is
             // presented by the CLI (which read it from the admin token file);
@@ -241,16 +291,25 @@ pub async fn dispatch(
 
         // --- trace management ---
         // Trace contents are a sensitive read: every trace method verifies an
-        // observation or control token against the session's stored hashes
-        // BEFORE touching any file. A session-id-only caller gets
-        // OBSERVATION_TOKEN_REQUIRED and no file I/O happens.
+        // observation or control token BEFORE touching any file. A
+        // session-id-only caller gets OBSERVATION_TOKEN_REQUIRED and no file
+        // I/O happens.
         "trace.list" => {
-            // Only the trace *listing* (session ids, paths, sizes) of sessions
-            // whose identity the caller can prove… but a list inherently spans
-            // sessions. The list is a table of trace summaries — the same
-            // metadata `session.summary` already exposes publicly — so it stays
-            // tokenless, exactly like `session.summary`. Every entry's
-            // *content* access (get/export/replay) is token-verified.
+            // The listing spans sessions (it has no session_id), so it verifies
+            // the caller's capability against any session: a valid token
+            // proves a trusted client. The summaries are metadata only — the
+            // absolute filesystem path never crosses the wire. No token →
+            // OBSERVATION_TOKEN_REQUIRED, and the trace directory is not even
+            // scanned.
+            let p: CapabilityTokenParams = match parse_params(&params) {
+                Ok(p) => p,
+                Err(e) => return error_response(id, e),
+            };
+            if let Err(e) =
+                runtime.verify_any_token(p.observation_token.as_deref(), p.control_token.as_deref())
+            {
+                return error_response(id, e);
+            }
             cu_trace::list_traces(runtime.traces_dir())
                 .and_then(|list| to_result(serde_json::json!({ "traces": list })))
         }
@@ -319,7 +378,16 @@ pub async fn dispatch(
             cu_trace::replay_from_file(&p.session_id, &path).and_then(to_result)
         }
         "trace.summaries" => {
-            // Same public-metadata treatment as `trace.list`.
+            // Same token-gated, metadata-only treatment as `trace.list`.
+            let p: CapabilityTokenParams = match parse_params(&params) {
+                Ok(p) => p,
+                Err(e) => return error_response(id, e),
+            };
+            if let Err(e) =
+                runtime.verify_any_token(p.observation_token.as_deref(), p.control_token.as_deref())
+            {
+                return error_response(id, e);
+            }
             let list = match cu_trace::list_traces(runtime.traces_dir()) {
                 Ok(l) => l,
                 Err(e) => return error_response(id, e),
@@ -345,151 +413,10 @@ fn error_response(id: Option<serde_json::Value>, e: CuError) -> RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fakes::{test_admin, test_config, FakeDriver};
     use cu_core::{RpcRequest, SessionAction};
-    use cu_driver::{
-        ApplicationInfo, CaptureRequest, DesktopLayout, DisplayInfo, PermissionStatus, PointerInfo,
-    };
     use cu_runtime::{Runtime, RuntimeConfig};
     use std::sync::Arc;
-
-    /// A deterministic in-memory driver so the full dispatch path can be
-    /// exercised without a real display. Waits actually sleep (so in-flight
-    /// cancellation is observable); every execute is counted.
-    #[derive(Default)]
-    struct FakeDriver {
-        pub executes: std::sync::atomic::AtomicUsize,
-        /// Capture count — the observable side effect of `computer.observe`.
-        /// A rejected observe must leave this at zero.
-        pub captures: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl cu_driver::ComputerDriver for FakeDriver {
-        async fn list_displays(&self) -> Result<Vec<DisplayInfo>, CuError> {
-            Ok(vec![DisplayInfo {
-                id: "1".into(),
-                name: "fake".into(),
-                bounds: cu_core::DisplayBounds {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1280.0,
-                    height: 800.0,
-                },
-                pixel_width: 2560,
-                pixel_height: 1600,
-                scale_factor: 2.0,
-                is_main: true,
-            }])
-        }
-        async fn desktop_layout(&self) -> Result<DesktopLayout, CuError> {
-            Ok(DesktopLayout {
-                displays: self.list_displays().await?,
-                primary_id: "1".into(),
-            })
-        }
-        async fn capture(
-            &self,
-            request: CaptureRequest,
-        ) -> Result<cu_driver::CapturedFrame, CuError> {
-            self.captures
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            // A real (tiny) PNG so the inspect pixel-read path can decode it.
-            let png: &[u8] = &[
-                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
-                1, 8, 2, 0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99,
-                248, 207, 192, 0, 0, 3, 1, 1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68,
-                174, 66, 96, 130,
-            ];
-            std::fs::write(&request.output_path, png).unwrap();
-            Ok(cu_driver::CapturedFrame {
-                display_id: request.display_id,
-                width: 4,
-                height: 4,
-                scale_factor: 1.0,
-                bounds: cu_core::DisplayBounds {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 4.0,
-                    height: 4.0,
-                },
-                image_path: request.output_path,
-                image_bytes: png.to_vec(),
-                format: request.format,
-                active_application: None,
-                captured_at: chrono::Utc::now(),
-            })
-        }
-        async fn quick_snapshot(
-            &self,
-            display_id: &str,
-        ) -> Result<cu_driver::QuickSnapshot, CuError> {
-            Ok(cu_driver::QuickSnapshot {
-                thumbnail: vec![0u8; 64],
-                thumb_width: 8,
-                thumb_height: 8,
-                display_id: display_id.to_string(),
-                active_application: None,
-                captured_at: chrono::Utc::now(),
-            })
-        }
-        async fn execute(
-            &self,
-            action: &cu_driver::ResolvedAction,
-        ) -> Result<cu_driver::ActionResult, CuError> {
-            self.executes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let cu_driver::ResolvedAction::Wait { duration_ms } = action {
-                tokio::time::sleep(std::time::Duration::from_millis((*duration_ms).min(1000)))
-                    .await;
-            }
-            Ok(cu_driver::ActionResult {
-                success: true,
-                duration_ms: 1,
-                detail: None,
-            })
-        }
-        async fn permission_status(&self) -> Result<PermissionStatus, CuError> {
-            Ok(PermissionStatus {
-                screen_recording: true,
-                accessibility: true,
-            })
-        }
-        async fn active_application(&self) -> Result<Option<ApplicationInfo>, CuError> {
-            Ok(None)
-        }
-        async fn pointer_location(&self) -> Result<PointerInfo, CuError> {
-            Ok(PointerInfo {
-                location: cu_core::Point::new(0.0, 0.0),
-                display_id: Some("1".into()),
-            })
-        }
-        async fn shutdown(&self) -> Result<(), CuError> {
-            Ok(())
-        }
-    }
-
-    fn test_config() -> RuntimeConfig {
-        let dir = std::env::temp_dir().join(format!("cu-daemon-tests-{}", std::process::id()));
-        RuntimeConfig {
-            traces_dir: dir.join("traces"),
-            frames_dir: dir.join("frames"),
-            ..RuntimeConfig::default()
-        }
-    }
-
-    /// The daemon's admin credential for tests: one shared token/hash pair so
-    /// shutdown tests can present the token they verified against.
-    fn test_admin() -> (cu_core::security::DaemonAdminToken, SecretTokenHash) {
-        static ADMIN: std::sync::OnceLock<(cu_core::security::DaemonAdminToken, SecretTokenHash)> =
-            std::sync::OnceLock::new();
-        ADMIN
-            .get_or_init(|| {
-                let token = cu_core::security::generate_daemon_admin_token();
-                let hash = SecretTokenHash::from_token(&token);
-                (token, hash)
-            })
-            .clone()
-    }
 
     /// Dispatch one request as if it arrived on connection `conn`, against the
     /// shared test admin credential.
@@ -671,12 +598,11 @@ mod tests {
         let _ = &runtime;
         let _ = SessionAction::Start;
         let _ = TraceSummary {
+            trace_id: String::new(),
             session_id: String::new(),
-            path: String::new(),
-            entries: 0,
-            bytes: 0,
-            started_at: chrono::Utc::now(),
-            last_entry_at: None,
+            created_at: chrono::Utc::now(),
+            size_bytes: 0,
+            event_count: 0,
         };
     }
 
@@ -1369,9 +1295,26 @@ mod tests {
             "observation token must read a stopped session's trace"
         );
 
-        // The list itself is public metadata (like session.summary).
+        // The list is token-gated: it is no longer public (round 5 — a trace
+        // listing reveals which sessions ever ran on this machine).
         let resp = call(&rt, 1, "trace.list", 25, serde_json::Value::Null).await;
-        let list = resp.result.expect("trace.list is public");
+        assert_eq!(
+            error_code(&resp),
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024)),
+            "trace.list without a capability token must be refused"
+        );
+
+        // With the observation token it works — metadata only, no paths, no
+        // tokens.
+        let resp = call(
+            &rt,
+            1,
+            "trace.list",
+            26,
+            serde_json::json!({ "observation_token": observation }),
+        )
+        .await;
+        let list = resp.result.expect("trace.list with a token must succeed");
         let ids: Vec<&str> = list["traces"]
             .as_array()
             .unwrap()
@@ -1379,8 +1322,11 @@ mod tests {
             .map(|t| t["session_id"].as_str().unwrap())
             .collect();
         assert!(ids.contains(&sid.as_str()));
-        // …but list entries carry metadata only, never tokens.
         for entry in list["traces"].as_array().unwrap() {
+            assert!(
+                entry.get("path").is_none(),
+                "trace.list must never expose filesystem paths"
+            );
             assert!(entry.get("control_token").is_none());
             assert!(entry.get("observation_token").is_none());
         }
@@ -1429,6 +1375,72 @@ mod tests {
         )
         .await;
         assert!(resp.result.is_some(), "status with token must succeed");
+    }
+
+    /// Once the runtime begins shutting down, every dispatch is refused with
+    /// the typed DAEMON_SHUTTING_DOWN — the daemon never starts new work it
+    /// cannot finish.
+    #[tokio::test]
+    async fn dispatch_during_shutdown_returns_daemon_shutting_down() {
+        let rt = test_runtime().await;
+        let before = call(&rt, 1, "runtime.health", 1, serde_json::Value::Null).await;
+        assert!(before.result.is_some(), "health serves before shutdown");
+        rt.shutdown().await.expect("shutdown succeeds");
+        let resp = call(&rt, 1, "runtime.health", 2, serde_json::Value::Null).await;
+        let (code, _) = error_code(&resp).expect("an error response");
+        assert_eq!(code, "DAEMON_SHUTTING_DOWN");
+        // Even runtime.version is refused — the daemon is done serving.
+        let resp = call(&rt, 1, "runtime.version", 3, serde_json::Value::Null).await;
+        let (code, _) = error_code(&resp).expect("an error response");
+        assert_eq!(code, "DAEMON_SHUTTING_DOWN");
+    }
+
+    /// Graceful shutdown cancels in-flight action batches: a long-running
+    /// act is aborted the moment the daemon shuts down, and reports
+    /// CANCELLED (not a success, not a hang).
+    #[tokio::test]
+    async fn shutdown_cancels_in_flight_actions() {
+        let rt = test_runtime().await;
+        let (sid, ctrl, obs) = start_session(&rt, 1).await;
+        let frame = observe_frame(&rt, 1, &sid, &obs).await;
+        // An action batch that would take 2s — far longer than the test.
+        let act_rt = rt.clone();
+        let sid2 = sid.clone();
+        let ctrl2 = ctrl.clone();
+        let frame2 = frame.clone();
+        let act = tokio::spawn(async move {
+            call(
+                &act_rt,
+                1,
+                "computer.act",
+                10,
+                serde_json::json!({
+                    "session_id": sid2,
+                    "frame_id": frame2,
+                    "control_token": ctrl2,
+                    "actions": [{"type": "wait", "duration_ms": 2000}],
+                }),
+            )
+            .await
+        });
+        // Give the act time to register and start, then shut down.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        rt.shutdown().await.expect("shutdown succeeds");
+        let resp = act.await.expect("the act task finishes");
+        // Cancellation is reported *inside the result* (per-action
+        // `status: "cancelled"`), not as a JSON-RPC error — the batch did not
+        // fail, it was aborted.
+        let result = resp.result.expect("act returns a result");
+        assert_eq!(
+            result["executed"],
+            serde_json::json!(false),
+            "a cancelled batch must not report execution"
+        );
+        assert_eq!(
+            result["action_results"][0]["status"],
+            serde_json::json!("cancelled"),
+            "in-flight action must be cancelled by shutdown"
+        );
     }
 
     /// §三: runtime.shutdown is the daemon's kill switch — the admin token
@@ -1536,5 +1548,183 @@ mod tests {
             "a non-string admin_token is a malformed request"
         );
         assert!(!shutdown.is_cancelled());
+    }
+
+    /// §四.1: `trace.list` / `trace.summaries` are sensitive reads — no token →
+    /// OBSERVATION_TOKEN_REQUIRED, wrong token → INVALID_OBSERVATION_TOKEN,
+    /// observation token → success, control token → success. The trace
+    /// directory is not even scanned on the failure path.
+    #[tokio::test]
+    async fn trace_list_requires_a_capability_token() {
+        let (rt, _fake) = test_runtime_with_driver().await;
+        let (sid, token, observation) = start_and_observe(&rt, 1).await;
+
+        // 1) No token → OBSERVATION_TOKEN_REQUIRED.
+        let resp = call(&rt, 1, "trace.list", 1, serde_json::Value::Null).await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024))
+        );
+        let resp = call(&rt, 1, "trace.summaries", 2, serde_json::Value::Null).await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024))
+        );
+
+        // 2) Wrong token → INVALID_OBSERVATION_TOKEN (non-descriptive).
+        let resp = call(
+            &rt,
+            1,
+            "trace.list",
+            3,
+            serde_json::json!({ "observation_token": "wrong-token" }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_OBSERVATION_TOKEN", -32025))
+        );
+        let resp = call(
+            &rt,
+            1,
+            "trace.summaries",
+            4,
+            serde_json::json!({ "control_token": "wrong-token" }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_OBSERVATION_TOKEN", -32025))
+        );
+
+        // 3) Observation token → success; entries are metadata only.
+        let resp = call(
+            &rt,
+            1,
+            "trace.list",
+            5,
+            serde_json::json!({ "observation_token": observation }),
+        )
+        .await;
+        let list = resp.result.expect("observation token must list traces");
+        let ids: Vec<&str> = list["traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["session_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&sid.as_str()));
+        for entry in list["traces"].as_array().unwrap() {
+            assert!(
+                entry.get("path").is_none(),
+                "no filesystem paths on the wire"
+            );
+            assert_eq!(entry["event_count"], entry["event_count"]);
+            assert!(entry["size_bytes"].is_u64());
+        }
+
+        // 4) Control token → success too (control includes observation).
+        let resp = call(
+            &rt,
+            1,
+            "trace.summaries",
+            6,
+            serde_json::json!({ "control_token": token }),
+        )
+        .await;
+        assert!(resp.result.is_some(), "control token must also list traces");
+    }
+
+    /// §四.4/§四.5: `runtime.pointer`, `runtime.active_application` and
+    /// `runtime.desktop_layout` are sensitive reads. Without a token the
+    /// request is refused **before** any driver call — the driver counters
+    /// stay at zero. The observation token opens them; a wrong token is
+    /// refused with zero driver calls as well.
+    #[tokio::test]
+    async fn runtime_sensitive_reads_require_a_capability_token() {
+        let (rt, fake) = test_runtime_with_driver().await;
+        let (_sid, _token, observation) = start_and_observe(&rt, 1).await;
+
+        let driver_calls = |fake: &FakeDriver| {
+            (
+                fake.pointer_calls.load(std::sync::atomic::Ordering::SeqCst),
+                fake.active_app_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
+        };
+
+        // 1) No token → OBSERVATION_TOKEN_REQUIRED, zero driver calls.
+        for (method, id) in [
+            ("runtime.pointer", 1),
+            ("runtime.active_application", 2),
+            ("runtime.desktop_layout", 3),
+        ] {
+            let resp = call(&rt, 1, method, id, serde_json::Value::Null).await;
+            assert_eq!(
+                error_code(&resp),
+                Some(("OBSERVATION_TOKEN_REQUIRED", -32024)),
+                "{method} without a token must be refused"
+            );
+            assert_eq!(
+                driver_calls(&fake),
+                (0, 0),
+                "{method} must not touch the driver"
+            );
+        }
+
+        // 2) Wrong token → INVALID_OBSERVATION_TOKEN, zero driver calls.
+        let resp = call(
+            &rt,
+            1,
+            "runtime.pointer",
+            10,
+            serde_json::json!({ "observation_token": "wrong-token" }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_OBSERVATION_TOKEN", -32025))
+        );
+        assert_eq!(
+            driver_calls(&fake),
+            (0, 0),
+            "wrong token must not touch the driver"
+        );
+
+        // 3) Observation token → all three succeed, driver called once each.
+        let resp = call(
+            &rt,
+            1,
+            "runtime.pointer",
+            11,
+            serde_json::json!({ "observation_token": observation }),
+        )
+        .await;
+        assert!(resp.result.is_some(), "pointer with token must succeed");
+        let resp = call(
+            &rt,
+            1,
+            "runtime.active_application",
+            12,
+            serde_json::json!({ "observation_token": observation }),
+        )
+        .await;
+        assert!(
+            resp.result.is_some(),
+            "active_application with token must succeed"
+        );
+        let resp = call(
+            &rt,
+            1,
+            "runtime.desktop_layout",
+            13,
+            serde_json::json!({ "observation_token": observation }),
+        )
+        .await;
+        assert!(
+            resp.result.is_some(),
+            "desktop_layout with token must succeed"
+        );
+        assert_eq!(driver_calls(&fake), (1, 1));
     }
 }

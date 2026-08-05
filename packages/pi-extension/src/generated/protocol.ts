@@ -93,6 +93,23 @@ export type CoordinateSpace = "normalized_1000" | "image_pixels";
  */
 export type WaitPolicy = "none" | "fixed" | "until_stable";
 /**
+ * Shared token fields for **cross-session** sensitive reads: `runtime.pointer`, `runtime.active_application`, `runtime.desktop_layout`, `trace.list`, `trace.summaries`. Unlike the session-addressed reads these methods have no `session_id`, so any valid observation or control token is accepted — the token proves the caller is a trusted client of this daemon. No token → `OBSERVATION_TOKEN_REQUIRED`; a token matching nothing → `INVALID_OBSERVATION_TOKEN`.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "CapabilityTokenParams".
+ */
+export type CapabilityTokenParams =
+  | {
+      control_token?: string;
+      observation_token: string;
+      [k: string]: unknown;
+    }
+  | {
+      control_token: string;
+      observation_token?: string;
+      [k: string]: unknown;
+    };
+/**
  * Well-known structured error codes. These are the stable strings that appear in the `data.code` field of a JSON-RPC error response.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
@@ -132,7 +149,90 @@ export type ErrorCode =
   | "REQUEST_TIMEOUT"
   | "PROTOCOL_VERSION_MISMATCH"
   | "DAEMON_ADMIN_TOKEN_REQUIRED"
-  | "INVALID_DAEMON_ADMIN_TOKEN";
+  | "INVALID_DAEMON_ADMIN_TOKEN"
+  | "DAEMON_SHUTTING_DOWN";
+/**
+ * `computer.inspect` request.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "InspectParams".
+ */
+export type InspectParams =
+  | {
+      control_token?: string;
+      frame_id?: string;
+      /**
+       * Observation (or control) token — required; a session id alone grants no observation permission.
+       */
+      observation_token: string;
+      region?: Region1;
+      scale?: number;
+      session_id?: string;
+      [k: string]: unknown;
+    }
+  | {
+      control_token: string;
+      frame_id?: string;
+      /**
+       * Observation (or control) token — required; a session id alone grants no observation permission.
+       */
+      observation_token?: string;
+      region?: Region1;
+      scale?: number;
+      session_id?: string;
+      [k: string]: unknown;
+    };
+/**
+ * `computer.observe` request.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "ObserveParams".
+ */
+export type ObserveParams =
+  | {
+      /**
+       * The session's control token — accepted in place of the observation token (control includes observation).
+       */
+      control_token?: string;
+      display_id?: string;
+      image_format?: string;
+      include_cursor?: boolean;
+      /**
+       * When true, the response carries the image as base64. Off by default so a plain `observe` stays cheap; adapters that need pixels (MCP, vision harnesses) turn it on.
+       */
+      include_image?: boolean;
+      jpeg_quality?: number;
+      max_width?: number;
+      /**
+       * The session's **observation token**. Required — observing captures the desktop; a session id alone grants no observation permission. A valid control token is accepted in its place.
+       */
+      observation_token: string;
+      session_id?: string;
+      target?: string;
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * The session's control token — accepted in place of the observation token (control includes observation).
+       */
+      control_token: string;
+      display_id?: string;
+      image_format?: string;
+      include_cursor?: boolean;
+      /**
+       * When true, the response carries the image as base64. Off by default so a plain `observe` stays cheap; adapters that need pixels (MCP, vision harnesses) turn it on.
+       */
+      include_image?: boolean;
+      jpeg_quality?: number;
+      max_width?: number;
+      /**
+       * The session's **observation token**. Required — observing captures the desktop; a session id alone grants no observation permission. A valid control token is accepted in its place.
+       */
+      observation_token?: string;
+      session_id?: string;
+      target?: string;
+      [k: string]: unknown;
+    };
 /**
  * Which macOS permission is missing. Used to generate actionable guidance.
  *
@@ -147,6 +247,79 @@ export type PermissionKind = "screen_recording" | "accessibility";
  * via the `definition` "SessionAction".
  */
 export type SessionAction = "start" | "status" | "pause" | "resume" | "stop" | "takeover" | "release";
+/**
+ * `computer.session` request.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "SessionParams".
+ */
+export type SessionParams =
+  | {
+      action?: "start";
+      [k: string]: unknown;
+    }
+  | (
+      | {
+          action?: SessionAction;
+          /**
+           * Identity of the client performing the action; recorded on `start`.
+           */
+          client_id?: string;
+          client_instance_id?: string;
+          client_name?: string;
+          /**
+           * The session's control token. Required for `pause`/`resume`/`takeover`/ `release`/`stop`; `start` does not need one. `status` needs either this or the observation token (full status is a sensitive read).
+           */
+          control_token?: string;
+          display_id?: string;
+          /**
+           * The session's observation token — accepted for `status` in place of the control token.
+           */
+          observation_token: string;
+          session_id?: string;
+          [k: string]: unknown;
+        }
+      | {
+          action?: SessionAction;
+          /**
+           * Identity of the client performing the action; recorded on `start`.
+           */
+          client_id?: string;
+          client_instance_id?: string;
+          client_name?: string;
+          /**
+           * The session's control token. Required for `pause`/`resume`/`takeover`/ `release`/`stop`; `start` does not need one. `status` needs either this or the observation token (full status is a sensitive read).
+           */
+          control_token: string;
+          display_id?: string;
+          /**
+           * The session's observation token — accepted for `status` in place of the control token.
+           */
+          observation_token?: string;
+          session_id?: string;
+          [k: string]: unknown;
+        }
+    )
+  | {
+      action?: SessionAction;
+      /**
+       * Identity of the client performing the action; recorded on `start`.
+       */
+      client_id?: string;
+      client_instance_id?: string;
+      client_name?: string;
+      /**
+       * The session's control token. Required for `pause`/`resume`/`takeover`/ `release`/`stop`; `start` does not need one. `status` needs either this or the observation token (full status is a sensitive read).
+       */
+      control_token: string;
+      display_id?: string;
+      /**
+       * The session's observation token — accepted for `status` in place of the control token.
+       */
+      observation_token?: string;
+      session_id?: string;
+      [k: string]: unknown;
+    };
 /**
  * Lifecycle state of a computer-use session.
  *
@@ -169,12 +342,71 @@ export type StaleFramePolicy = "Strict" | "VisualMatch";
  */
 export type TextInputMethod = "keyboard" | "clipboard";
 /**
+ * `trace.export` request — exporting a trace requires an observation or control token.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "TraceExportParams".
+ */
+export type TraceExportParams =
+  | {
+      control_token?: string;
+      dest?: string;
+      observation_token: string;
+      session_id?: string;
+      [k: string]: unknown;
+    }
+  | {
+      control_token: string;
+      dest?: string;
+      observation_token?: string;
+      session_id?: string;
+      [k: string]: unknown;
+    };
+/**
+ * `trace.get` / `trace.replay` request — trace contents are a sensitive read; an observation or control token is required.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "TraceGetParams".
+ */
+export type TraceGetParams =
+  | {
+      control_token?: string;
+      observation_token: string;
+      session_id?: string;
+      [k: string]: unknown;
+    }
+  | {
+      control_token: string;
+      observation_token?: string;
+      session_id?: string;
+      [k: string]: unknown;
+    };
+/**
  * How strictly traces are recorded.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
  * via the `definition` "TraceMode".
  */
 export type TraceMode = "Required" | "BestEffort" | "Disabled";
+/**
+ * `trace.replay` request (token-verified like `trace.get`).
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "TraceReplayParams".
+ */
+export type TraceReplayParams =
+  | {
+      control_token?: string;
+      observation_token: string;
+      session_id?: string;
+      [k: string]: unknown;
+    }
+  | {
+      control_token: string;
+      observation_token?: string;
+      session_id?: string;
+      [k: string]: unknown;
+    };
 
 /**
  * JSON-RPC 2.0 wire protocol between the Computer Use daemon and its adapters (SDK, MCP server, Pi extension). Generated from the Rust wire types — edit the Rust source, then run `pnpm generate:protocol`. Capability tokens (control / observation / admin) are 256-bit secrets issued exactly once; the daemon stores only their SHA-256 hashes and never repeats them in responses.
@@ -193,7 +425,7 @@ export interface ActParams {
   /**
    * The session's control token. Required: without it the batch is rejected before any action is parsed, queued, or executed.
    */
-  control_token?: string;
+  control_token: string;
   fixed_wait_ms?: number;
   frame_id: string;
   policy_context?: string;
@@ -329,7 +561,7 @@ export interface CancelParams {
   /**
    * The session's control token — required; cancelling is a mutating op.
    */
-  control_token?: string;
+  control_token: string;
   request_id?: unknown;
   session_id: string;
   [k: string]: unknown;
@@ -406,24 +638,6 @@ export interface Region {
   [k: string]: unknown;
 }
 /**
- * `computer.inspect` request.
- *
- * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
- * via the `definition` "InspectParams".
- */
-export interface InspectParams {
-  control_token?: string;
-  frame_id: string;
-  /**
-   * Observation (or control) token — required; a session id alone grants no observation permission.
-   */
-  observation_token?: string;
-  region: Region1;
-  scale?: number;
-  session_id: string;
-  [k: string]: unknown;
-}
-/**
  * A rectangle expressed in one of the image-relative coordinate spaces.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
@@ -451,34 +665,6 @@ export interface InspectResult {
   mapping: InspectMapping;
   session_id: string;
   width: number;
-  [k: string]: unknown;
-}
-/**
- * `computer.observe` request.
- *
- * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
- * via the `definition` "ObserveParams".
- */
-export interface ObserveParams {
-  /**
-   * The session's control token — accepted in place of the observation token (control includes observation).
-   */
-  control_token?: string;
-  display_id?: string;
-  image_format?: string;
-  include_cursor?: boolean;
-  /**
-   * When true, the response carries the image as base64. Off by default so a plain `observe` stays cheap; adapters that need pixels (MCP, vision harnesses) turn it on.
-   */
-  include_image?: boolean;
-  jpeg_quality?: number;
-  max_width?: number;
-  /**
-   * The session's **observation token**. Required — observing captures the desktop; a session id alone grants no observation permission. A valid control token is accepted in its place.
-   */
-  observation_token?: string;
-  session_id?: string;
-  target?: string;
   [k: string]: unknown;
 }
 /**
@@ -517,6 +703,8 @@ export interface RpcError {
 /**
  * A JSON-RPC 2.0 request as received by the daemon.
  *
+ * `Debug` is redacting by hand: `params` may carry capability tokens (`control_token` / `observation_token` / `admin_token`), so the derived form would print them. `{request:?}` in a log is always safe.
+ *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
  * via the `definition` "RpcRequest".
  */
@@ -529,6 +717,8 @@ export interface RpcRequest {
 }
 /**
  * A JSON-RPC 2.0 response written by the daemon.
+ *
+ * `Debug` redacts `result`/`error.data` (the one-time `start` response carries both capability tokens in `result`).
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
  * via the `definition` "RpcResponse".
@@ -558,32 +748,6 @@ export interface RuntimeVersionResult {
    * Wire name is `runtime_version` (the protocol spec's field name); the Rust field stays `version` to avoid `version.version`-style confusion.
    */
   runtime_version: string;
-  [k: string]: unknown;
-}
-/**
- * `computer.session` request.
- *
- * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
- * via the `definition` "SessionParams".
- */
-export interface SessionParams {
-  action: SessionAction;
-  /**
-   * Identity of the client performing the action; recorded on `start`.
-   */
-  client_id?: string;
-  client_instance_id?: string;
-  client_name?: string;
-  /**
-   * The session's control token. Required for `pause`/`resume`/`takeover`/ `release`/`stop`; `start` does not need one. `status` needs either this or the observation token (full status is a sensitive read).
-   */
-  control_token?: string;
-  display_id?: string;
-  /**
-   * The session's observation token — accepted for `status` in place of the control token.
-   */
-  observation_token?: string;
-  session_id?: string;
   [k: string]: unknown;
 }
 /**
@@ -658,7 +822,7 @@ export interface ShutdownParams {
   /**
    * The daemon admin token (per-install credential held by the daemon manager — the CLI / LaunchAgent). Ordinary clients never hold it.
    */
-  admin_token?: string;
+  admin_token: string;
   [k: string]: unknown;
 }
 /**
@@ -713,43 +877,6 @@ export interface TraceExport {
   [k: string]: unknown;
 }
 /**
- * `trace.export` request — exporting a trace requires an observation or control token.
- *
- * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
- * via the `definition` "TraceExportParams".
- */
-export interface TraceExportParams {
-  control_token?: string;
-  dest: string;
-  observation_token?: string;
-  session_id: string;
-  [k: string]: unknown;
-}
-/**
- * `trace.get` / `trace.replay` request — trace contents are a sensitive read; an observation or control token is required.
- *
- * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
- * via the `definition` "TraceGetParams".
- */
-export interface TraceGetParams {
-  control_token?: string;
-  observation_token?: string;
-  session_id: string;
-  [k: string]: unknown;
-}
-/**
- * `trace.replay` request (token-verified like `trace.get`).
- *
- * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
- * via the `definition` "TraceReplayParams".
- */
-export interface TraceReplayParams {
-  control_token?: string;
-  observation_token?: string;
-  session_id: string;
-  [k: string]: unknown;
-}
-/**
  * Recording status of the session's trace for one `computer.act` batch.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
@@ -771,18 +898,20 @@ export interface TraceReport1 {
   [k: string]: unknown;
 }
 /**
- * `trace.list` entry.
+ * `trace.list` / `trace.summaries` entry — metadata only. The absolute filesystem path never crosses the wire (a path would leak the install layout and invite path-based probing); contents are read via `trace.get` and exported via `trace.export`, both token-gated.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
  * via the `definition` "TraceSummary".
  */
 export interface TraceSummary {
-  bytes: number;
-  entries: number;
-  last_entry_at?: string;
-  path: string;
+  created_at: string;
+  event_count: number;
   session_id: string;
-  started_at: string;
+  size_bytes: number;
+  /**
+   * Stable id of this trace. One trace per session — `trace_id` is the trace-file stem, which is currently the session id.
+   */
+  trace_id: string;
   [k: string]: unknown;
 }
 

@@ -67,32 +67,35 @@ async function getClient(): Promise<ComputerUseClient> {
 
 /**
  * What to do when a session owned by *another* client is already active.
- * - `reject` (default): refuse to use it — the daemon answers the start
- *   attempt with CONTROL_LOCKED, carrying the owner's identity (never a token).
- * - `read_only`: observe the existing session, but never act on or stop it —
- *   this extension holds no token for it (the daemon refuses mutating
- *   requests without one).
- * A `start_new` policy is deliberately not implemented: the runtime holds a
- * single active-session control lock, so a second session cannot exist.
- * `attach_with_token` is not offered either — Pi has no way to obtain another
- * client's token, and attaching without one would be silently powerless.
+ * Only `reject` (the default) exists: the start attempt is refused and the
+ * daemon's CONTROL_LOCKED error (with the owner's identity, never a token)
+ * surfaces.
+ *
+ * The pre-0.3 observe-only policies were removed: a read-only attach without
+ * the foreign session's observation token grants nothing (the daemon refuses
+ * every sensitive read without a capability), so it was silently powerless
+ * at best and misleading at worst. Setting
+ * `COMPUTER_USE_EXISTING_SESSION_POLICY=read_only` (or the older `attach`)
+ * still configures the *daemon* to refuse — the value is honored with a
+ * deprecation warning and behaves exactly like `reject`. `attach_with_token`
+ * is not offered either — Pi has no way to obtain another client's token.
  */
-type ExistingSessionPolicy = "reject" | "read_only";
+type ExistingSessionPolicy = "reject";
 
 function existingSessionPolicy(): ExistingSessionPolicy {
   const v = process.env.COMPUTER_USE_EXISTING_SESSION_POLICY;
   if (v === "read_only") {
-    return "read_only";
-  }
-  if (v === "attach") {
-    // `attach` was the pre-0.2 name for observe-only attachment; `read_only`
-    // is clearer (attachment grants no control — the daemon refuses mutating
-    // calls without a control token). Keep accepting the old value with a
-    // warning so existing configs don't silently change behavior.
+    // Removed in 0.3: observe-only attachment without the foreign session's
+    // observation token was refused by the daemon anyway. Configs that set it
+    // now get the same `reject` behavior, loudly.
     console.warn(
-      "COMPUTER_USE_EXISTING_SESSION_POLICY=attach is deprecated; use read_only instead",
+      "COMPUTER_USE_EXISTING_SESSION_POLICY=read_only is deprecated and removed; treating it as reject (the default). A read-only attach without the session's observation token grants nothing.",
     );
-    return "read_only";
+  } else if (v === "attach") {
+    // `attach` was the pre-0.2 name for the removed read-only behavior.
+    console.warn(
+      "COMPUTER_USE_EXISTING_SESSION_POLICY=attach is deprecated and removed; treating it as reject (the default).",
+    );
   }
   return "reject";
 }

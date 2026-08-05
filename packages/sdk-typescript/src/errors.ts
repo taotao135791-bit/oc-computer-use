@@ -59,6 +59,16 @@ export const ERROR_CODES = {
   TRACE_UNAVAILABLE: "TRACE_ERROR",
   DRIVER_ERROR: "DRIVER_ERROR",
   UNSUPPORTED: "UNSUPPORTED",
+  /** A sensitive read was attempted without an observation/control token. */
+  OBSERVATION_TOKEN_REQUIRED: "OBSERVATION_TOKEN_REQUIRED",
+  /** An observation token was presented but did not verify (never says why). */
+  INVALID_OBSERVATION_TOKEN: "INVALID_OBSERVATION_TOKEN",
+  /** `runtime.shutdown` requires the daemon admin token, not a session token. */
+  DAEMON_ADMIN_TOKEN_REQUIRED: "DAEMON_ADMIN_TOKEN_REQUIRED",
+  /** An admin token was presented but did not verify (never says why). */
+  INVALID_DAEMON_ADMIN_TOKEN: "INVALID_DAEMON_ADMIN_TOKEN",
+  /** The daemon is shutting down; retry once it is back up. */
+  DAEMON_SHUTTING_DOWN: "DAEMON_SHUTTING_DOWN",
 } as const;
 
 export type ErrorCodeName = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
@@ -92,6 +102,11 @@ const JSONRPC_CODE_TO_NAME: Record<number, ErrorCodeName> = {
   [-32021]: ERROR_CODES.SESSION_STOPPED,
   [-32022]: ERROR_CODES.REQUEST_TIMEOUT,
   [-32023]: ERROR_CODES.PROTOCOL_VERSION_MISMATCH,
+  [-32024]: ERROR_CODES.OBSERVATION_TOKEN_REQUIRED,
+  [-32025]: ERROR_CODES.INVALID_OBSERVATION_TOKEN,
+  [-32026]: ERROR_CODES.DAEMON_ADMIN_TOKEN_REQUIRED,
+  [-32027]: ERROR_CODES.INVALID_DAEMON_ADMIN_TOKEN,
+  [-32028]: ERROR_CODES.DAEMON_SHUTTING_DOWN,
 };
 
 /** Map a numeric JSON-RPC code to its machine-readable name. */

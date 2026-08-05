@@ -69,6 +69,9 @@ pub enum ErrorCode {
     /// An admin token was presented for `runtime.shutdown` but did not verify.
     /// Deliberately non-descriptive.
     InvalidDaemonAdminToken,
+    /// The daemon is shutting down: new requests are refused until it exits.
+    /// In-flight work was cancelled (or is draining within the grace period).
+    DaemonShuttingDown,
 }
 
 impl ErrorCode {
@@ -109,6 +112,7 @@ impl ErrorCode {
             InvalidObservationToken => -32025,
             DaemonAdminTokenRequired => -32026,
             InvalidDaemonAdminToken => -32027,
+            DaemonShuttingDown => -32028,
         }
     }
 
@@ -147,6 +151,7 @@ impl ErrorCode {
             ProtocolVersionMismatch => "PROTOCOL_VERSION_MISMATCH",
             DaemonAdminTokenRequired => "DAEMON_ADMIN_TOKEN_REQUIRED",
             InvalidDaemonAdminToken => "INVALID_DAEMON_ADMIN_TOKEN",
+            DaemonShuttingDown => "DAEMON_SHUTTING_DOWN",
         }
     }
 }
@@ -288,6 +293,9 @@ pub enum CuError {
     /// non-descriptive.
     #[error("Invalid daemon admin token.")]
     InvalidDaemonAdminToken,
+    /// The daemon is shutting down; this request was refused.
+    #[error("The daemon is shutting down. Retry once it is back up.")]
+    DaemonShuttingDown,
 }
 
 impl CuError {
@@ -326,6 +334,7 @@ impl CuError {
             Unsupported(_) => ErrorCode::Unsupported,
             DaemonAdminTokenRequired => ErrorCode::DaemonAdminTokenRequired,
             InvalidDaemonAdminToken => ErrorCode::InvalidDaemonAdminToken,
+            DaemonShuttingDown => ErrorCode::DaemonShuttingDown,
         }
     }
 
@@ -478,6 +487,21 @@ mod tests {
         let data = err.to_error_data();
         assert_eq!(data["code"], "ACTION_TIMEOUT");
         assert_eq!(err.code(), ErrorCode::ActionTimeout);
+    }
+
+    #[test]
+    fn shutting_down_error_has_stable_code() {
+        assert_eq!(
+            ErrorCode::DaemonShuttingDown.as_str(),
+            "DAEMON_SHUTTING_DOWN"
+        );
+        assert_eq!(ErrorCode::DaemonShuttingDown.jsonrpc_code(), -32028);
+        let err = CuError::DaemonShuttingDown;
+        assert_eq!(err.code(), ErrorCode::DaemonShuttingDown);
+        assert_eq!(err.to_error_data()["code"], "DAEMON_SHUTTING_DOWN");
+        let json = err.to_jsonrpc_error(&serde_json::json!(7));
+        assert_eq!(json["error"]["code"], -32028);
+        assert_eq!(json["error"]["data"]["code"], "DAEMON_SHUTTING_DOWN");
     }
 
     #[test]

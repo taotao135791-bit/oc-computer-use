@@ -21,11 +21,11 @@ use cu_core::errors::{
     BoundsDetail, ConfirmationDetail, ErrorCode, PermissionIssue, PermissionKind, StaleFrameDetail,
 };
 use cu_core::protocol::{
-    ActParams, ActResult, ActionResultReport, CancelParams, CancelResult, ClientInfo,
-    InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult, RpcError,
-    RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams, SessionResult, SessionSummary,
-    ShutdownParams, StabilizationInfo, TraceEntry, TraceExport, TraceExportParams, TraceGetParams,
-    TraceReplayParams, TraceReport, TraceSummary, JSONRPC_VERSION,
+    ActParams, ActResult, ActionResultReport, CancelParams, CancelResult, CapabilityTokenParams,
+    ClientInfo, InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult,
+    RpcError, RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams, SessionResult,
+    SessionSummary, ShutdownParams, StabilizationInfo, TraceEntry, TraceExport, TraceExportParams,
+    TraceGetParams, TraceReplayParams, TraceReport, TraceSummary, JSONRPC_VERSION,
 };
 use cu_core::security::{
     MAX_CLIENT_PROTOCOL_VERSION, MIN_CLIENT_PROTOCOL_VERSION, PROTOCOL_VERSION,
@@ -76,6 +76,27 @@ const ALWAYS_PRESENT: &[(&str, &[&str])] = &[(
         "message",
     ],
 )];
+
+/// **Control-only** requests: the params are meaningless (and the daemon
+/// refuses them) without the session's control token, so the schema must
+/// require `control_token`.
+const CONTROL_ONLY: &[&str] = &["ActParams", "CancelParams"];
+
+/// **Observation-or-control** requests: sensitive reads whose params carry
+/// both token slots. The schema must express the one-of requirement — at
+/// least one of `observation_token` / `control_token` is required (the daemon
+/// refuses both-missing with OBSERVATION_TOKEN_REQUIRED and a mismatch with
+/// INVALID_OBSERVATION_TOKEN). These are the session-addressed reads
+/// (`ObserveParams`, `InspectParams`, the trace reads) plus the cross-session
+/// capability-token reads (`CapabilityTokenParams`).
+const OBSERVATION_ONE_OF: &[&str] = &[
+    "ObserveParams",
+    "InspectParams",
+    "TraceGetParams",
+    "TraceExportParams",
+    "TraceReplayParams",
+    "CapabilityTokenParams",
+];
 
 /// Drop the `null` alternative from an optional property schema (the wire
 /// omits `skip_serializing_if` fields entirely; they are never `null`).
@@ -128,11 +149,114 @@ fn is_unconstrained_value(v: &Value) -> bool {
     map.keys().all(|k| k == "description")
 }
 
+/// Assert the capability requirements the daemon actually enforces into the
+/// schema (the derive cannot express cross-field requirements):
+///
+/// - `CONTROL_ONLY` defs get `required: ["control_token"]`;
+/// - `OBSERVATION_ONE_OF` defs get
+///   `anyOf: [{required:[observation_token]}, {required:[control_token]}]`;
+/// - `ShutdownParams` gets `required: ["admin_token"]`;
+/// - `SessionParams` gets the action-conditional rule (see below).
+///
+/// The requirements live here, next to the wire types, so the machine-readable
+/// schema and the service behave identically — a schema violation is a
+/// `INVALID_PARAMS`, and both refusal paths are exercised by tests.
+fn assert_capability_requirements(def_name: &str, map: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    let mut required: Vec<String> = map
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|r| {
+            r.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if CONTROL_ONLY.contains(&def_name)
+        && map.contains_key("properties")
+        && !required.contains(&"control_token".to_string())
+    {
+        required.push("control_token".into());
+        changed = true;
+    }
+    if OBSERVATION_ONE_OF.contains(&def_name) && map.contains_key("properties") {
+        // Each branch carries a **full copy** of the property schemas with its
+        // token required, so TypeScript generation keeps every field on both
+        // variants (a bare `required` branch would make
+        // json-schema-to-typescript drop the whole property set).
+        let props = map
+            .get("properties")
+            .cloned()
+            .unwrap_or(Value::Object(Map::new()));
+        let mut obs_branch = json!({ "required": ["observation_token"] });
+        let mut ctl_branch = json!({ "required": ["control_token"] });
+        obs_branch["properties"] = props.clone();
+        ctl_branch["properties"] = props;
+        map.insert("anyOf".into(), Value::Array(vec![obs_branch, ctl_branch]));
+        changed = true;
+    }
+    if def_name == "ShutdownParams"
+        && map.contains_key("properties")
+        && !required.contains(&"admin_token".to_string())
+    {
+        required.push("admin_token".into());
+        changed = true;
+    }
+    if def_name == "SessionParams" {
+        // Action-conditional capability rules:
+        //   start              → no token (the start response issues them)
+        //   status             → observation **or** control token (sensitive read)
+        //   pause/resume/takeover/release/stop → control token (mutations)
+        // A tokenless `status` or mutation violates the schema exactly as the
+        // daemon refuses it at runtime. Branches carry property schemas so
+        // TypeScript generation keeps every field.
+        let props = map
+            .get("properties")
+            .cloned()
+            .unwrap_or(Value::Object(Map::new()));
+        // status → observation **or** control token; the branch carries the
+        // full property set with its token required (TypeScript generation
+        // keeps every field on both variants).
+        let mut status_branch = json!({
+            "properties": { "action": { "const": "status" } },
+            "anyOf": [
+                { "required": ["observation_token"] },
+                { "required": ["control_token"] },
+            ],
+        });
+        status_branch["anyOf"][0]["properties"] = props.clone();
+        status_branch["anyOf"][1]["properties"] = props.clone();
+        // All other (mutating) actions → control token, full property set.
+        let mut control_branch = json!({ "required": ["control_token"] });
+        control_branch["properties"] = props;
+        map.insert(
+            "anyOf".into(),
+            Value::Array(vec![
+                json!({ "properties": { "action": { "const": "start" } } }),
+                status_branch,
+                control_branch,
+            ]),
+        );
+        changed = true;
+    }
+
+    if changed && !required.is_empty() {
+        map.insert(
+            "required".into(),
+            Value::Array(required.into_iter().map(Value::String).collect()),
+        );
+    }
+    changed
+}
+
 /// Post-process one `$defs` entry so the emitted schema matches the actual
 /// wire semantics (which the derive cannot always express):
 /// - `Option` fields with `skip_serializing_if` are optional and never `null`;
 /// - `ALWAYS_PRESENT` fields are required (even though `null`-typed);
-/// - `serde_json::Value` fields are unconstrained JSON, not "any object".
+/// - `serde_json::Value` fields are unconstrained JSON, not "any object";
+/// - capability-token requirements are asserted (see
+///   [`assert_capability_requirements`]).
 fn fixup_def(def_name: &str, v: &mut Value) {
     let Value::Object(map) = v else { return };
     let mut required: Vec<String> = map
@@ -167,6 +291,9 @@ fn fixup_def(def_name: &str, v: &mut Value) {
             Value::Array(required.into_iter().map(Value::String).collect()),
         );
     }
+    // Capability requirements are asserted after the property fixups so the
+    // `properties` object (needed for the field-presence checks) is final.
+    assert_capability_requirements(def_name, map);
 }
 
 /// schemars 0.8 emits draft-07 tuple form (`items: [s1, s2]`) even under
@@ -236,6 +363,9 @@ pub fn build_protocol_schema() -> Value {
     // Cancel.
     register!(gen, CancelParams);
     register!(gen, CancelResult);
+    // Cross-session sensitive reads (runtime.pointer / active_application /
+    // desktop_layout / trace.list / trace.summaries).
+    register!(gen, CapabilityTokenParams);
     // Traces.
     register!(gen, TraceGetParams);
     register!(gen, TraceExportParams);

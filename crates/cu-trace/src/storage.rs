@@ -32,7 +32,7 @@ pub fn list_traces(dir: &Path) -> Result<Vec<TraceSummary>, CuError> {
             out.push(summary);
         }
     }
-    out.sort_by_key(|b| std::cmp::Reverse(b.started_at));
+    out.sort_by_key(|b| std::cmp::Reverse(b.created_at));
     Ok(out)
 }
 
@@ -48,34 +48,31 @@ fn summarize(path: &Path) -> Result<Option<TraceSummary>, CuError> {
     }
     // Read first and last non-empty line to recover timestamps cheaply.
     let content = std::fs::read_to_string(path).map_err(|e| CuError::Trace(e.to_string()))?;
-    let mut entries = 0usize;
+    let mut event_count = 0usize;
     let mut started_at = meta
         .modified()
         .ok()
         .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok());
-    let mut last_entry_at = None;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if entries == 0 {
+        if event_count == 0 {
             if let Ok(e) = serde_json::from_str::<TraceEntry>(line) {
                 started_at = Some(ts_to_duration(&e.ts));
             }
         }
-        if let Ok(e) = serde_json::from_str::<TraceEntry>(line) {
-            last_entry_at = Some(e.ts);
-        }
-        entries += 1;
+        event_count += 1;
     }
     Ok(Some(TraceSummary {
+        // One trace per session; the trace id is the file stem (the session
+        // id). The filesystem path itself never leaves the daemon.
+        trace_id: session_id.clone(),
         session_id,
-        path: path.to_string_lossy().to_string(),
-        entries,
-        bytes: meta.len(),
-        started_at: duration_to_ts(started_at),
-        last_entry_at,
+        created_at: duration_to_ts(started_at),
+        size_bytes: meta.len(),
+        event_count,
     }))
 }
 
@@ -134,7 +131,7 @@ pub fn prune_old_traces(dir: &Path, retention_days: u64) -> Result<usize, CuErro
             continue;
         }
         if let Some(summary) = summarize(&path)? {
-            if now.signed_duration_since(summary.started_at) > cutoff {
+            if now.signed_duration_since(summary.created_at) > cutoff {
                 std::fs::remove_file(&path).map_err(|e| CuError::Trace(e.to_string()))?;
                 removed += 1;
             }
@@ -162,9 +159,15 @@ mod tests {
         let list = list_traces(dir.path()).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].session_id, "s_list");
-        assert_eq!(list[0].entries, 1);
+        assert_eq!(
+            list[0].trace_id, "s_list",
+            "one trace per session, id = file stem"
+        );
+        assert_eq!(list[0].event_count, 1);
+        assert!(list[0].size_bytes > 0);
 
-        let entries = read_trace(Path::new(&list[0].path)).unwrap();
+        // The summary carries no filesystem path — paths never cross the wire.
+        let entries = read_trace(&dir.path().join("s_list.jsonl")).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].event, "session.start");
     }

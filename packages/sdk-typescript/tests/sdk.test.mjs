@@ -122,20 +122,27 @@ test("aborting an in-flight request notifies the daemon with a precise computer.
   const fake = startFakeDaemon();
   const client = await connect({ socketPath: fake.socketPath });
   try {
+    // The cancel chain is authorized by the session's control token — a real
+    // client holds one for the sessions it started, so start one first.
+    const started = await client.session("start", { display_id: "1" });
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 20);
-    const err = await client.request("hang", { session_id: "s1" }, { signal: ac.signal }).catch((e) => e);
+    const err = await client
+      .request("hang", { session_id: started.session_id }, { signal: ac.signal })
+      .catch((e) => e);
     assert.ok(err instanceof AbortError);
     // The full cancel chain: the daemon must receive a fire-and-forget
     // computer.cancel for the session so the server-side batch stops too.
     await new Promise((r) => setTimeout(r, 50));
     const cancelReq = fake.requests.find((r) => r.method === "computer.cancel");
     assert.ok(cancelReq, "expected a computer.cancel notify after abort");
-    assert.equal(cancelReq.params.session_id, "s1");
-    // Precision: the cancel pins the aborted request's own id (2 — id 1 was
-    // connect()'s protocol-version check) on this connection, so an abort can
-    // never cancel a different client's request with the same id.
-    assert.equal(cancelReq.params.request_id, 2);
+    assert.equal(cancelReq.params.session_id, started.session_id);
+    assert.equal(cancelReq.params.control_token, START_TOKEN, "the notify carries the control token");
+    // Precision: the cancel pins the aborted request's own id (3 — id 1 was
+    // connect()'s protocol-version check, id 2 the session start) on this
+    // connection, so an abort can never cancel a different client's request
+    // with the same id.
+    assert.equal(cancelReq.params.request_id, 3);
     // The client stays usable after the abort.
     const echoed = await client.request("echo", { ok: true });
     assert.deepEqual(echoed.echoed, { ok: true });

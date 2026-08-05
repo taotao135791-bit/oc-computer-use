@@ -55,6 +55,7 @@ async fn spawn_daemon() -> TestDaemon {
         socket_path: socket.clone(),
         admin_token_path: admin_path.clone(),
         request_timeout_secs: 60,
+        shutdown_grace_secs: 5,
         runtime_config: cu_runtime::RuntimeConfig {
             traces_dir: dir.path().join("traces"),
             frames_dir: dir.path().join("frames"),
@@ -148,6 +149,7 @@ async fn stale_socket_is_replaced_on_startup() {
         socket_path: socket.clone(),
         admin_token_path: admin_path.clone(),
         request_timeout_secs: 60,
+        shutdown_grace_secs: 5,
         runtime_config: cu_runtime::RuntimeConfig {
             traces_dir: dir.path().join("traces"),
             frames_dir: dir.path().join("frames"),
@@ -194,6 +196,7 @@ async fn daemon_refuses_to_start_when_the_admin_token_cannot_be_persisted() {
         // A path under a file (not a directory) can never be created.
         admin_token_path: dir.path().join("blocker").join("daemon-admin.json"),
         request_timeout_secs: 60,
+        shutdown_grace_secs: 5,
         runtime_config: cu_runtime::RuntimeConfig {
             traces_dir: dir.path().join("traces"),
             frames_dir: dir.path().join("frames"),
@@ -220,8 +223,15 @@ async fn daemon_refuses_to_start_when_the_admin_token_cannot_be_persisted() {
 #[tokio::test]
 async fn trace_list_is_empty_on_fresh_home() {
     let d = spawn_daemon().await;
-    let traces = request(&d.socket, "trace.list", json!({})).await;
-    assert_eq!(traces["traces"], json!([]));
+    // trace.list is token-gated since round 5: with no session at all there
+    // is no credential to present, so it must refuse — the daemon never
+    // leaks "which sessions ever ran" to anonymous callers.
+    let err = request(&d.socket, "trace.list", json!({})).await;
+    assert_eq!(
+        err["code"],
+        json!(-32024),
+        "trace.list without a capability token must be refused"
+    );
     shutdown_daemon(d).await;
 }
 

@@ -92,9 +92,11 @@ argument controls this:
 
 - `reject` (default): a `start` probe surfaces the daemon's `CONTROL_LOCKED`
   (with the owner's non-secret identity in `data`) — nothing is disturbed.
-- `read_only`: returns the foreign session for observe-only use; no
-  credential is held, so mutating calls are refused by the daemon
-  (`CONTROL_TOKEN_REQUIRED`).
+- `read_only`: requires the foreign session's **observation token** —
+  call `attachReadOnly(sessionId, observationToken)` first (a session id
+  alone grants nothing). The adopted credential is observation-only
+  (`access: "read_only"`): sensitive reads work, mutating calls are refused
+  by the daemon (`CONTROL_TOKEN_REQUIRED`).
 - `attach_with_token`: adopt the session only with a token the caller
   supplies (e.g. from its own credential store); the adopted credential is
   injected into later mutating calls.

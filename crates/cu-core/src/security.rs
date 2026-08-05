@@ -25,7 +25,10 @@ use std::path::{Path, PathBuf};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 /// Wire protocol version. Round 4 (observation tokens, admin token, session
 /// summary, protocol-version bounds) is a breaking protocol change; adapters
@@ -65,6 +68,13 @@ impl std::fmt::Display for ControlToken {
     }
 }
 
+/// Wipe the plaintext from memory when the token is dropped.
+impl Drop for ControlToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// A plaintext observation token (read-only capability).
 #[derive(Clone, PartialEq, Eq)]
 pub struct ObservationToken(String);
@@ -84,6 +94,13 @@ impl std::fmt::Debug for ObservationToken {
 impl std::fmt::Display for ObservationToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[REDACTED]")
+    }
+}
+
+/// Wipe the plaintext from memory when the token is dropped.
+impl Drop for ObservationToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -109,6 +126,13 @@ impl std::fmt::Display for DaemonAdminToken {
     }
 }
 
+/// Wipe the plaintext from memory when the token is dropped.
+impl Drop for DaemonAdminToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// Generate a fresh token of `TOKEN_BYTES` random bytes (base64url, no pad).
 fn generate_token() -> String {
     let mut bytes = [0u8; TOKEN_BYTES];
@@ -130,6 +154,105 @@ pub fn generate_observation_token() -> ObservationToken {
 /// Generate a fresh daemon admin token.
 pub fn generate_daemon_admin_token() -> DaemonAdminToken {
     DaemonAdminToken(generate_token())
+}
+
+/// A capability token as it crosses the wire (in request params and in the
+/// one-time `start` response) and as adapters hold it.
+///
+/// The wire form is a plain string (`#[serde(transparent)]`), so the JSON
+/// format is unchanged by the type — but every other surface is hardened:
+/// - `Debug`/`Display` print `[REDACTED]` — deriving `Debug` on any struct
+///   holding a `SecretToken` can no longer leak it;
+/// - dropping the value zeroizes the underlying buffer;
+/// - the runtime never stores plaintext — only `SecretTokenHash` (see below).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct SecretToken(String);
+
+impl SecretToken {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    /// The token as sent over the wire (base64url, no padding).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretToken([REDACTED])")
+    }
+}
+
+impl std::fmt::Display for SecretToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl std::ops::Deref for SecretToken {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<String> for SecretToken {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for SecretToken {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+/// Empty default — used only as the `#[serde(default)]` of optional fields
+/// (e.g. pre-v3 credential files without an observation token). An empty
+/// token never verifies.
+impl Default for SecretToken {
+    fn default() -> Self {
+        Self(String::new())
+    }
+}
+
+/// Wipe the plaintext from memory when the token is dropped.
+impl Drop for SecretToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// Deep-copy `value` with every secret field replaced by `[REDACTED]` — the
+/// one form of a JSON-RPC payload that may be logged or `Debug`-printed.
+///
+/// A field is a secret when its key contains `token` or `secret`
+/// (`control_token`, `observation_token`, `admin_token`, `client_secret`, …).
+/// String values in those fields are replaced; everything else is passed
+/// through. This is the single redaction primitive: the `Debug` impls of the
+/// JSON-RPC envelope and the CLI's output redaction both route through it.
+pub fn redact_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                let k_lower = k.to_ascii_lowercase();
+                if (k_lower.contains("token") || k_lower.contains("secret")) && v.is_string() {
+                    out.insert(k.clone(), Value::String("[REDACTED]".into()));
+                } else {
+                    out.insert(k.clone(), redact_json(v));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_json).collect()),
+        other => other.clone(),
+    }
 }
 
 /// A secret whose plaintext can be hashed without ever being printed.
@@ -485,5 +608,82 @@ mod tests {
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn secret_token_serializes_as_plain_string_on_the_wire() {
+        // The typed SecretToken must not change the JSON wire format: params
+        // and the one-time start response carry tokens as plain strings.
+        let token = SecretToken::new("wire-token-value");
+        let json = serde_json::to_value(&token).unwrap();
+        assert_eq!(json, serde_json::json!("wire-token-value"));
+        let back: SecretToken = serde_json::from_value(json).unwrap();
+        assert_eq!(back.as_str(), "wire-token-value");
+        // Option<SecretToken> with skip_serializing_if = None behaves like a
+        // plain optional string.
+        let none: Option<SecretToken> = None;
+        assert_eq!(serde_json::to_value(none).unwrap(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn secret_token_debug_and_display_redact() {
+        let token = SecretToken::new("super-secret-token-value");
+        let d = format!("{token:?}");
+        let p = format!("{token}");
+        assert_eq!(d, "SecretToken([REDACTED])");
+        assert_eq!(p, "[REDACTED]");
+        assert!(!d.contains("super-secret"));
+        assert!(!p.contains("super-secret"));
+        // Deref exposes the plaintext only through the explicit as_str().
+        assert_eq!(token.as_str(), "super-secret-token-value");
+        let opt = Some(token);
+        assert_eq!(opt.as_deref(), Some("super-secret-token-value"));
+    }
+
+    #[test]
+    fn redact_json_hides_token_fields_at_any_depth() {
+        let v = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "computer.act",
+            "params": {
+                "session_id": "s1",
+                "control_token": "plaintext-control",
+                "actions": [{ "type": "wait", "duration_ms": 1 }],
+            },
+            "nested": { "observation_token": "plaintext-obs", "keep": "visible" },
+            "list": [{ "admin_token": "plaintext-admin" }],
+        });
+        let r = redact_json(&v);
+        assert_eq!(r["params"]["control_token"], "[REDACTED]");
+        assert_eq!(r["nested"]["observation_token"], "[REDACTED]");
+        assert_eq!(r["list"][0]["admin_token"], "[REDACTED]");
+        assert_eq!(
+            r["params"]["session_id"], "s1",
+            "non-secret fields pass through"
+        );
+        assert_eq!(r["nested"]["keep"], "visible");
+        assert_eq!(r["method"], "computer.act");
+        // The original value is untouched — redaction produces a copy.
+        assert_eq!(v["params"]["control_token"], "plaintext-control");
+    }
+
+    #[test]
+    fn redact_json_does_not_touch_non_string_values_or_other_keys() {
+        let v = serde_json::json!({
+            "control_token": 42,
+            "token_count": "not-a-secret",
+            "screen_token": null,
+            "request_id": 7,
+        });
+        let r = redact_json(&v);
+        // Non-string values under secret keys are passed through (a number is
+        // never a token); string values under any *token/secret key are
+        // redacted even when the key merely *contains* the word — the cost of
+        // a false positive is a redacted log line, the cost of a false
+        // negative is a leaked credential.
+        assert_eq!(r["control_token"], 42, "non-string values are not redacted");
+        assert_eq!(r["token_count"], "[REDACTED]");
+        assert_eq!(r["screen_token"], serde_json::Value::Null);
+        assert_eq!(r["request_id"], 7);
     }
 }

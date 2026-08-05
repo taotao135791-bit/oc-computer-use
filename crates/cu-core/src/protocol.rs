@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::{ComputerAction, WaitPolicy};
 use crate::coordinates::Region;
+use crate::security::{redact_json, SecretToken};
 use crate::sessions::{SessionAction, SessionState};
 
 /// Identifies one in-flight JSON-RPC request across **all** connections.
@@ -27,7 +28,11 @@ pub struct RequestKey {
 pub const JSONRPC_VERSION: &str = "2.0";
 
 /// A JSON-RPC 2.0 request as received by the daemon.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+///
+/// `Debug` is redacting by hand: `params` may carry capability tokens
+/// (`control_token` / `observation_token` / `admin_token`), so the derived
+/// form would print them. `{request:?}` in a log is always safe.
+#[derive(Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RpcRequest {
     pub jsonrpc: String,
     pub id: Option<serde_json::Value>,
@@ -36,8 +41,22 @@ pub struct RpcRequest {
     pub params: Option<serde_json::Value>,
 }
 
+impl std::fmt::Debug for RpcRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcRequest")
+            .field("jsonrpc", &self.jsonrpc)
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("params", &self.params.as_ref().map(redact_json))
+            .finish()
+    }
+}
+
 /// A JSON-RPC 2.0 response written by the daemon.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+///
+/// `Debug` redacts `result`/`error.data` (the one-time `start` response
+/// carries both capability tokens in `result`).
+#[derive(Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RpcResponse {
     pub jsonrpc: String,
     pub id: Option<serde_json::Value>,
@@ -47,12 +66,33 @@ pub struct RpcResponse {
     pub error: Option<RpcError>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+impl std::fmt::Debug for RpcResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcResponse")
+            .field("jsonrpc", &self.jsonrpc)
+            .field("id", &self.id)
+            .field("result", &self.result.as_ref().map(redact_json))
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcError")
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .field("data", &self.data.as_ref().map(redact_json))
+            .finish()
+    }
 }
 
 impl RpcResponse {
@@ -96,11 +136,11 @@ pub struct ObserveParams {
     /// desktop; a session id alone grants no observation permission. A valid
     /// control token is accepted in its place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observation_token: Option<String>,
+    pub observation_token: Option<SecretToken>,
     /// The session's control token — accepted in place of the observation
     /// token (control includes observation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_token: Option<String>,
+    pub control_token: Option<SecretToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_cursor: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,7 +187,7 @@ pub struct ActParams {
     /// The session's control token. Required: without it the batch is rejected
     /// before any action is parsed, queued, or executed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_token: Option<String>,
+    pub control_token: Option<SecretToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_policy: Option<WaitPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,9 +269,9 @@ pub struct InspectParams {
     /// Observation (or control) token — required; a session id alone grants
     /// no observation permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observation_token: Option<String>,
+    pub observation_token: Option<SecretToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_token: Option<String>,
+    pub control_token: Option<SecretToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<u32>,
 }
@@ -283,11 +323,11 @@ pub struct SessionParams {
     /// `release`/`stop`; `start` does not need one. `status` needs either this
     /// or the observation token (full status is a sensitive read).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub control_token: Option<String>,
+    pub control_token: Option<SecretToken>,
     /// The session's observation token — accepted for `status` in place of the
     /// control token.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub observation_token: Option<String>,
+    pub observation_token: Option<SecretToken>,
     /// Identity of the client performing the action; recorded on `start`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
@@ -357,13 +397,13 @@ pub struct SessionResult {
     /// or any other read-only call. Keep it in memory (or the CLI's 0600
     /// credential file), never in logs or traces.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub control_token: Option<String>,
+    pub control_token: Option<SecretToken>,
     /// The session's observation token (read-only capability). **Only present
     /// in the `start` response**, like the control token. A holder of only
     /// this token can observe/inspect/read traces, but can never act, cancel,
     /// pause, or stop.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub observation_token: Option<String>,
+    pub observation_token: Option<SecretToken>,
     /// Who created this session (backward-compatible name of the starting
     /// client). The owner_* fields carry the structured identity; only the
     /// creating client may stop the session on exit.
@@ -390,7 +430,7 @@ pub struct CancelParams {
     pub session_id: String,
     /// The session's control token — required; cancelling is a mutating op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_token: Option<String>,
+    pub control_token: Option<SecretToken>,
     /// JSON-RPC id of the specific request to cancel (same connection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<serde_json::Value>,
@@ -409,9 +449,9 @@ pub struct CancelResult {
 pub struct TraceGetParams {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observation_token: Option<String>,
+    pub observation_token: Option<SecretToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_token: Option<String>,
+    pub control_token: Option<SecretToken>,
 }
 
 /// `trace.export` request — exporting a trace requires an observation or
@@ -421,9 +461,9 @@ pub struct TraceExportParams {
     pub session_id: String,
     pub dest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observation_token: Option<String>,
+    pub observation_token: Option<SecretToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_token: Option<String>,
+    pub control_token: Option<SecretToken>,
 }
 
 /// `trace.replay` request (token-verified like `trace.get`).
@@ -431,9 +471,9 @@ pub struct TraceExportParams {
 pub struct TraceReplayParams {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observation_token: Option<String>,
+    pub observation_token: Option<SecretToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_token: Option<String>,
+    pub control_token: Option<SecretToken>,
 }
 
 /// `runtime.shutdown` request — requires the daemon admin token.
@@ -442,19 +482,37 @@ pub struct ShutdownParams {
     /// The daemon admin token (per-install credential held by the daemon
     /// manager — the CLI / LaunchAgent). Ordinary clients never hold it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admin_token: Option<String>,
+    pub admin_token: Option<SecretToken>,
 }
 
-/// `trace.list` entry.
+/// `trace.list` / `trace.summaries` entry — metadata only. The absolute
+/// filesystem path never crosses the wire (a path would leak the install
+/// layout and invite path-based probing); contents are read via `trace.get`
+/// and exported via `trace.export`, both token-gated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraceSummary {
+    /// Stable id of this trace. One trace per session — `trace_id` is the
+    /// trace-file stem, which is currently the session id.
+    pub trace_id: String,
     pub session_id: String,
-    pub path: String,
-    pub entries: usize,
-    pub bytes: u64,
-    pub started_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_entry_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub size_bytes: u64,
+    pub event_count: usize,
+}
+
+/// Shared token fields for **cross-session** sensitive reads:
+/// `runtime.pointer`, `runtime.active_application`, `runtime.desktop_layout`,
+/// `trace.list`, `trace.summaries`. Unlike the session-addressed reads these
+/// methods have no `session_id`, so any valid observation or control token is
+/// accepted — the token proves the caller is a trusted client of this daemon.
+/// No token → `OBSERVATION_TOKEN_REQUIRED`; a token matching nothing →
+/// `INVALID_OBSERVATION_TOKEN`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, schemars::JsonSchema)]
+pub struct CapabilityTokenParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<SecretToken>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<SecretToken>,
 }
 
 /// One entry inside a trace file (JSONL).
@@ -567,5 +625,103 @@ mod tests {
         let v = serde_json::json!({ "include_image": true });
         let p: ObserveParams = serde_json::from_value(v).unwrap();
         assert_eq!(p.include_image, Some(true));
+    }
+
+    /// Round 5: derived `Debug` on any token-bearing struct must never print
+    /// the plaintext — the `SecretToken` field type redacts structurally, so
+    /// no struct holding one needs a hand-written `Debug`.
+    #[test]
+    fn derived_debug_on_token_bearing_structs_redacts() {
+        let p = ActParams {
+            session_id: "s1".into(),
+            frame_id: "frame_9".into(),
+            actions: Vec::new(),
+            control_token: Some(SecretToken::new("plaintext-control-token")),
+            wait_policy: None,
+            fixed_wait_ms: None,
+            return_screenshot: None,
+            risk_level: None,
+            requires_confirmation: None,
+            policy_context: None,
+        };
+        let d = format!("{p:?}");
+        assert!(d.contains("[REDACTED]"));
+        assert!(
+            !d.contains("plaintext-control-token"),
+            "Debug of ActParams must not contain the control token"
+        );
+
+        let obs = ObserveParams {
+            observation_token: Some(SecretToken::new("plaintext-obs-token")),
+            control_token: Some(SecretToken::new("plaintext-ctl-token")),
+            ..Default::default()
+        };
+        let d = format!("{obs:?}");
+        assert!(!d.contains("plaintext-obs-token"));
+        assert!(!d.contains("plaintext-ctl-token"));
+
+        let s = ShutdownParams {
+            admin_token: Some(SecretToken::new("plaintext-admin-token")),
+        };
+        let d = format!("{s:?}");
+        assert!(!d.contains("plaintext-admin-token"));
+    }
+
+    #[test]
+    fn rpc_envelope_debug_redacts_token_fields_in_params_and_results() {
+        // A start response carries both capability tokens exactly once; its
+        // Debug form (a log line, a panic message) must never print them.
+        let resp = RpcResponse::ok(
+            Some(serde_json::json!(1)),
+            serde_json::json!({
+                "session_id": "s1",
+                "control_token": "plaintext-control",
+                "observation_token": "plaintext-obs",
+            }),
+        );
+        let d = format!("{resp:?}");
+        assert!(d.contains("[REDACTED]"));
+        assert!(!d.contains("plaintext-control"));
+        assert!(!d.contains("plaintext-obs"));
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(2)),
+            method: "computer.act".into(),
+            params: Some(serde_json::json!({
+                "session_id": "s1",
+                "control_token": "plaintext-control",
+            })),
+        };
+        let d = format!("{req:?}");
+        assert!(!d.contains("plaintext-control"));
+        assert!(d.contains("computer.act"), "method stays visible");
+
+        let err = RpcResponse::err(
+            Some(serde_json::json!(3)),
+            -32024,
+            "OBSERVATION_TOKEN_REQUIRED".into(),
+            Some(serde_json::json!({ "admin_token": "plaintext-admin" })),
+        );
+        let d = format!("{err:?}");
+        assert!(!d.contains("plaintext-admin"));
+    }
+
+    /// The wire format is unchanged by the typed token: params serialize as
+    /// plain strings, exactly as before the type was introduced.
+    #[test]
+    fn token_fields_serialize_as_plain_strings() {
+        let p = ObserveParams {
+            session_id: Some("s1".into()),
+            observation_token: Some(SecretToken::new("wire-obs")),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["observation_token"], "wire-obs");
+        assert_eq!(v["session_id"], "s1");
+        // skip_serializing_if still drops absent tokens.
+        let none = ObserveParams::default();
+        let v = serde_json::to_value(&none).unwrap();
+        assert!(v.get("observation_token").is_none());
     }
 }

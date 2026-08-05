@@ -111,11 +111,14 @@ fn act_params_passes_the_schema_with_a_real_action_batch() {
     assert_eq!(v["actions"][1]["type"], "drag");
     assert_eq!(v["actions"][2]["type"], "type");
 
-    // A batch without a control token is still schema-valid (the daemon
-    // rejects it at runtime with CONTROL_TOKEN_REQUIRED).
+    // A batch without a control token is *schema-invalid* — round 5 asserts
+    // the daemon's CONTROL_TOKEN_REQUIRED into the schema itself.
     let mut no_token = v.clone();
     no_token.as_object_mut().unwrap().remove("control_token");
-    validate("ActParams", &no_token).unwrap();
+    assert!(
+        validate("ActParams", &no_token).is_err(),
+        "act without a control token must be schema-invalid"
+    );
 }
 
 #[test]
@@ -163,13 +166,26 @@ fn shutdown_params_documents_the_admin_token_field() {
     })
     .unwrap();
     validate("ShutdownParams", &v).unwrap();
-    // The field is optional on the wire so the daemon can answer
-    // DAEMON_ADMIN_TOKEN_REQUIRED; it is documented in the schema.
+    // Round 5: the schema *requires* the admin token (the daemon's
+    // DAEMON_ADMIN_TOKEN_REQUIRED is a runtime fallback, not a contract the
+    // schema blesses). A tokenless shutdown is schema-invalid.
     let schema = build_protocol_schema();
     assert!(schema["$defs"]["ShutdownParams"]["properties"]
         .as_object()
         .unwrap()
         .contains_key("admin_token"));
+    let required = schema["$defs"]["ShutdownParams"]["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        required.contains(&"admin_token"),
+        "admin_token must be required in the schema"
+    );
+    assert!(validate("ShutdownParams", &json!({})).is_err());
+    assert!(validate("ShutdownParams", &json!({ "admin_token": 42 })).is_err());
 }
 
 #[test]
@@ -221,6 +237,7 @@ fn every_error_code_is_in_the_schema_and_nothing_more() {
         ErrorCode::ProtocolVersionMismatch.as_str(),
         ErrorCode::DaemonAdminTokenRequired.as_str(),
         ErrorCode::InvalidDaemonAdminToken.as_str(),
+        ErrorCode::DaemonShuttingDown.as_str(),
     ];
     assert_eq!(
         expected.len(),
@@ -241,19 +258,181 @@ fn invalid_instances_are_rejected() {
     let bad_session = json!({ "state": "active", "paused": false });
     assert!(validate("SessionResult", &bad_session).is_err());
 
-    // A session-id-only read is *schema-valid* but the daemon rejects it with
-    // OBSERVATION_TOKEN_REQUIRED — the schema documents permission via the
-    // token fields, not by making them required.
-    let no_token_observe = json!({
-        "session_id": "s1",
-        "target": "screen",
-        "display_id": "1"
-    });
-    validate("ObserveParams", &no_token_observe).unwrap();
-
     // Unknown error codes are rejected.
     assert!(validate("ErrorCode", &json!("NOT_A_REAL_CODE")).is_err());
     assert!(validate("ErrorCode", &json!("STALE_FRAME")).is_ok());
+}
+
+/// §五.5: the machine-readable schema must express exactly what the daemon
+/// enforces. Observe/Inspect/Trace reads need observation **or** control
+/// (one-of, both-missing invalid); Act/Cancel need control (observation alone
+/// is invalid); Shutdown needs the admin token (a capability token is
+/// invalid); Session actions are conditional on the action (start tokenless,
+/// status one-of, mutations control-only).
+#[test]
+fn capability_token_requirements_are_in_the_schema() {
+    let observe = json!({ "session_id": "s1", "include_image": false });
+    let obs = json!({ "session_id": "s1", "observation_token": "fake-obs-token" });
+    let ctl = json!({ "session_id": "s1", "control_token": "fake-ctl-token" });
+
+    // Observe: both-missing invalid, either token valid.
+    assert!(validate("ObserveParams", &observe).is_err());
+    validate("ObserveParams", &obs).unwrap();
+    validate("ObserveParams", &ctl).unwrap();
+
+    // Inspect: same one-of rule.
+    let inspect = json!({
+        "session_id": "s1",
+        "frame_id": "frame_9",
+        "region": { "x": 0, "y": 0, "width": 1, "height": 1, "coordinate_space": "image_pixels" }
+    });
+    assert!(validate("InspectParams", &inspect).is_err());
+    validate(
+        "InspectParams",
+        &json!({ "session_id": "s1", "frame_id": "frame_9",
+                 "observation_token": "fake-obs-token",
+                 "region": { "x": 0, "y": 0, "width": 1, "height": 1, "coordinate_space": "image_pixels" } }),
+    )
+    .unwrap();
+    validate(
+        "InspectParams",
+        &json!({ "session_id": "s1", "frame_id": "frame_9",
+                 "control_token": "fake-ctl-token",
+                 "region": { "x": 0, "y": 0, "width": 1, "height": 1, "coordinate_space": "image_pixels" } }),
+    )
+    .unwrap();
+
+    // Trace reads: same one-of rule (get/export/replay).
+    assert!(validate("TraceGetParams", &json!({ "session_id": "s1" })).is_err());
+    validate(
+        "TraceGetParams",
+        &json!({ "session_id": "s1", "observation_token": "fake-obs-token" }),
+    )
+    .unwrap();
+    validate(
+        "TraceGetParams",
+        &json!({ "session_id": "s1", "control_token": "fake-ctl-token" }),
+    )
+    .unwrap();
+    assert!(validate(
+        "TraceExportParams",
+        &json!({ "session_id": "s1", "dest": "/tmp/x.jsonl" })
+    )
+    .is_err());
+    validate(
+        "TraceExportParams",
+        &json!({ "session_id": "s1", "dest": "/tmp/x.jsonl", "observation_token": "fake-obs-token" }),
+    )
+    .unwrap();
+    assert!(validate("TraceReplayParams", &json!({ "session_id": "s1" })).is_err());
+    validate(
+        "TraceReplayParams",
+        &json!({ "session_id": "s1", "observation_token": "fake-obs-token" }),
+    )
+    .unwrap();
+
+    // Cross-session reads (runtime.pointer etc.): same one-of rule.
+    assert!(validate("CapabilityTokenParams", &json!({})).is_err());
+    validate(
+        "CapabilityTokenParams",
+        &json!({ "observation_token": "fake-obs-token" }),
+    )
+    .unwrap();
+    validate(
+        "CapabilityTokenParams",
+        &json!({ "control_token": "fake-ctl-token" }),
+    )
+    .unwrap();
+
+    // Act: control token required — observation alone is NOT enough.
+    let act = json!({
+        "session_id": "s1",
+        "frame_id": "frame_9",
+        "actions": [{ "type": "wait", "duration_ms": 1 }]
+    });
+    assert!(validate("ActParams", &act).is_err());
+    assert!(
+        validate(
+            "ActParams",
+            &json!({
+                "session_id": "s1", "frame_id": "frame_9",
+                "observation_token": "fake-obs-token",
+                "actions": [{ "type": "wait", "duration_ms": 1 }]
+            })
+        )
+        .is_err(),
+        "an observation token must never satisfy a control-only schema"
+    );
+    validate(
+        "ActParams",
+        &json!({
+            "session_id": "s1", "frame_id": "frame_9",
+            "control_token": "fake-ctl-token",
+            "actions": [{ "type": "wait", "duration_ms": 1 }]
+        }),
+    )
+    .unwrap();
+
+    // Cancel: control token required.
+    assert!(validate("CancelParams", &json!({ "session_id": "s1" })).is_err());
+    validate(
+        "CancelParams",
+        &json!({ "session_id": "s1", "control_token": "fake-ctl-token", "request_id": 1 }),
+    )
+    .unwrap();
+
+    // Shutdown: admin token required — a capability token is invalid.
+    assert!(validate("ShutdownParams", &json!({})).is_err());
+    assert!(validate(
+        "ShutdownParams",
+        &json!({ "admin_token": "fake-ctl-token" })
+    )
+    .is_ok());
+    validate(
+        "ShutdownParams",
+        &json!({ "admin_token": "fake-admin-token" }),
+    )
+    .unwrap();
+
+    // Session actions: start is tokenless; status needs one of the two;
+    // mutations need the control token.
+    validate("SessionParams", &json!({ "action": "start" })).unwrap();
+    assert!(validate(
+        "SessionParams",
+        &json!({ "action": "status", "session_id": "s1" })
+    )
+    .is_err());
+    validate(
+        "SessionParams",
+        &json!({ "action": "status", "session_id": "s1", "observation_token": "fake-obs-token" }),
+    )
+    .unwrap();
+    validate(
+        "SessionParams",
+        &json!({ "action": "status", "session_id": "s1", "control_token": "fake-ctl-token" }),
+    )
+    .unwrap();
+    assert!(
+        validate(
+            "SessionParams",
+            &json!({ "action": "pause", "session_id": "s1" })
+        )
+        .is_err(),
+        "a tokenless pause must be schema-invalid"
+    );
+    assert!(
+        validate(
+            "SessionParams",
+            &json!({ "action": "pause", "session_id": "s1", "observation_token": "fake-obs-token" })
+        )
+        .is_err(),
+        "an observation token must not authorize pause"
+    );
+    validate(
+        "SessionParams",
+        &json!({ "action": "pause", "session_id": "s1", "control_token": "fake-ctl-token" }),
+    )
+    .unwrap();
 }
 
 #[test]

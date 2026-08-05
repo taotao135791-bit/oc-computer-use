@@ -10,6 +10,11 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "esModuleInterop": true,
+    // skipLibCheck: skip type-checking third-party .d.ts files only.
+    // @earendil-works/pi-coding-agent's declarations reference DOM globals
+    // this node-only lib does not provide; the error is in the vendor
+    // declarations, not in our code. Our own sources are still fully
+    // type-checked (strict + noUncheckedIndexedAccess).
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },

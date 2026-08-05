@@ -72,6 +72,7 @@ referenced `frame_id` itself is checked (`COMPUTER_USE_STALE_POLICY`):
 | -32025 | `INVALID_OBSERVATION_TOKEN` | a presented observation/control token did not verify (deliberately non-descriptive) |
 | -32026 | `DAEMON_ADMIN_TOKEN_REQUIRED` | `runtime.shutdown` was attempted without the daemon admin token |
 | -32027 | `INVALID_DAEMON_ADMIN_TOKEN` | an admin token was presented but did not verify |
+| -32028 | `DAEMON_SHUTTING_DOWN` | the daemon is shutting down — a new request arrived after `runtime.shutdown` began (retry once it is back up; in-flight actions are cancelled, never errors) |
 | — | `OUT_OF_BOUNDS` | coordinate outside the display |
 | — | `DRIVER_ERROR` | bridge/driver failure (e.g. Screen Recording permission missing) |
 | — | `PERMISSION` | macOS permission missing |
@@ -108,7 +109,7 @@ daemon runs with `COMPUTER_USE_TRACE_DEV_MODE=1`.
 | `runtime.desktop_layout` | — | `primary_id`, `displays` |
 | `runtime.pointer` | — | `location: {x, y}` |
 | `runtime.active_application` | — | `bundle_id`, `name`, optional `window_title` |
-| `runtime.shutdown` | `{admin_token}` | `{status: "shutting_down"}` — refused with `DAEMON_ADMIN_TOKEN_REQUIRED` / `INVALID_DAEMON_ADMIN_TOKEN` without the daemon admin token (see below); the daemon exits only when it verifies |
+| `runtime.shutdown` | `{admin_token}` | `{status: "shutting_down"}` — refused with `DAEMON_ADMIN_TOKEN_REQUIRED` / `INVALID_DAEMON_ADMIN_TOKEN` without the daemon admin token (see below); the daemon exits only when it verifies. Once shutdown begins the daemon marks itself shutting-down: new requests are refused with `DAEMON_SHUTTING_DOWN` (-32028), each session's in-flight action is cancelled (the response reports the executed actions `success` and the rest `cancelled`, `executed: false` — never a JSON-RPC error), connections drain within the grace period, and the socket + admin token are removed for a clean restart |
 
 ### Sessions
 
@@ -189,10 +190,16 @@ refuses startup (never a silent downgrade to an unstoppable daemon).
 - **Existing sessions: default is `reject`.** When a client finds an active
   session it does not own, it must **not** silently attach: the SDK's
   `ensureSession` defaults to `reject` (the daemon's `CONTROL_LOCKED` surfaces
-  to the caller), with `read_only` (observe-only, no token) and
-  `attach_with_token` (the caller supplies the token, e.g. from its own
-  credential store) as explicit opt-ins. No client auto-attaches in a way
-  that would let it stop another client's session.
+  to the caller), with explicit **token-bearing** opt-ins only — `read_only`
+  requires the foreign session's observation token (`attachReadOnly(sessionId,
+  observationToken)` first) and `attach_with_token` requires its control
+  token. A session id alone grants no observation or control permission
+  (`OBSERVATION_TOKEN_REQUIRED` / `CONTROL_TOKEN_REQUIRED`). No client
+  auto-attaches in a way that would let it stop another client's session, and
+  adapters expose no token-less policy: the Pi extension's
+  `COMPUTER_USE_EXISTING_SESSION_POLICY` is `reject` only — the pre-0.3
+  `read_only`/`attach` values print a deprecation warning and behave like
+  `reject`.
 - **`status` with no session** returns `SESSION_NOT_FOUND` (code -32009)
   with `"No active computer-use session exists."` — this is the
   signal to create.

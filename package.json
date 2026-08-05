@@ -9,12 +9,14 @@
     "apps/*"
   ],
   "scripts": {
+    "clean": "find packages -name dist -type d -prune -exec rm -rf {} +",
+    "generate:protocol": "node scripts/generate-protocol.mjs",
+    "check:protocol": "node scripts/generate-protocol.mjs --check",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
     "test": "pnpm -r test",
-    "generate:protocol": "node scripts/generate-protocol.mjs",
-    "check:protocol": "node scripts/generate-protocol.mjs --check",
+    "ci": "pnpm check:protocol && pnpm build && pnpm typecheck && pnpm lint && pnpm test",
     "scan:secrets": "gitleaks detect --source . --config .gitleaks.toml --no-banner",
     "release:build": "bash scripts/release-build.sh"
   },

@@ -79,7 +79,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 ## Tests
 
 ```bash
-pnpm test   # 10 tests: spawns the real server, drives it with an McpClient
+pnpm test   # 11 tests: spawns the real server, drives it with an McpClient
             # over stdio (newline-delimited JSON framing)
 ```
 

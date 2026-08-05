@@ -39,6 +39,7 @@ libc = "0.2"
 tempfile = "3"
 sha2 = "0.10"
 hex = "0.4"
+zeroize = "1.8"
 tokio-util = "0.7"
 # Protocol single-source-of-truth: wire types derive JSON Schemas (schemars)
 # that a generator emits and adapters consume; the schema is validated in CI.

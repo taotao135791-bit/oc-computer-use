@@ -85,7 +85,7 @@ test("session start response with both capability tokens passes the schema", () 
   });
 });
 
-test("act params pass the schema; control_token stays optional on the wire", () => {
+test("act params pass the schema; control_token is required on the wire", () => {
   validate("ActParams", {
     session_id: "s1",
     frame_id: "frame_9",
@@ -98,13 +98,33 @@ test("act params pass the schema; control_token stays optional on the wire", () 
     return_screenshot: true,
     control_token: "ts-fake-control-token",
   });
-  // A tokenless batch is schema-valid (the daemon rejects it at runtime with
-  // CONTROL_TOKEN_REQUIRED — enforcement is the daemon's, not the schema's).
-  validate("ActParams", {
-    session_id: "s1",
-    frame_id: "frame_9",
-    actions: [{ type: "wait", duration_ms: 100 }],
+  // Round 5: a tokenless batch is schema-invalid — the schema expresses the
+  // control-token requirement, the daemon enforces it at runtime (CONTROL
+  // _TOKEN_REQUIRED) as the fallback for clients that predate the schema.
+  const bad = ajv.compile({
+    $schema: "https://json-schema.org/draft/2019-09/schema",
+    $ref: "#/$defs/ActParams",
+    $defs: schema.$defs,
   });
+  assert.equal(
+    bad({
+      session_id: "s1",
+      frame_id: "frame_9",
+      actions: [{ type: "wait", duration_ms: 100 }],
+    }),
+    false,
+    "tokenless act must be schema-invalid",
+  );
+  assert.equal(
+    bad({
+      session_id: "s1",
+      frame_id: "frame_9",
+      actions: [{ type: "wait", duration_ms: 100 }],
+      observation_token: "ts-fake-observation-token",
+    }),
+    false,
+    "an observation token must not satisfy the control-only act schema",
+  );
 });
 
 test("session summary carries explicit nulls that are required", () => {
@@ -144,11 +164,19 @@ test("error codes are the SCREAMING_SNAKE enum; unknown codes are rejected", () 
   assert.equal(bad("NOT_A_REAL_CODE"), false);
 });
 
-test("shutdown params document the admin token field", () => {
+test("shutdown params require the admin token", () => {
   validate("ShutdownParams", { admin_token: "ts-fake-admin-token" });
-  // Tokenless is schema-valid so the daemon can answer
-  // DAEMON_ADMIN_TOKEN_REQUIRED.
-  validate("ShutdownParams", {});
+  // Round 5: the schema *requires* the admin token — a capability token is
+  // not an admin token, and a tokenless shutdown is schema-invalid (the
+  // daemon's DAEMON_ADMIN_TOKEN_REQUIRED is a runtime fallback, not a
+  // contract the schema blesses).
+  const bad = ajv.compile({
+    $schema: "https://json-schema.org/draft/2019-09/schema",
+    $ref: "#/$defs/ShutdownParams",
+    $defs: schema.$defs,
+  });
+  assert.equal(bad({}), false, "tokenless shutdown must be schema-invalid");
+  assert.equal(bad({ admin_token: "ts-fake-control-token" }), true);
 });
 
 test("observe params carry the observation capability token slots", () => {

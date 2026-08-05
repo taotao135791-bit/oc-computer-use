@@ -11,6 +11,11 @@
 //   cu-opencode help
 import { connect, defaultSocketPath } from "@computer-use/sdk";
 
+/** Narrow an unknown rejection to a readable message. */
+function failureMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 import {
   cleanupSession,
   defaultOpenCodeConfigPath,
@@ -87,7 +92,7 @@ async function main(argv: string[]): Promise<void> {
       return;
     }
     case "status": {
-      const client = await connect({ socketPath }).catch((err) => fail(`cannot connect to daemon at ${socketPath}: ${err.message}`));
+      const client = await connect({ socketPath }).catch((err: unknown) => fail(`cannot connect to daemon at ${socketPath}: ${failureMessage(err)}`));
       try {
         console.log(await statusText(client));
       } finally {
@@ -97,7 +102,7 @@ async function main(argv: string[]): Promise<void> {
     }
     case "session": {
       if (rest[0] !== "cleanup") fail("expected `session cleanup`");
-      const client = await connect({ socketPath }).catch((err) => fail(`cannot connect to daemon at ${socketPath}: ${err.message}`));
+      const client = await connect({ socketPath }).catch((err: unknown) => fail(`cannot connect to daemon at ${socketPath}: ${failureMessage(err)}`));
       try {
         const result = await cleanupSession(client);
         console.log(result.message);

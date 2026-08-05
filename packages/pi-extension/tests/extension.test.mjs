@@ -444,6 +444,13 @@ test("observe rejects a session owned by another client with CONTROL_LOCKED", as
   }
 });
 
+/**
+ * A session owned by another client is never touched: the only existing
+ * session policy is `reject`, so any tool call against a foreign session is
+ * refused with the daemon's CONTROL_LOCKED (never a silent, tokenless
+ * attach). `policyValue` (when given) sets the env var; removed policy
+ * values must additionally warn.
+ */
 async function foreignSessionRefused(policyValue, expectDeprecationWarning) {
   const fake = startFakeDaemon({
     existingSession: {
@@ -461,7 +468,7 @@ async function foreignSessionRefused(policyValue, expectDeprecationWarning) {
     },
   });
   process.env.COMPUTER_USE_SOCKET = fake.socketPath;
-  process.env.COMPUTER_USE_EXISTING_SESSION_POLICY = policyValue;
+  if (policyValue) process.env.COMPUTER_USE_EXISTING_SESSION_POLICY = policyValue;
   const warnings = [];
   const origWarn = console.warn;
   console.warn = (msg) => warnings.push(String(msg));
@@ -470,21 +477,19 @@ async function foreignSessionRefused(policyValue, expectDeprecationWarning) {
     const createExtension = await loadExtension();
     createExtension(pi);
     const observe = tools.find((t) => t.name === "computer_observe");
-    // v3: a session id alone grants no observation permission. The read-only
-    // attach requires the session's observation token, which only the owner
-    // can share — a tokenless attach is refused (never silently observed).
+    // The only policy is reject: the start attempt is refused by the daemon
+    // with CONTROL_LOCKED, carrying the owner's non-secret identity.
     await assert.rejects(
       observe.execute("call-3", {}, undefined, undefined, ctx),
       (err) => {
-        assert.equal(err.code, "INVALID_PARAMS");
-        assert.match(err.message, /attachReadOnly/);
+        assert.equal(err.code, "CONTROL_LOCKED");
         return true;
       },
     );
-    assert.equal(fake.state.startCount, 0, "attach never starts a session");
+    assert.equal(fake.state.startCount, 0, "reject never starts a session");
     // Shutdown must NOT stop a session we do not own.
     await handlers["session_shutdown"]();
-    assert.equal(fake.state.stopCount, 0, "attached session is not stopped on shutdown");
+    assert.equal(fake.state.stopCount, 0, "foreign session is not stopped on shutdown");
     return { warnings, fake };
   } finally {
     console.warn = origWarn;
@@ -494,19 +499,23 @@ async function foreignSessionRefused(policyValue, expectDeprecationWarning) {
   }
 }
 
-test("read_only policy without an observation token refuses and never touches the foreign session", async () => {
-  const { warnings } = await foreignSessionRefused("read_only", false);
-  assert.equal(
-    warnings.length,
-    0,
-    "the current policy name must not warn",
+test("a foreign session is refused with CONTROL_LOCKED — reject is the only policy", async () => {
+  const { warnings } = await foreignSessionRefused(undefined, false);
+  assert.equal(warnings.length, 0, "the default policy must not warn");
+});
+
+test("removed read_only policy value is deprecated and behaves like reject", async () => {
+  const { warnings } = await foreignSessionRefused("read_only", true);
+  assert.ok(
+    warnings.some((w) => /read_only.*deprecated.*reject/.test(w)),
+    `expected a deprecation warning, got: ${JSON.stringify(warnings)}`,
   );
 });
 
-test("legacy attach policy value maps to read_only with a deprecation warning", async () => {
+test("legacy attach policy value is deprecated and behaves like reject", async () => {
   const { warnings } = await foreignSessionRefused("attach", true);
   assert.ok(
-    warnings.some((w) => /attach.*deprecated.*read_only/.test(w)),
+    warnings.some((w) => /attach.*deprecated.*reject/.test(w)),
     `expected a deprecation warning, got: ${JSON.stringify(warnings)}`,
   );
 });

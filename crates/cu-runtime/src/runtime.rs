@@ -22,8 +22,8 @@ use cu_core::{
     generate_control_token, generate_observation_token, ActParams, ActResult, ClientInfo,
     CoordinateSpace, CuError, ErrorCode, ImageGeometry, InspectMapping, InspectParams,
     InspectResult, ObserveParams, ObserveResult, Region, RequestKey, ScreenFrame, ScreenSnapshot,
-    SecretTokenHash, SessionAction, SessionResult, SessionState, SessionSummary, StabilizationInfo,
-    TraceReport, WaitPolicy,
+    SecretToken, SecretTokenHash, SessionAction, SessionResult, SessionState, SessionSummary,
+    StabilizationInfo, TraceReport, WaitPolicy,
 };
 use cu_driver::{
     ApplicationInfo, CaptureRequest, ComputerDriver, DesktopLayout, DisplayInfo, PermissionStatus,
@@ -88,6 +88,17 @@ pub struct Runtime {
     /// Per-request cancellation registry (connection_id, request_id) → batch
     /// token. Lets `computer.cancel` abort exactly one request.
     requests: RequestRegistry,
+    /// Set by `shutdown` the moment it starts. Every dispatch checks it first,
+    /// so requests that arrive during shutdown fail fast with
+    /// `DAEMON_SHUTTING_DOWN` instead of starting new work.
+    shutting_down: std::sync::atomic::AtomicBool,
+}
+
+impl Runtime {
+    /// Whether `shutdown` has begun. New requests are refused from this point.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl Runtime {
@@ -104,6 +115,7 @@ impl Runtime {
             stale,
             started_at: Instant::now(),
             requests: RequestRegistry::new(),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -318,8 +330,8 @@ impl Runtime {
         // response to the client that just created the session. The control
         // token covers mutating operations; the observation token covers
         // sensitive reads (and is what a read-only attach must hold).
-        result.control_token = Some(control_token.as_str().to_string());
-        result.observation_token = Some(observation_token.as_str().to_string());
+        result.control_token = Some(SecretToken::new(control_token.as_str()));
+        result.observation_token = Some(SecretToken::new(observation_token.as_str()));
         Ok(result)
     }
 
@@ -1088,10 +1100,22 @@ impl Runtime {
     // Shutdown
     // ------------------------------------------------------------------
 
-    /// Stop every session, close traces, and release driver resources.
+    /// Graceful daemon shutdown.
+    ///
+    /// Order matters for a clean drain:
+    /// 1. The `shutting_down` flag is set **first** (synchronously), so any
+    ///    request dispatched from this point on fails fast with
+    ///    `DAEMON_SHUTTING_DOWN` instead of starting new work.
+    /// 2. Every session is stopped; each stop transitions through `Stopping`,
+    ///    which cancels the in-flight action batch, so long-running requests
+    ///    return promptly (CANCELLED) rather than blocking the exit.
+    /// 3. Driver resources (the Swift bridge) are released.
+    ///
     /// The runtime's own shutdown path is the one caller that may stop a
     /// session without a control token.
     pub async fn shutdown(&self) -> Result<(), CuError> {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let sessions: Vec<SharedSession> =
             self.sessions.lock().unwrap().values().cloned().collect();
         for session in sessions {
@@ -1125,6 +1149,33 @@ impl Runtime {
     ) -> Result<(), CuError> {
         let session = self.get_session(session_id)?;
         session.verify_read_tokens(observation_token, control_token)
+    }
+
+    /// Verify a capability token against **any** session known to the daemon.
+    /// Used by the cross-session sensitive reads (`trace.list`,
+    /// `trace.summaries`, `runtime.pointer`, `runtime.active_application`,
+    /// `runtime.desktop_layout`) which have no `session_id`: a valid token
+    /// proves the caller is a trusted client of this daemon. No token at all
+    /// is `OBSERVATION_TOKEN_REQUIRED`; a token matching no session is the
+    /// non-descriptive `INVALID_OBSERVATION_TOKEN`. Never touches a file or
+    /// driver on the failure path.
+    pub fn verify_any_token(
+        &self,
+        observation_token: Option<&str>,
+        control_token: Option<&str>,
+    ) -> Result<(), CuError> {
+        let sessions: Vec<SharedSession> =
+            self.sessions.lock().unwrap().values().cloned().collect();
+        if sessions.iter().any(|s| {
+            s.verify_read_tokens(observation_token, control_token)
+                .is_ok()
+        }) {
+            return Ok(());
+        }
+        match (observation_token, control_token) {
+            (None, None) => Err(CuError::ObservationTokenRequired),
+            _ => Err(CuError::InvalidObservationToken),
+        }
     }
 
     fn gate_active(&self, session: &Session) -> Result<(), CuError> {
@@ -1475,7 +1526,11 @@ mod tests {
         assert_eq!(status.owner_client_id.as_deref(), Some("test"));
     }
 
-    fn wait_params(session_id: &str, frame_id: &str, control_token: Option<String>) -> ActParams {
+    fn wait_params(
+        session_id: &str,
+        frame_id: &str,
+        control_token: Option<cu_core::SecretToken>,
+    ) -> ActParams {
         ActParams {
             session_id: session_id.into(),
             frame_id: frame_id.into(),
@@ -1548,7 +1603,7 @@ mod tests {
                 ObserveParams {
                     session_id: Some(sid.clone()),
                     include_image: Some(false),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1583,7 +1638,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(sid.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1679,7 +1734,7 @@ mod tests {
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
                     include_image: Some(false),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1711,7 +1766,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1722,7 +1777,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1764,7 +1819,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1775,7 +1830,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1826,7 +1881,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1859,7 +1914,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s2.session_id.clone()),
-                    control_token: Some(token2.to_string()),
+                    control_token: Some(token2.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1891,7 +1946,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1932,7 +1987,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -1973,7 +2028,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -2020,7 +2075,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -2098,7 +2153,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -2160,7 +2215,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,
@@ -2214,7 +2269,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Helper: start a session and observe a fresh frame for act calls.
-    async fn start_observed(rt: &Arc<Runtime>) -> (String, String, String) {
+    async fn start_observed(rt: &Arc<Runtime>) -> (String, cu_core::SecretToken, String) {
         let s = rt.session_start(None, test_client()).await.unwrap();
         let token = s
             .control_token
@@ -2225,7 +2280,7 @@ mod tests {
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
                     include_image: Some(false),
-                    control_token: Some(token.to_string()),
+                    control_token: Some(token.clone()),
                     ..Default::default()
                 },
                 None,

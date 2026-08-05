@@ -36,18 +36,14 @@ The extension talks to the daemon at `~/.computer-use/runtime.sock`
   client created is left running. When a session owned by another client is
   already active, the behavior is controlled by
   `COMPUTER_USE_EXISTING_SESSION_POLICY`:
-  - `reject` (default): tools fail with `CONTROL_LOCKED`, whose payload names
-    the owner's non-secret identity — the extension never takes over.
-  - `read_only`: observe-only use of the foreign session. The extension holds
-    **no control token** for it (the token is issued exactly once, at `start`,
-    to the creating client), so mutating calls are refused by the daemon with
-    `CONTROL_TOKEN_REQUIRED` and the extension can never stop it. It also
-    holds no observation token, so observing a foreign session requires the
-    owner to share one (v3: a session id alone grants no observation
-    permission) — a tokenless `read_only` attach is refused with
-    `attachReadOnly` rather than silently observed. The pre-0.2 value
-    `attach` is still accepted for the same behavior, with a deprecation
-    warning.
+  - `reject` (the only policy, and the default): tools fail with
+    `CONTROL_LOCKED`, whose payload names the owner's non-secret identity —
+    the extension never takes over.
+  - `read_only` and the pre-0.2 `attach` values are **removed**: they are
+    accepted with a deprecation warning and behave exactly like `reject`. A
+    read-only attach without the foreign session's observation token granted
+    nothing (v3: a session id alone grants no observation permission), so the
+    removed behavior was silently powerless — refusing is honest.
   There is deliberately no `start_new` policy — the runtime allows only one
   active session — and no token-less takeover: attaching without the
   capability would be silently powerless.
@@ -102,5 +98,5 @@ Saved screenshots never touch the repo, project, or working directory:
 ## Tests
 
 ```bash
-pnpm test   # 16 tests (stateful fake daemon, drive the registered tools directly)
+pnpm test   # 17 tests (stateful fake daemon, drive the registered tools directly)
 ```

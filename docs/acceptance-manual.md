@@ -159,6 +159,40 @@ connected** (entry present in `~/.config/opencode/opencode.json`, command
   the OpenCode UI) remain **NOT VERIFIED** — the GLM Coding Plan on the
   acceptance machine is still expired (see the round-2 failure record).
 
+**Round 5 (2026-08-05)** — release hardening: sensitive-read capability
+tokens, credential-file write safety, graceful shutdown, removed session
+policies. Both integrations re-verified against the round-5 daemon:
+
+- `scripts/pi-host-acceptance.mjs` → **32/32 PASS** (host shim; real
+  extension code, real daemon, real screen). Round-5 differences:
+  - the removed `read_only`/`attach` policies are gone from the wire: both
+    env values print the deprecation warning and behave exactly like the
+    only policy, `reject` — the scenario now asserts `CONTROL_LOCKED` +
+    warning for both, and that a rejected client's `session_shutdown` never
+    stops the foreign session.
+  - sensitive reads in the scenario (session state, screenshot) all flow
+    through the session's capability tokens — the acceptance script reads
+    Pi-session state via the extension's own `computer_session` tool.
+  - screenshots: saved under the system temp dir, mode `0600`, real JPEG
+    magic, cleaned up on shutdown — re-asserted in the round-5 run.
+- `scripts/opencode-mcp-acceptance.mjs` → **17/17 PASS** (real
+  `computer-use-mcp` binary over stdio, real daemon, real screen),
+  including cancel of a 30 s wait in 750 ms and STALE_FRAME rejection
+  after a window switch.
+- graceful shutdown verified live: `cu daemon stop` drains the socket,
+  cancels in-flight actions (`cancelled`, `executed: false` — never a
+  JSON-RPC error), removes the socket + admin token, and the daemon
+  restarts cleanly on the same paths.
+
+Round-5 environment fix worth recording: the OpenCode acceptance script
+failed with `spawn computer-use-mcp EACCES` because the **globally
+installed** copy of the MCP server (`~/.npm-global/lib/node_modules/
+@computer-use/mcp-server/dist/bin.js`) had lost its executable bit —
+the workspace build artifact keeps `+x` (the add-shebang build step), but
+the npm-installed copy did not. Fix: `chmod +x` on the installed copy.
+If that ever recurs, run `computer-use-mcp` directly and check the file
+mode before blaming the script.
+
 ## Failure record (round 2)
 
 | Date | Step # | Observed | Root cause / fix |

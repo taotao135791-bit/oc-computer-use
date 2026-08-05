@@ -367,8 +367,17 @@ async fn run(cli: Cli) -> Result<(), ClientError> {
         Command::Doctor => run_doctor().await,
         Command::Permissions => print_json(request("runtime.permissions", Value::Null).await?),
         Command::Displays => print_json(request("runtime.displays", Value::Null).await?),
-        Command::Pointer => print_json(request("runtime.pointer", Value::Null).await?),
-        Command::ActiveApp => print_json(request("runtime.active_application", Value::Null).await?),
+        // Cursor location and the active application are sensitive reads
+        // (observation or control token required): present any capability
+        // credential this CLI holds.
+        Command::Pointer => {
+            let params = token_params();
+            print_json(request("runtime.pointer", params).await?)
+        }
+        Command::ActiveApp => {
+            let params = token_params();
+            print_json(request("runtime.active_application", params).await?)
+        }
         Command::Session(args) => run_session(args).await,
         Command::Observe(args) => run_observe(args).await,
         Command::Inspect(args) => run_inspect(args).await,
@@ -397,28 +406,15 @@ fn emit(value: &Value, json: bool) {
     }
 }
 
-/// Deep-redact every capability token field (`control_token`,
-/// `observation_token`, `admin_token`) so a secret can never reach stdout,
-/// even in `--json` output. The daemon only returns the session tokens in
-/// `start` responses (exactly once); those must never be printed verbatim.
-/// `admin_token` rides only *requests*, never responses, but redacting it
-/// too is cheap defense if a response ever echoes params.
+/// Deep-redact every capability token field so a secret can never reach
+/// stdout, even in `--json` output. The daemon only returns the session
+/// tokens in `start` responses (exactly once); those must never be printed
+/// verbatim. `admin_token` rides only *requests*, never responses, but
+/// redacting it too is cheap defense if a response ever echoes params.
+/// Delegates to the shared [`cu_core::redact_json`] — one redaction rule for
+/// the runtime, the logs, and the CLI.
 fn redact_token(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                if k == "control_token" || k == "observation_token" || k == "admin_token" {
-                    out.insert(k.clone(), Value::String("<redacted>".into()));
-                } else {
-                    out.insert(k.clone(), redact_token(v));
-                }
-            }
-            Value::Object(out)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(redact_token).collect()),
-        other => other.clone(),
-    }
+    cu_core::redact_json(value)
 }
 
 /// `--json` flag forms: many commands carry it, but simple list-like commands
@@ -426,6 +422,27 @@ fn redact_token(value: &Value) -> Value {
 fn print_json(value: Value) -> Result<(), ClientError> {
     println!("{}", serde_json::to_string_pretty(&value).unwrap());
     Ok(())
+}
+
+/// Build the token fields for the **cross-session** sensitive reads
+/// (`runtime.pointer`, `runtime.active_application`, `trace.list`): any
+/// capability credential this CLI holds. No credentials → the params stay
+/// empty and the daemon refuses with OBSERVATION_TOKEN_REQUIRED.
+fn token_params() -> Value {
+    let token = credentials::all()
+        .into_iter()
+        .map(|cred| {
+            if !cred.observation_token.is_empty() {
+                cred.observation_token
+            } else {
+                cred.control_token
+            }
+        })
+        .next();
+    match token {
+        Some(t) => json!({ "observation_token": t }),
+        None => json!({}),
+    }
 }
 
 fn human_action_result(value: &Value) {
@@ -1030,7 +1047,9 @@ async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
         }
     }
 
-    emit(&resp, args.json);
+    // Status/pause/resume/stop responses are tokenless by contract, but the
+    // redaction is cheap defense if a future response ever echoes params.
+    emit(&redact_token(&resp), args.json);
     Ok(())
 }
 
@@ -1406,20 +1425,23 @@ async fn run_wait(args: WaitArgs) -> Result<(), ClientError> {
 async fn run_trace(args: TraceArgs) -> Result<(), ClientError> {
     match args.action {
         TraceAction::List => {
-            let resp = request("trace.list", Value::Null).await?;
+            // The trace listing is a sensitive read since round 5: a token is
+            // required (any capability credential this CLI holds). Entries
+            // are metadata only — no filesystem paths.
+            let resp = request("trace.list", token_params()).await?;
             if let Some(traces) = resp.get("traces").and_then(|v| v.as_array()) {
                 if traces.is_empty() {
                     println!("no traces yet");
                 } else {
                     println!(
-                        "{:<12} {:>6} {:>8}  started_at",
-                        "session", "entries", "bytes"
+                        "{:<12} {:>6} {:>8}  created_at",
+                        "session", "events", "bytes"
                     );
                     for t in traces {
                         let sid = t.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
-                        let entries = t.get("entries").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let bytes = t.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let at = t.get("started_at").and_then(|v| v.as_str()).unwrap_or("?");
+                        let entries = t.get("event_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let bytes = t.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let at = t.get("created_at").and_then(|v| v.as_str()).unwrap_or("?");
                         println!("{sid:<12} {entries:>6} {bytes:>8}  {at}");
                     }
                 }

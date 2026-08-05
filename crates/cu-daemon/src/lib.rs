@@ -7,4 +7,7 @@
 pub mod jsonrpc;
 pub mod server;
 
+#[cfg(test)]
+pub(crate) mod fakes;
+
 pub use server::{run, DaemonConfig};

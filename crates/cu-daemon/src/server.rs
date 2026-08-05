@@ -8,7 +8,13 @@
 //! - Each request runs under a deadline; a timed-out request cancels the
 //!   in-flight action batch (cooperatively) and recycles the Swift bridge so no
 //!   stale response can desync later calls.
-//! - `runtime.shutdown` cancels the accept loop for a graceful stop.
+//! - `runtime.shutdown` (admin token only) is a graceful stop: new requests
+//!   are refused with `DAEMON_SHUTTING_DOWN`, in-flight action batches are
+//!   cancelled, every connection is drained (it stops reading the moment
+//!   shutdown is requested and only finishes responses already started), and
+//!   anything still alive after the grace period is aborted. The socket and
+//!   the admin token file are removed on the way out, so the daemon can be
+//!   restarted cleanly on the same path.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +43,9 @@ pub struct DaemonConfig {
     /// Per-request deadline in seconds. Generous by default; session
     /// pause/stop/cancel remain the responsive cancellation path.
     pub request_timeout_secs: u64,
+    /// How long shutdown waits for connections to drain their in-flight
+    /// responses before aborting them (a graceful stop never hangs forever).
+    pub shutdown_grace_secs: u64,
     pub runtime_config: RuntimeConfig,
 }
 
@@ -60,6 +69,7 @@ impl Default for DaemonConfig {
             socket_path: cu_core::config::socket_path(),
             admin_token_path: cu_core::config::daemon_admin_path(),
             request_timeout_secs: 600,
+            shutdown_grace_secs: 10,
             runtime_config,
         }
     }
@@ -68,6 +78,14 @@ impl Default for DaemonConfig {
 /// Run the daemon until `runtime.shutdown` or Ctrl-C. Returns after cleanup.
 pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let driver: Arc<dyn ComputerDriver> = Arc::new(MacosDriver::new());
+    serve_with(driver, config).await
+}
+
+/// The daemon loop over a caller-provided driver (tests inject a fake).
+pub(crate) async fn serve_with(
+    driver: Arc<dyn ComputerDriver>,
+    config: DaemonConfig,
+) -> anyhow::Result<()> {
     let runtime = Arc::new(Runtime::new(driver, config.runtime_config.clone()));
 
     // Prune trace files older than the retention window on startup.
@@ -126,6 +144,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
 
     tracing::info!(path = %socket.display(), version = %cu_core::config::RUNTIME_VERSION, "computer-use daemon listening");
 
+    // Every connection task is tracked in a JoinSet so shutdown can drain
+    // them: connections are told to stop reading (and finish their in-flight
+    // responses), and anything still alive after the grace period is aborted.
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = app_shutdown.cancelled() => break,
@@ -137,7 +159,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                         let timeout = config.request_timeout_secs;
                         let admin_hash = admin_hash.clone();
                         let connection_id = connection_counter.fetch_add(1, Ordering::Relaxed);
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             if let Err(e) = handle_connection(stream, connection_id, runtime, shutdown, admin_hash, timeout).await {
                                 tracing::debug!(error = %e, "connection handler ended");
                             }
@@ -149,8 +171,26 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Graceful shutdown: refuse new work, cancel in-flight actions, stop
+    // sessions, release the driver — then wait for the connections to drain
+    // their remaining responses (already in flight when the flag flipped).
     tracing::info!("shutting down daemon");
     let _ = runtime.shutdown().await;
+
+    // Drain connections. Each one stopped reading the moment shutdown was
+    // requested and is only finishing responses it already started; the grace
+    // period bounds how long a stuck client can delay the exit.
+    let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
+    let drained = tokio::time::timeout(grace, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!("grace period expired; aborting remaining connections");
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
+
     let _ = std::fs::remove_file(socket);
     // The admin token dies with the daemon: a stale file would make the next
     // `stop` misread state (and leak a live credential to nothing).
@@ -185,7 +225,20 @@ async fn handle_connection(
     let writer = Arc::new(tokio::sync::Mutex::new(write_half));
     let mut inflight = Vec::new();
 
-    while let Some(line) = lines.next_line().await? {
+    // On shutdown the daemon stops accepting new requests: the loop below
+    // breaks, and the in-flight tasks finish (the runtime cancelled the
+    // action batches; anything dispatched after the flag flipped fails fast
+    // with DAEMON_SHUTTING_DOWN). The server's grace period is the bound on
+    // a client that never reads its responses.
+    loop {
+        let line = tokio::select! {
+            _ = app_shutdown.cancelled() => break,
+            line = lines.next_line() => match line {
+                Ok(Some(l)) => l,
+                Ok(None) => break, // client closed
+                Err(e) => return Err(e.into()),
+            },
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -254,4 +307,242 @@ async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, resp: &RpcResponse) -> 
     w.write_all(payload.as_bytes()).await?;
     w.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fakes::{test_config, FakeDriver};
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// One running server over a fake driver on a temp socket.
+    struct TestServer {
+        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+        socket: PathBuf,
+        admin_path: PathBuf,
+        dir: tempfile::TempDir,
+    }
+
+    async fn spawn_test_server() -> TestServer {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("runtime.sock");
+        let admin_path = dir.path().join("daemon-admin.json");
+        let config = DaemonConfig {
+            socket_path: socket.clone(),
+            admin_token_path: admin_path.clone(),
+            request_timeout_secs: 60,
+            shutdown_grace_secs: 5,
+            runtime_config: test_config(),
+        };
+        let driver: Arc<dyn ComputerDriver> = Arc::new(FakeDriver::default());
+        let handle = tokio::spawn(serve_with(driver, config));
+        for _ in 0..200 {
+            if socket.exists() && admin_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "server did not create its socket");
+        assert!(
+            admin_path.exists(),
+            "server did not persist its admin token"
+        );
+        TestServer {
+            handle,
+            socket,
+            admin_path,
+            dir,
+        }
+    }
+
+    /// A raw line-based client that keeps its connection open (unlike the
+    /// one-shot `request` helper) so drain behavior is observable.
+    struct WireClient {
+        reader: BufReader<tokio::net::UnixStream>,
+    }
+
+    async fn connect(socket: &Path) -> WireClient {
+        let stream = UnixStream::connect(socket)
+            .await
+            .unwrap_or_else(|e| panic!("cannot connect to {socket:?}: {e}"));
+        WireClient {
+            reader: BufReader::new(stream),
+        }
+    }
+
+    impl WireClient {
+        /// Send one request and read exactly one response line.
+        ///
+        /// `None` means the daemon closed the connection instead of answering
+        /// (shutdown drain behavior): the write failed with broken pipe, the
+        /// read hit EOF, or the line was not valid JSON.
+        async fn call(
+            &mut self,
+            id: u64,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Option<Value> {
+            let mut line = serde_json::to_string(
+                &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+            )
+            .unwrap();
+            line.push('\n');
+            if self.reader.write_all(line.as_bytes()).await.is_err() {
+                return None;
+            }
+            if self.reader.flush().await.is_err() {
+                return None;
+            }
+            let mut resp = String::new();
+            match self.reader.read_line(&mut resp).await {
+                Ok(0) => None, // clean EOF: the daemon stopped reading
+                Ok(_) => serde_json::from_str::<Value>(resp.trim()).ok(),
+                Err(_) => None,
+            }
+        }
+    }
+
+    fn admin_token(path: &Path) -> cu_core::security::DaemonAdminToken {
+        cu_core::security::load_daemon_admin_token_from(path)
+            .expect("server must have persisted its admin token")
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_connections_and_cleans_up_for_a_clean_restart() {
+        let mut s = spawn_test_server().await;
+
+        // Connection A stays open and watches the daemon go down.
+        let mut a = connect(&s.socket).await;
+        let ok = a
+            .call(1, "runtime.health", json!({}))
+            .await
+            .expect("health must be answered");
+        assert_eq!(ok["result"]["ready"], json!(true));
+
+        // Connection B is established before shutdown too — it must observe
+        // the drain: its request dispatched after the flag flips fails with
+        // the typed DAEMON_SHUTTING_DOWN (or the connection just closes).
+        let mut b = connect(&s.socket).await;
+
+        // Connection A requests the graceful shutdown with the admin token.
+        let token = admin_token(&s.admin_path);
+        let resp = a
+            .call(
+                2,
+                "runtime.shutdown",
+                json!({ "admin_token": token.as_str() }),
+            )
+            .await
+            .expect("shutdown must be answered");
+        assert!(resp["result"].is_object(), "shutdown must succeed");
+
+        // The server must exit on its own within the grace period.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), &mut s.handle)
+            .await
+            .expect("server must finish within the grace period")
+            .expect("server run must return Ok");
+
+        // New requests are refused: the daemon is gone (the connection
+        // closes instead of answering).
+        let refused = b.call(3, "runtime.health", json!({})).await;
+        assert!(
+            refused.is_none()
+                || refused.as_ref().and_then(|v| v.get("error")).is_some()
+                || refused.as_ref().and_then(|v| v.get("result")).is_none(),
+            "a request after shutdown must not be served, got {refused:?}"
+        );
+
+        // The socket and the admin token file are gone — the daemon can
+        // restart cleanly on the same paths.
+        assert!(!s.socket.exists(), "socket must be removed on shutdown");
+        assert!(!s.admin_path.exists(), "admin token file must be removed");
+
+        // Restart on the same paths proves a clean, restartable daemon.
+        let dir2 = tempfile::tempdir().unwrap();
+        let socket2 = s.socket.clone();
+        let admin2 = s.admin_path.clone();
+        let config = DaemonConfig {
+            socket_path: socket2.clone(),
+            admin_token_path: admin2.clone(),
+            request_timeout_secs: 60,
+            shutdown_grace_secs: 5,
+            runtime_config: test_config(),
+        };
+        let driver2: Arc<dyn ComputerDriver> = Arc::new(FakeDriver::default());
+        let h2 = tokio::spawn(serve_with(driver2, config));
+        for _ in 0..200 {
+            if socket2.exists() && admin2.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(socket2.exists(), "restarted server must bind its socket");
+        let mut c = connect(&socket2).await;
+        let ok = c
+            .call(1, "runtime.health", json!({}))
+            .await
+            .expect("restarted health must be answered");
+        assert_eq!(ok["result"]["ready"], json!(true));
+
+        // Stop the restarted server too (fresh admin token).
+        let token2 = admin_token(&admin2);
+        let resp = c
+            .call(
+                2,
+                "runtime.shutdown",
+                json!({ "admin_token": token2.as_str() }),
+            )
+            .await
+            .expect("restarted shutdown must be answered");
+        assert!(resp["result"].is_object());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), h2)
+            .await
+            .expect("restarted server must also exit");
+        let _ = dir2.close();
+        s.dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn requests_issued_after_shutdown_are_refused_with_daemon_shutting_down() {
+        let mut s = spawn_test_server().await;
+        let mut client = connect(&s.socket).await;
+
+        // Fire the shutdown…
+        let token = admin_token(&s.admin_path);
+        let resp = client
+            .call(
+                1,
+                "runtime.shutdown",
+                json!({ "admin_token": token.as_str() }),
+            )
+            .await
+            .expect("shutdown must be answered");
+        assert!(resp["result"].is_object(), "shutdown must succeed");
+
+        // …and a request that races the drain. Either the daemon already
+        // stopped reading (connection closed) or dispatch refused it with the
+        // typed code — never a real result.
+        let late = client.call(2, "runtime.health", json!({})).await;
+        let code = late
+            .as_ref()
+            .and_then(|v| v.get("error"))
+            .and_then(|e| e.get("data"))
+            .and_then(|d| d.get("code"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        assert!(
+            late.is_none()
+                || code == "DAEMON_SHUTTING_DOWN"
+                || late.as_ref().and_then(|v| v.get("result")).is_none(),
+            "late request must be refused, got {late:?}"
+        );
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), &mut s.handle)
+            .await
+            .expect("server must exit")
+            .expect("run must return Ok");
+        s.dir.close().unwrap();
+    }
 }

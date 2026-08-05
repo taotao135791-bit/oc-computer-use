@@ -270,39 +270,46 @@ check(
   locked ? `${locked.code}: ${locked.message}` : "no error",
 );
 
-// Scenario B: read_only attach. v3: a session id alone grants no observation
-// permission, so a tokenless read_only attach is refused with INVALID_PARAMS
-// pointing at attachReadOnly — the extension must not silently observe a
-// session it has no token for. The legacy `attach` value maps to read_only
-// with a deprecation warning.
+// Scenario B: removed read_only/attach policies. The observe-only policies
+// were removed in 0.3 (a tokenless read-only attach granted nothing — the
+// daemon refuses every sensitive read without a capability), so both values
+// warn and behave exactly like the only policy, reject.
 const host2 = await loadExtension();
-process.env.COMPUTER_USE_EXISTING_SESSION_POLICY = "attach";
 const warnings = [];
 const origWarn = console.warn;
 console.warn = (m) => warnings.push(String(m));
 let attachErr = null;
 try {
+  // Scenario B-1: the legacy `attach` value.
+  process.env.COMPUTER_USE_EXISTING_SESSION_POLICY = "attach";
   try {
     await callTool(host2.tools.get("computer_observe"), {});
   } catch (e) {
     attachErr = e;
   }
-} finally {
-  console.warn = origWarn;
-}
-check(
-  "legacy COMPUTER_USE_EXISTING_SESSION_POLICY=attach → deprecation warning",
-  warnings.some((w) => w.includes("attach is deprecated")),
-  warnings.join(" | ") || "no warning",
-);
-check(
-  "read_only attach without the observation token → INVALID_PARAMS (attachReadOnly)",
-  attachErr?.code === "INVALID_PARAMS" && /attachReadOnly/.test(attachErr?.message ?? ""),
-  attachErr ? `${attachErr.code}: ${attachErr.message}` : "no error — silently attached",
-);
-delete process.env.COMPUTER_USE_EXISTING_SESSION_POLICY;
-process.env.COMPUTER_USE_EXISTING_SESSION_POLICY = "read_only";
-try {
+  check(
+    "legacy COMPUTER_USE_EXISTING_SESSION_POLICY=attach → deprecation warning + reject",
+    warnings.some((w) => w.includes("attach is deprecated")) &&
+      attachErr?.code === "CONTROL_LOCKED",
+    warnings.join(" | ") + (attachErr ? ` | ${attachErr.code}` : " | no error — silently attached"),
+  );
+
+  // Scenario B-2: the removed `read_only` value — same warning + reject.
+  delete process.env.COMPUTER_USE_EXISTING_SESSION_POLICY;
+  process.env.COMPUTER_USE_EXISTING_SESSION_POLICY = "read_only";
+  let readOnlyErr = null;
+  try {
+    await callTool(host2.tools.get("computer_observe"), {});
+  } catch (e) {
+    readOnlyErr = e;
+  }
+  check(
+    "removed read_only policy → deprecation warning + reject (CONTROL_LOCKED)",
+    warnings.some((w) => w.includes("read_only is deprecated")) &&
+      readOnlyErr?.code === "CONTROL_LOCKED",
+    warnings.join(" | ") + (readOnlyErr ? ` | ${readOnlyErr.code}` : " | no error — silently attached"),
+  );
+
   for (const cb of host2.shutdownHandlers) await cb();
   // CLI owns the foreign session, so the CLI (with its own credential) reads it.
   const stF = cuSessionStatus();
@@ -312,6 +319,7 @@ try {
     `session ${stF?.session_id} state=${stF?.state}`,
   );
 } finally {
+  console.warn = origWarn;
   delete process.env.COMPUTER_USE_EXISTING_SESSION_POLICY;
 }
 

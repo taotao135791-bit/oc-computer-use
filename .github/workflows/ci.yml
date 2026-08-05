@@ -45,12 +45,23 @@ jobs:
           cache: pnpm
       - name: Install
         run: pnpm install --frozen-lockfile
-      - name: Lint
-        run: pnpm -r lint
-      - name: Typecheck
-        run: pnpm -r typecheck
+      - name: Clean (no leftover build products)
+        run: pnpm clean
+      - name: Generate protocol bindings
+        run: pnpm generate:protocol
+      - name: Protocol drift check
+        run: pnpm check:protocol
+      # Build comes first: every consumer package resolves @computer-use/sdk
+      # through its built `dist` declaration files (`types` -> dist/index.d.ts).
+      # pnpm -r runs in dependency order, so the SDK is built before MCP / Pi /
+      # OpenCode. This is what makes a clean checkout (no local dist/ leftovers)
+      # pass strict typecheck and lint.
       - name: Build
         run: pnpm -r build
+      - name: Typecheck
+        run: pnpm -r typecheck
+      - name: Lint
+        run: pnpm -r lint
       - name: Test
         run: pnpm -r test
 

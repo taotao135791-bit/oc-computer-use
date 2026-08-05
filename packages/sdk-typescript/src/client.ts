@@ -487,16 +487,28 @@ export class ComputerUseClient {
     return this.request<DisplayInfo[]>("runtime.displays");
   }
 
+  /**
+   * Cross-session sensitive reads (`runtime.desktop_layout`, `runtime.pointer`,
+   * `runtime.active_application`, `trace.list`) have no `session_id`, so the
+   * client presents the observation credential it holds for its own session —
+   * a valid token proves a trusted client. Tokenless clients get
+   * OBSERVATION_TOKEN_REQUIRED from the daemon.
+   */
+  private capabilityTokenParams(): { observation_token?: string } {
+    const token = this.sessionCredential?.observationToken ?? this.sessionCredential?.controlToken;
+    return token ? { observation_token: token } : {};
+  }
+
   desktopLayout(): Promise<DesktopLayout> {
-    return this.request<DesktopLayout>("runtime.desktop_layout");
+    return this.request<DesktopLayout>("runtime.desktop_layout", this.capabilityTokenParams());
   }
 
   pointer(): Promise<PointerInfo> {
-    return this.request<PointerInfo>("runtime.pointer");
+    return this.request<PointerInfo>("runtime.pointer", this.capabilityTokenParams());
   }
 
   activeApplication(): Promise<ApplicationInfo> {
-    return this.request<ApplicationInfo>("runtime.active_application");
+    return this.request<ApplicationInfo>("runtime.active_application", this.capabilityTokenParams());
   }
 
   /**
@@ -744,11 +756,13 @@ export class ComputerUseClient {
    * Observe is a sensitive read: the observation credential is injected
    * automatically when this client holds one (explicit tokens always win).
    */
-  async observe(params: ObserveParams = {}, options?: RequestOptions): Promise<ObserveResult> {
-    let p: ObserveParams = params;
+  async observe(params: Partial<ObserveParams> = {}, options?: RequestOptions): Promise<ObserveResult> {
+    // The observation-or-control token requirement lives on the wire: the
+    // credential is injected below and the daemon (and schema) enforce it.
+    let p: ObserveParams = params as ObserveParams;
     if (!p.session_id) {
       const session = await this.ensureSession(undefined, options);
-      p = { ...params, session_id: session.session_id };
+      p = { ...params, session_id: session.session_id } as ObserveParams;
     }
     return this.request<ObserveResult>(
       "computer.observe",
@@ -757,11 +771,11 @@ export class ComputerUseClient {
     );
   }
 
-  act(params: ActParams, options?: RequestOptions): Promise<ActResult> {
-    const p: ActParams = { ...params };
-    // The daemon refuses a batch before executing anything without the token;
-    // inject the one this client holds for the session (never override an
-    // explicit token).
+  act(params: Partial<ActParams>, options?: RequestOptions): Promise<ActResult> {
+    // The wire schema requires the control token; the client injects the one
+    // it holds for the session (never overriding an explicit token). The
+    // daemon refuses a tokenless batch before executing anything.
+    const p: ActParams = { ...params } as ActParams;
     if (!p.control_token) {
       const token = this.tokenFor(p.session_id);
       if (token) p.control_token = token;
@@ -769,8 +783,12 @@ export class ComputerUseClient {
     return this.request<ActResult>("computer.act", p, options ?? {});
   }
 
-  /** Inspect pixels of a stored frame — a sensitive read, token-injected. */
-  inspect(params: InspectParams, options?: RequestOptions): Promise<InspectResult> {
+  /**
+   * Inspect pixels of a stored frame — a sensitive read. The observation
+   * credential is injected automatically; the wire schema requires one of
+   * `observation_token` / `control_token`.
+   */
+  inspect(params: Partial<InspectParams>, options?: RequestOptions): Promise<InspectResult> {
     return this.request<InspectResult>(
       "computer.inspect",
       this.withObservationTokens(params),
@@ -778,8 +796,8 @@ export class ComputerUseClient {
     );
   }
 
-  cancel(params: CancelParams, options?: RequestOptions): Promise<CancelResult> {
-    const p: CancelParams = { ...params };
+  cancel(params: Partial<CancelParams>, options?: RequestOptions): Promise<CancelResult> {
+    const p: CancelParams = { ...params } as CancelParams;
     if (!p.control_token) {
       const token = this.tokenFor(p.session_id);
       if (token) p.control_token = token;
@@ -791,9 +809,14 @@ export class ComputerUseClient {
   // Traces
   // -------------------------------------------------------------------------
 
-  /** List trace metadata — public, like `session.summary`. */
+  /**
+   * List trace metadata. Sensitive since round 5: the daemon requires an
+   * observation or control token (presented from this client's own session
+   * credential) — a listing reveals which sessions ever ran on the machine.
+   * Entries carry metadata only, never filesystem paths.
+   */
   traceList(): Promise<TraceList> {
-    return this.request<TraceList>("trace.list");
+    return this.request<TraceList>("trace.list", this.capabilityTokenParams());
   }
 
   /** Trace contents are a sensitive read — the observation credential is injected. */
@@ -842,8 +865,9 @@ export class ComputerUseClient {
    * Fire-and-forget precise `computer.cancel` for a request that was aborted
    * locally. `request_id` pins it to this connection's request, so an abort in
    * one client can never cancel another client's request with the same id. The
-   * control token is included when known; without it the daemon refuses the
-   * cancel — which is correct, an abort is not a license to cancel others.
+   * control token is included when known; without it there is nothing to send
+   * (the daemon refuses a tokenless cancel — an abort is not a license to
+   * cancel others).
    */
   private notifyCancel(method: string, params: unknown, requestId: number): void {
     if (!this.socket || this.closed) return;
@@ -851,8 +875,10 @@ export class ComputerUseClient {
     if (typeof sid !== "string" || !sid) return;
     const p = params as { control_token?: unknown };
     const token = typeof p.control_token === "string" ? p.control_token : this.tokenFor(sid);
-    const cancelParams: CancelParams = { session_id: sid, request_id: requestId };
-    if (token) cancelParams.control_token = token;
+    // The schema requires the control token on the wire, and the daemon
+    // refuses a tokenless cancel — there is nothing to send without one.
+    if (!token) return;
+    const cancelParams: CancelParams = { session_id: sid, request_id: requestId, control_token: token };
     const payload = {
       jsonrpc: "2.0",
       id: this.nextId++,

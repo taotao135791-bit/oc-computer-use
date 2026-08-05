@@ -110,9 +110,14 @@ not by the client, so every adapter gets the same guarantees.
   or a daemon restart invalidates them. The CLI persists session credentials
   to files with mode `0600`; the SDK keeps them in memory only.
 - **Existing sessions default to `reject`**: a client that finds a session it
-  does not own must not silently attach — `read_only` (observe-only, no
-  token held) and `attach_with_token` (caller supplies the token) are
-  explicit opt-ins.
+  does not own must not silently attach. The SDK's `ensureSession` offers
+  explicit, token-bearing opt-ins only: `read_only` requires the foreign
+  session's **observation token** (`attachReadOnly(sessionId, observationToken)`
+  first) and `attach_with_token` requires its **control token** — a session id
+  alone grants nothing. Adapters expose no token-less policy: the Pi
+  extension's `COMPUTER_USE_EXISTING_SESSION_POLICY` is `reject` only (the
+  pre-0.3 `read_only`/`attach` values print a deprecation warning and behave
+  like `reject`).
 - **Daemon admin token**: `runtime.shutdown` requires a per-install admin
   token (256-bit CSPRNG, persisted `0600` at daemon startup) — only the
   daemon manager (CLI / LaunchAgent) holds it; a corrupt store refuses
@@ -179,9 +184,14 @@ the trace cannot be recorded), or `disabled` (no recorder).
 ## Tests
 
 ```bash
-cargo test --workspace                    # 175 tests (Rust: core, driver, runtime, daemon protocol, ownership matrix)
+cargo test --workspace                    # 219 tests (Rust: core, driver, runtime, daemon protocol, ownership matrix)
 cargo test -p cu-daemon --test integration -- --ignored   # live security-matrix test
-pnpm install && pnpm -r build && pnpm -r test             # 80 tests: SDK (33), Pi (14), OpenCode adapter (23), MCP (10)
+pnpm install && pnpm -r build && pnpm -r test             # SDK / Pi / OpenCode adapter / MCP suites
+pnpm run ci                               # the full TypeScript gate in one command:
+                                          #   check:protocol → build → typecheck → lint → test
+                                          #   (a *repo* script; not `pnpm ci`, which is the
+                                          #   lockfile-only install command)
+pnpm scan:secrets                         # gitleaks over the whole repo
 ./scripts/smoke.sh                        # automated smoke: gates + Pi/OpenCode wiring snapshots
 ```
 
@@ -196,14 +206,15 @@ node scripts/ownership-scenario-a.mjs     # ownership: MCP-owned session vs. the
 
 See [docs/acceptance-manual.md](docs/acceptance-manual.md) for the full
 manual checklists (Pi 20 steps, OpenCode 14 steps, ownership A/B/C) and the
-results recorded during the round-2 and round-3 acceptance runs.
+results recorded during the round-2 through round-5 acceptance runs.
 
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — components, threads, data flow
-- [docs/protocol.md](docs/protocol.md) — JSON-RPC surface, methods, error codes, session behavior (auto-create, ownership, cancel)
+- [docs/protocol.md](docs/protocol.md) — JSON-RPC surface, methods, error codes, session behavior (auto-create, ownership, cancel, shutdown)
 - [docs/permissions.md](docs/permissions.md) — Screen Recording / Accessibility setup & troubleshooting
-- [docs/acceptance-manual.md](docs/acceptance-manual.md) — Pi (20 steps) + OpenCode (14 steps) manual acceptance checklist, with round-2 and round-3 results
+- [docs/acceptance-manual.md](docs/acceptance-manual.md) — Pi + OpenCode + ownership manual acceptance checklist, with round-2 through round-5 results
+- [SECURITY.md](SECURITY.md) — threat model, secret handling, credential-file write safety
 - [docs/uninstall.md](docs/uninstall.md) — clean removal
 - [packages/sdk-typescript/README.md](packages/sdk-typescript/README.md)
 - [packages/mcp-server/README.md](packages/mcp-server/README.md)

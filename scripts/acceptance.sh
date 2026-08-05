@@ -154,7 +154,7 @@ fi
 if [ -f "$OWN_CRED" ]; then echo "  FAIL ownership — credential survives stop"; FAIL=$((FAIL + 1)); else echo "  ok   ownership — credential removed on stop"; PASS=$((PASS + 1)); fi
 
 echo "-- 14. trace list / export / replay -------------------------------------------"
-check "trace.list" 'entries' "$("$CU" trace list 2>&1)"
+check "trace.list" 'events' "$("$CU" trace list 2>&1)"
 TMPEXPORT=$(mktemp /tmp/cu-trace-XXXX.jsonl)
 check "trace.export" 'exported' "$("$CU" trace export "$SESSION_ID" "$TMPEXPORT" 2>&1)"
 [ -s "$TMPEXPORT" ] && { echo "  ok   export file non-empty"; PASS=$((PASS + 1)); } || { echo "  FAIL export file empty"; FAIL=$((FAIL + 1)); }

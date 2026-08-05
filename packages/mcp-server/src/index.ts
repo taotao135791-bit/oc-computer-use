@@ -483,7 +483,7 @@ export function createComputerUseServer(
         if (traces.length === 0) return { content: [textBlock("no traces recorded")] };
         const lines = traces.map(
           (t) =>
-            `${t.session_id}\t${t.entries} entries\t${t.bytes} bytes\t${t.started_at}`,
+            `${t.session_id}\t${t.event_count} events\t${t.size_bytes} bytes\t${t.created_at}`,
         );
         return { content: [textBlock(lines.join("\n"))] };
       } catch (err) {
