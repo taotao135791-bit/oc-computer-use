@@ -130,6 +130,8 @@ jobs:
 
   # Package smoke: every automated gate (Rust + TS) in one shot, no daemon
   # or display needed — the same command maintainers run locally.
+  # Full mode requires both macOS rustup targets (release-build.sh
+  # cross-compiles the arm64 + x86_64 release binaries).
   package-smoke:
     name: Package smoke
     runs-on: macos-latest
@@ -138,6 +140,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: pnpm/action-setup@v4
         with:
           version: 10
