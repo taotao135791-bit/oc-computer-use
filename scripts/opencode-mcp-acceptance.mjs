@@ -103,7 +103,11 @@ class McpClient {
 section("OpenCode acceptance — 1..5. daemon, no session, MCP loads, tools exist");
 check("daemon running", cu(["daemon", "status"]).ok);
 const pre = cu(["session", "status", "--json"]);
-check("no active session before first observe", !pre.ok || !pre.json?.session_id, pre.json ? pre.json.session_id : "SESSION_NOT_FOUND");
+// Clean only when the CLI says SESSION_NOT_FOUND: a foreign live session
+// surfaces as OBSERVATION_TOKEN_REQUIRED (also exit 1) and must FAIL this
+// check, not look like an empty daemon.
+const preClean = !pre.ok && /SESSION_NOT_FOUND/.test(pre.raw);
+check("no active session before first observe", preClean || (pre.ok && !pre.json?.session_id), pre.raw.trim().split("\n").pop());
 
 const proc = spawn("computer-use-mcp", [], {
   env: { ...process.env },
@@ -112,6 +116,20 @@ const proc = spawn("computer-use-mcp", [], {
 const client = new McpClient(proc);
 let stderr = "";
 proc.stderr.on("data", (c) => (stderr += c));
+// v3: `cu session status` reads only sessions the CLI itself owns — the CLI
+// persists only its own credentials, and the daemon refuses tokenless status
+// with OBSERVATION_TOKEN_REQUIRED. The MCP server holds the tokens for the
+// session IT created, so state is read through the MCP's own computer_session
+// tool — the exact path OpenCode uses.
+const mcpSessionStatus = async () => {
+  const res = await client.callTool("computer_session", { action: "status" });
+  const text = res.content[0].text;
+  return {
+    session_id: text.match(/session_id: (s_\w+)/)?.[1],
+    started_by: text.match(/started_by: (.+)/)?.[1],
+    text,
+  };
+};
 const init = await client.initialize();
 check("MCP server initializes (as OpenCode sees it)", init.serverInfo.name === "computer-use", JSON.stringify(init.serverInfo));
 const { tools } = await client.listTools();
@@ -130,11 +148,11 @@ check("image is a real screenshot (JPEG magic)", isJpeg);
 const obsText = obs.content.find((b) => b.type === "text").text;
 const frameId = obsText.match(/frame_id: (frame_\d+)/)?.[1];
 check("observe text carries frame_id", !!frameId, frameId);
-const st = cu(["session", "status", "--json"]).json;
+const st = await mcpSessionStatus();
 check(
   "session auto-created, owned by mcp-server",
-  st?.owner_client_id === "mcp-server" && st?.owner_client_name === "Computer Use MCP",
-  `owner=${st?.owner_client_id}/${st?.owner_client_name}/${st?.owner_instance_id} session=${st?.session_id}`,
+  /^s_/.test(st?.session_id ?? "") && st?.started_by === "Computer Use MCP",
+  `started_by=${st?.started_by} session=${st?.session_id}`,
 );
 const obs2 = await client.callTool("computer_observe", { include_image: false });
 check("second observe reuses the session (no second start)", obs2.isError === undefined);
@@ -207,5 +225,16 @@ const after = cu(["session", "status", "--json"]);
 check("no active session after stop", !after.ok || !after.json?.session_id);
 
 proc.kill();
+// Let the MCP server run its own cleanup: SIGTERM → stopOwnedSessionOnExit
+// stops the session it created (the script holds no token for it), then the
+// server exits. Without this, a failed run leaves an orphaned MCP process
+// whose session locks the daemon for the next run.
+try {
+  proc.kill("SIGTERM");
+  await new Promise((resolve) => {
+    proc.once("exit", resolve);
+    setTimeout(resolve, 5000);
+  });
+} catch {}
 console.log(`\n=== ${results.filter((r) => r.ok).length}/${results.length} PASS ===`);
 if (results.some((r) => !r.ok)) process.exit(1);

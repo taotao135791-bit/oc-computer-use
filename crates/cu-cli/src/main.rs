@@ -77,6 +77,10 @@ enum Command {
 struct DaemonArgs {
     #[command(subcommand)]
     action: DaemonAction,
+    /// Print the daemon admin token for debugging (with a warning). Never
+    /// passed by default — the token can shut the daemon down.
+    #[arg(long, global = true)]
+    show_secret: bool,
 }
 
 #[derive(Subcommand)]
@@ -85,15 +89,17 @@ enum DaemonAction {
     Start,
     /// Run the daemon in the foreground (used by `daemon start`).
     Run,
-    /// Ask the daemon to shut down gracefully.
+    /// Ask the daemon to shut down gracefully (reads the admin token file).
     Stop,
+    /// Restart the daemon (stop if running, then start).
+    Restart,
     /// Print whether the daemon is running and its version.
     Status,
 }
 
 #[derive(Args)]
 struct SessionArgs {
-    /// start | status | pause | resume | takeover | release | stop
+    /// start | status | summary | pause | resume | takeover | release | stop
     action: String,
     /// Target session; defaults to the active one for status.
     #[arg(long)]
@@ -391,15 +397,18 @@ fn emit(value: &Value, json: bool) {
     }
 }
 
-/// Deep-redact any `control_token` field so a token can never reach stdout,
-/// even in `--json` output. The daemon only returns the token in `start`
-/// responses; those must never be printed verbatim.
+/// Deep-redact every capability token field (`control_token`,
+/// `observation_token`, `admin_token`) so a secret can never reach stdout,
+/// even in `--json` output. The daemon only returns the session tokens in
+/// `start` responses (exactly once); those must never be printed verbatim.
+/// `admin_token` rides only *requests*, never responses, but redacting it
+/// too is cheap defense if a response ever echoes params.
 fn redact_token(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut out = serde_json::Map::new();
             for (k, v) in map {
-                if k == "control_token" {
+                if k == "control_token" || k == "observation_token" || k == "admin_token" {
                     out.insert(k.clone(), Value::String("<redacted>".into()));
                 } else {
                     out.insert(k.clone(), redact_token(v));
@@ -457,25 +466,28 @@ fn rpc_code_is(data: &Option<Value>, code: &str) -> bool {
 
 /// Resolve a session: the one named by `session_id`, or the currently active
 /// one when the caller left it unspecified. First use auto-creates: when the
-/// daemon has no active session (SESSION_NOT_FOUND), one is started with this
-/// CLI's identity, so `cu observe` / `cu click` work straight after
-/// `cu daemon start`. The token issued by that start is saved to the
-/// credential store — the capability that later mutating commands need.
+/// daemon has no active session, one is started with this CLI's identity, so
+/// `cu observe` / `cu click` work straight after `cu daemon start`. The
+/// capability tokens issued by that start are saved to the credential store.
+///
+/// Discovery is the public `session.summary` probe (v3): `status` is a
+/// sensitive read and this CLI may not hold the active session's credential,
+/// while `session.summary` answers "is there a session" tokenlessly.
 async fn resolve_session(session_id: &Option<String>) -> Result<String, ClientError> {
     if let Some(id) = session_id {
         return Ok(id.clone());
     }
-    let resp = request("computer.session", json!({"action": "status"})).await;
-    let value = match resp {
-        Ok(v) => v,
-        Err(ClientError::Rpc { data, .. }) if rpc_code_is(&data, "SESSION_NOT_FOUND") => {
-            let started = request("computer.session", session_start_params(Value::Null)).await?;
-            save_started_credential(&started);
-            started
-        }
-        Err(e) => return Err(e),
+    let resp = request("session.summary", Value::Null).await?;
+    let active = resp
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let started = match active {
+        Some(id) => return Ok(id.to_string()),
+        None => request("computer.session", session_start_params(Value::Null)).await?,
     };
-    value
+    save_started_credential(&started);
+    started
         .get("session_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -486,14 +498,18 @@ async fn resolve_session(session_id: &Option<String>) -> Result<String, ClientEr
         })
 }
 
-/// Persist the token from a `start` response (issued exactly once) to the
+/// Persist the tokens from a `start` response (issued exactly once) to the
 /// 0600 credential store. Failures are non-fatal — the daemon simply refuses
-/// later mutating commands until the session is restarted.
+/// later sensitive commands until the session is restarted.
 fn save_started_credential(started: &Value) {
     if let (Some(sid), Some(token)) = (
         started.get("session_id").and_then(Value::as_str),
         started.get("control_token").and_then(Value::as_str),
     ) {
+        let observation = started
+            .get("observation_token")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let created_at = started
             .get("created_at")
             .and_then(Value::as_str)
@@ -501,6 +517,7 @@ fn save_started_credential(started: &Value) {
         if let Err(e) = credentials::save(
             sid,
             token,
+            observation,
             &format!("cu-{}", std::process::id()),
             created_at,
         ) {
@@ -510,19 +527,25 @@ fn save_started_credential(started: &Value) {
 }
 
 /// Drop credential files whose sessions no longer exist (stopped, or the
-/// daemon restarted — the token died with the session).
+/// daemon restarted — the tokens died with the session). Probes with the
+/// public `session.summary` (tokenless): `status` is a sensitive read in v3.
 async fn prune_stale_credentials() {
     for cred in credentials::all() {
-        match request(
-            "computer.session",
-            json!({"action": "status", "session_id": cred.session_id}),
-        )
-        .await
-        {
-            Err(ClientError::Rpc { data, .. })
-                if rpc_code_is(&data, "SESSION_NOT_FOUND")
-                    || rpc_code_is(&data, "SESSION_STOPPED") =>
-            {
+        match request("session.summary", Value::Null).await {
+            Ok(v) => {
+                let gone = match v.get("session_id").and_then(Value::as_str) {
+                    Some(id) if id == cred.session_id => matches!(
+                        v.get("state").and_then(Value::as_str),
+                        Some("stopped" | "stopping" | "failed")
+                    ),
+                    Some(_) => false,
+                    None => true,
+                };
+                if gone {
+                    credentials::delete(&cred.session_id);
+                }
+            }
+            Err(ClientError::Rpc { data, .. }) if rpc_code_is(&data, "SESSION_NOT_FOUND") => {
                 credentials::delete(&cred.session_id);
             }
             _ => {}
@@ -556,11 +579,13 @@ async fn resolve_frame(session_id: &str, frame_id: &Option<String>) -> Result<St
     if let Some(f) = frame_id {
         return Ok(f.clone());
     }
-    let obs = request(
-        "computer.observe",
-        json!({"session_id": session_id, "include_image": false}),
-    )
-    .await?;
+    // Observe is a sensitive read: it needs the session's observation
+    // credential, which this CLI holds only for sessions it started.
+    let mut params = json!({"session_id": session_id, "include_image": false});
+    if let Some(t) = credentials::read_token(session_id) {
+        params["observation_token"] = json!(t);
+    }
+    let obs = request("computer.observe", params).await?;
     obs.get("frame_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -612,16 +637,39 @@ async fn run_daemon(args: DaemonArgs) -> Result<(), ClientError> {
                     data: None,
                 })
         }
-        DaemonAction::Start => daemon_start().await,
+        DaemonAction::Start => daemon_start(args.show_secret).await,
         DaemonAction::Stop => daemon_stop().await,
-        DaemonAction::Status => daemon_status().await,
+        DaemonAction::Restart => daemon_restart(args.show_secret).await,
+        DaemonAction::Status => daemon_status(args.show_secret).await,
     }
 }
 
-async fn daemon_start() -> Result<(), ClientError> {
+/// Print the daemon admin token for debugging. Only reachable via explicit
+/// `--show-secret`; the warning is not optional — this token can shut the
+/// daemon down.
+fn print_admin_token_debug() {
+    match cu_core::security::load_daemon_admin_token() {
+        Ok(t) => {
+            eprintln!(
+                "WARNING: the daemon admin token below can shut the daemon down. Do not share it."
+            );
+            println!(
+                "admin_token_path: {}",
+                cu_core::config::daemon_admin_path().display()
+            );
+            println!("admin_token: {}", t.as_str());
+        }
+        Err(e) => eprintln!("cu: warning: admin token unavailable ({e})"),
+    }
+}
+
+async fn daemon_start(show_secret: bool) -> Result<(), ClientError> {
     // Already running?
     if request("runtime.health", Value::Null).await.is_ok() {
         println!("daemon already running");
+        if show_secret {
+            print_admin_token_debug();
+        }
         return Ok(());
     }
 
@@ -671,6 +719,9 @@ async fn daemon_start() -> Result<(), ClientError> {
                     h.get("version").and_then(|v| v.as_str()).unwrap_or("?")
                 );
                 println!("log: {}", log_path.display());
+                if show_secret {
+                    print_admin_token_debug();
+                }
                 return Ok(());
             }
             Err(_) => continue,
@@ -684,8 +735,45 @@ async fn daemon_start() -> Result<(), ClientError> {
 }
 
 async fn daemon_stop() -> Result<(), ClientError> {
-    // Idempotent: stopping a daemon that is not running is not an error.
-    match request("runtime.shutdown", Value::Null).await {
+    // runtime.shutdown is authorized only by the daemon admin token, which
+    // the daemon persisted at startup (0600). Read it back — never guess, and
+    // never fall back to a tokenless request.
+    let token = match cu_core::security::load_daemon_admin_token() {
+        Ok(t) => t,
+        Err(cu_core::security::AdminTokenFileError::Missing) => {
+            // The file is written before the socket binds and removed on
+            // graceful exit — usually no file means no daemon (idempotent
+            // stop, not an error). But a daemon that still answers health is
+            // a pre-v3 binary without admin-token support; say so instead of
+            // claiming it is not running.
+            match request("runtime.health", Value::Null).await {
+                Ok(_) => {
+                    return Err(ClientError::Rpc {
+                        code: -32000,
+                        message: "daemon is running but has no admin token file (is it an old "
+                            .to_string()
+                            + "pre-v3 daemon?); stop it manually and start it again with this cu",
+                        data: None,
+                    });
+                }
+                Err(ClientError::Connect(_, _)) => {
+                    println!("daemon is not running");
+                    return Ok(());
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        Err(e @ cu_core::security::AdminTokenFileError::Corrupt(_)) => {
+            // A corrupt token file must never be skipped silently: the daemon
+            // would be unstoppable and the user wouldn't know why.
+            return Err(ClientError::Rpc {
+                code: -32000,
+                message: format!("cannot read daemon admin token ({e}); refusing to guess"),
+                data: None,
+            });
+        }
+    };
+    match request("runtime.shutdown", json!({ "admin_token": token.as_str() })).await {
         Ok(_) => {
             // Wait for the socket to disappear.
             let sock = cu_core::config::socket_path();
@@ -695,10 +783,17 @@ async fn daemon_stop() -> Result<(), ClientError> {
                     break;
                 }
             }
+            // Defense in depth: the daemon removes its own token file on
+            // graceful exit; drop any leftover so a stale token can never
+            // mislead the next stop.
+            cu_core::security::remove_daemon_admin_token();
             println!("daemon stopped");
             Ok(())
         }
         Err(ClientError::Connect(_, _)) => {
+            // Socket unreachable: not running. Clear the stale token file a
+            // crashed daemon may have left behind.
+            cu_core::security::remove_daemon_admin_token();
             println!("daemon is not running");
             Ok(())
         }
@@ -706,11 +801,21 @@ async fn daemon_stop() -> Result<(), ClientError> {
     }
 }
 
-async fn daemon_status() -> Result<(), ClientError> {
+async fn daemon_restart(show_secret: bool) -> Result<(), ClientError> {
+    if request("runtime.health", Value::Null).await.is_ok() {
+        daemon_stop().await?;
+    }
+    daemon_start(show_secret).await
+}
+
+async fn daemon_status(show_secret: bool) -> Result<(), ClientError> {
     match request("runtime.health", Value::Null).await {
         Ok(h) => {
             let version = h.get("version").and_then(|v| v.as_str()).unwrap_or("?");
             println!("running (version {version})");
+            if show_secret {
+                print_admin_token_debug();
+            }
             Ok(())
         }
         Err(ClientError::Connect(_, _)) => {
@@ -802,17 +907,59 @@ async fn run_doctor() -> Result<(), ClientError> {
 // sessions
 // ---------------------------------------------------------------------------
 
+/// Resolve the active session's id via the public `session.summary` probe
+/// (tokenless). `None` when no session exists. `status` is a sensitive read
+/// in v3, so discovery never uses it.
+async fn active_session_id() -> Option<String> {
+    match request("session.summary", Value::Null).await {
+        Ok(v) => v
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Err(_) => None,
+    }
+}
+
 async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
     match args.action.as_str() {
-        "start" | "status" | "pause" | "resume" | "takeover" | "release" | "stop" => {}
+        "start" | "status" | "summary" | "pause" | "resume" | "takeover" | "release" | "stop" => {}
         other => {
             return Err(ClientError::Rpc {
                 code: -32602,
-                message: format!("unknown session action `{other}` (start|status|pause|resume|takeover|release|stop)"),
+                message: format!("unknown session action `{other}` (start|status|summary|pause|resume|takeover|release|stop)"),
                 data: None,
             })
         }
     }
+
+    if args.action == "summary" {
+        // The public coarse view: tokenless, no credential needed.
+        let resp = request("session.summary", Value::Null).await?;
+        if args.json {
+            print_json(resp)?;
+        } else {
+            let sid = resp.get("session_id").and_then(Value::as_str).unwrap_or("");
+            if sid.is_empty() {
+                println!("no active session");
+            } else {
+                println!(
+                    "session: {sid} state={} lock={}",
+                    resp.get("state").and_then(Value::as_str).unwrap_or("?"),
+                    resp.get("lock_held")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                );
+                if let Some(owner) = resp.get("owner_client_name").and_then(Value::as_str) {
+                    println!("owner: {owner}");
+                }
+                if let Some(msg) = resp.get("message").and_then(Value::as_str) {
+                    println!("{msg}");
+                }
+            }
+        }
+        return Ok(());
+    }
+
     if args.action == "status" {
         // Opportunistic cleanup: drop credential files whose sessions are
         // gone (stopped, or the daemon restarted) — their tokens died with
@@ -827,13 +974,7 @@ async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
         // user is operating — resolve the active one when none is named.
         match &args.session_id {
             Some(id) => Some(id.clone()),
-            None => match request("computer.session", json!({"action": "status"})).await {
-                Ok(v) => v
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                Err(_) => None,
-            },
+            None => active_session_id().await,
         }
     };
 
@@ -841,10 +982,20 @@ async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
         session_start_params(json!(args.display_id))
     } else if args.action == "status" {
         // status resolves the active session daemon-side; without one it is
-        // a typed SESSION_NOT_FOUND, which adapters rely on.
+        // a typed SESSION_NOT_FOUND, which adapters rely on. It is also a
+        // sensitive read (v3): this CLI's observation credential for that
+        // session is injected when held — a foreign session shows the
+        // daemon's refusal instead of its details.
         let mut p = json!({"action": "status"});
         if let Some(id) = &args.session_id {
             p["session_id"] = json!(id);
+        }
+        let target = match &args.session_id {
+            Some(id) => Some(id.clone()),
+            None => active_session_id().await,
+        };
+        if let Some(t) = target.as_ref().and_then(|id| credentials::read_token(id)) {
+            p["observation_token"] = json!(t);
         }
         p
     } else {
@@ -865,15 +1016,15 @@ async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
     let resp = request("computer.session", params).await?;
 
     if args.action == "start" {
-        // The token is issued exactly once, here — persist it and never print
-        // it (the response is redacted even with --json).
+        // The tokens are issued exactly once, here — persist them and never
+        // print them (the response is redacted even with --json).
         save_started_credential(&resp);
         emit(&redact_token(&resp), args.json);
         return Ok(());
     }
 
     if args.action == "stop" {
-        // The session is gone and its token died with it — drop the file.
+        // The session is gone and its tokens died with it — drop the file.
         if let Some(id) = resolved.as_ref().or(args.session_id.as_ref()) {
             credentials::delete(id);
         }
@@ -895,6 +1046,11 @@ async fn run_observe(args: ObserveArgs) -> Result<(), ClientError> {
     });
     if let Some(d) = &args.display_id {
         params["display_id"] = json!(d);
+    }
+    // Observe is a sensitive read: inject this CLI's observation credential
+    // for sessions it started (the daemon refuses tokenless reads in v3).
+    if let Some(t) = credentials::read_token(&session_id) {
+        params["observation_token"] = json!(t);
     }
     let resp = request("computer.observe", params).await?;
 
@@ -982,6 +1138,10 @@ async fn run_inspect(args: InspectArgs) -> Result<(), ClientError> {
     });
     if let Some(s) = args.scale {
         params["scale"] = json!(s);
+    }
+    // Inspect is a sensitive read — inject this CLI's observation credential.
+    if let Some(t) = credentials::read_token(&session_id) {
+        params["observation_token"] = json!(t);
     }
     let resp = request("computer.inspect", params).await?;
 
@@ -1267,16 +1427,22 @@ async fn run_trace(args: TraceArgs) -> Result<(), ClientError> {
             Ok(())
         }
         TraceAction::Get { session_id } => {
-            let resp = request("trace.get", json!({ "session_id": session_id })).await?;
+            // Trace contents are a sensitive read — the observation credential
+            // is required (trace.list stays public, like session.summary).
+            let mut p = json!({ "session_id": session_id });
+            if let Some(t) = credentials::read_token(&session_id) {
+                p["observation_token"] = json!(t);
+            }
+            let resp = request("trace.get", p).await?;
             println!("{}", serde_json::to_string_pretty(&resp).unwrap());
             Ok(())
         }
         TraceAction::Export { session_id, dest } => {
-            let resp = request(
-                "trace.export",
-                json!({ "session_id": session_id, "dest": dest.to_string_lossy() }),
-            )
-            .await?;
+            let mut p = json!({ "session_id": session_id, "dest": dest.to_string_lossy() });
+            if let Some(t) = credentials::read_token(&session_id) {
+                p["observation_token"] = json!(t);
+            }
+            let resp = request("trace.export", p).await?;
             if let Some(path) = resp.get("path").and_then(|v| v.as_str()) {
                 println!(
                     "exported {} → {path}",
@@ -1288,7 +1454,11 @@ async fn run_trace(args: TraceArgs) -> Result<(), ClientError> {
             Ok(())
         }
         TraceAction::Replay { session_id } => {
-            let resp = request("trace.replay", json!({ "session_id": session_id })).await?;
+            let mut p = json!({ "session_id": session_id });
+            if let Some(t) = credentials::read_token(&session_id) {
+                p["observation_token"] = json!(t);
+            }
+            let resp = request("trace.replay", p).await?;
             println!("replay: {}", serde_json::to_string_pretty(&resp).unwrap());
             Ok(())
         }

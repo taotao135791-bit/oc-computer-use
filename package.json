@@ -1,6 +1,6 @@
 {
   "name": "computer-use",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.1",
   "private": true,
   "description": "Model-agnostic, vision-first Computer Use runtime for macOS",
   "type": "module",
@@ -12,9 +12,16 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
-    "test": "pnpm -r test"
+    "test": "pnpm -r test",
+    "generate:protocol": "node scripts/generate-protocol.mjs",
+    "check:protocol": "node scripts/generate-protocol.mjs --check",
+    "scan:secrets": "gitleaks detect --source . --config .gitleaks.toml --no-banner",
+    "release:build": "bash scripts/release-build.sh"
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "json-schema-to-typescript": "^15.0.4"
   }
 }

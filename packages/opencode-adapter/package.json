@@ -1,6 +1,6 @@
 {
   "name": "@computer-use/opencode-adapter",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.1",
   "description": "Companion CLI (cu-opencode) for using the computer-use runtime from OpenCode via its MCP server",
   "type": "module",
   "main": "./dist/index.js",

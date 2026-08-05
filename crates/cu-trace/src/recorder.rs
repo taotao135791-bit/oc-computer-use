@@ -17,7 +17,7 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 
 /// How strictly traces are recorded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, schemars::JsonSchema)]
 pub enum TraceMode {
     /// A trace write failure fails the operation (session start or act batch).
     Required,

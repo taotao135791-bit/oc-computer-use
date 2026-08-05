@@ -34,12 +34,35 @@ const MIME = {
   ".svg": "image/svg+xml",
 };
 
-const client = await connect({ socketPath: process.env.COMPUTER_USE_SOCKET });
-console.error(`cu-inspector connected to ${client.socketPath}`);
+const SOCKET_PATH = process.env.COMPUTER_USE_SOCKET;
+
+// Lazy, resilient connection: the daemon may be down when the inspector
+// starts (or may restart later). Each request resolves a client first, so a
+// daemon outage surfaces as per-request 502s instead of killing the dashboard.
+let client = null;
+async function getClient() {
+  if (!client) {
+    client = await connect({ socketPath: SOCKET_PATH });
+    console.error(`cu-inspector connected to ${client.socketPath}`);
+  }
+  return client;
+}
+async function withClient(fn) {
+  try {
+    return await fn(await getClient());
+  } catch (err) {
+    // A dead/restarted daemon invalidates the socket handle; drop it so the
+    // next request reconnects instead of failing forever on a stale handle.
+    if (err && (err.code === "DAEMON_UNAVAILABLE" || /closed|not connected/.test(String(err?.message ?? err)))) {
+      client = null;
+    }
+    throw err;
+  }
+}
 
 async function sessionStatus() {
   try {
-    return await client.session("status", {});
+    return await withClient((c) => c.session("status", {}));
   } catch {
     return null;
   }
@@ -67,7 +90,7 @@ const server = createServer(async (req, res) => {
     if (url.pathname.startsWith("/api/")) {
       switch (url.pathname) {
         case "/api/health": {
-          const health = await client.health();
+          const health = await withClient((c) => c.health());
           return sendJson(res, 200, health);
         }
         case "/api/session": {
@@ -77,7 +100,7 @@ const server = createServer(async (req, res) => {
         case "/api/frame": {
           const s = await sessionStatus();
           if (!s) return sendJson(res, 200, { error: "NO_ACTIVE_SESSION" });
-          const frame = await client.observe({ session_id: s.session_id });
+          const frame = await withClient((c) => c.observe({ session_id: s.session_id }));
           return sendJson(res, 200, {
             frame_id: frame.frame_id,
             width: frame.width,
@@ -102,11 +125,11 @@ const server = createServer(async (req, res) => {
           }
         }
         case "/api/traces": {
-          const { traces } = await client.traceList();
+          const { traces } = await withClient((c) => c.traceList());
           return sendJson(res, 200, { traces });
         }
         case "/api/pointer": {
-          const p = await client.pointer();
+          const p = await withClient((c) => c.pointer());
           return sendJson(res, 200, p);
         }
         case "/api/act": {
@@ -125,11 +148,13 @@ const server = createServer(async (req, res) => {
           });
           const s = await sessionStatus();
           if (!s) return sendJson(res, 409, { error: "NO_ACTIVE_SESSION" });
-          const result = await client.act({
-            session_id: s.session_id,
-            frame_id: body.frame_id,
-            actions: body.actions,
-          });
+          const result = await withClient((c) =>
+            c.act({
+              session_id: s.session_id,
+              frame_id: body.frame_id,
+              actions: body.actions,
+            }),
+          );
           return sendJson(res, 200, result);
         }
         default:

@@ -117,6 +117,48 @@ step below; all automated scripts pass against the round-3 daemon.
 | 9 | OpenCode/MCP against the round-3 daemon | 17/17 PASS incl. cancel of a 30 s wait in 761 ms; session owned by `mcp-server` | ✅ PASS |
 | 10 | ownership scenario A | 6/6 PASS — Pi shutdown does not stop the MCP-owned session | ✅ PASS |
 
+**Round 4 (2026-08-05)** — protocol v3 (capability tokens, daemon admin
+token). The Pi extension was re-verified against the v3 daemon:
+`scripts/pi-host-acceptance.mjs` → **32/32 PASS** (host shim; real extension
+code, real daemon, real screen). The v3 semantics are what changed, so the
+round-4 differences are recorded explicitly:
+
+- `cu session status` on a session the CLI does **not** own is refused
+  (`OBSERVATION_TOKEN_REQUIRED`) — the acceptance script now reads Pi-session
+  state through the extension's own `computer_session` tool (owner check:
+  `pi-extension`/`Pi`/`pi-<pid>-…`). The CLI still reads sessions it owns.
+- `COMPUTER_USE_EXISTING_SESSION_POLICY=attach` prints the deprecation
+  warning and maps to `read_only` (Pi step 20's round-2 "attach → observe
+  works" no longer exists: a session id alone grants no observation
+  permission).
+- a tokenless `read_only` attach is refused with `INVALID_PARAMS` + the
+  `attachReadOnly` hint; the foreign session stays active, and the read_only
+  client's `session_shutdown` never stops it.
+- the acceptance script now exits explicitly — an all-PASS run previously
+  left the extension's SDK sockets open and hung piped runs (tail/CI) forever.
+- In-Pi-app steps (chat rendering, Pi's real AbortSignal wiring,
+  `session_shutdown` fired by the Pi app itself) remain **NOT VERIFIED** —
+  the Pi host app is still not installed on the acceptance machine; the
+  extension is verified in a host shim against the real daemon/screen.
+
+The OpenCode/MCP side was also re-verified against the v3 daemon:
+`scripts/opencode-mcp-acceptance.mjs` → **17/17 PASS** (real
+`computer-use-mcp` binary over stdio, real daemon, real screen), and the real
+OpenCode host loaded the server: `opencode mcp list` reports **`computer-use`
+connected** (entry present in `~/.config/opencode/opencode.json`, command
+`computer-use-mcp`). Round-4 differences:
+
+- like the Pi script, session state is read through the MCP's own
+  `computer_session` tool (the CLI can no longer read a session it does not
+  own — `OBSERVATION_TOKEN_REQUIRED`); the initial no-session check now
+  distinguishes a clean `SESSION_NOT_FOUND` from a foreign live session.
+- the script now SIGTERMs the MCP server and waits for it to run its
+  `stopOwnedSessionOnExit` cleanup — a failed run previously left an orphaned
+  MCP process whose session locked the daemon for the next run.
+- model-driven steps (a model choosing to call the tools, image rendered in
+  the OpenCode UI) remain **NOT VERIFIED** — the GLM Coding Plan on the
+  acceptance machine is still expired (see the round-2 failure record).
+
 ## Failure record (round 2)
 
 | Date | Step # | Observed | Root cause / fix |

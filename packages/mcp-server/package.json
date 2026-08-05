@@ -1,6 +1,6 @@
 {
   "name": "@computer-use/mcp-server",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.1",
   "description": "MCP server exposing the computer-use daemon as tools with image content blocks",
   "type": "module",
   "main": "./dist/index.js",
@@ -27,6 +27,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "ajv": "^8.20.0",
     "typescript": "^5.5.0"
   }
 }

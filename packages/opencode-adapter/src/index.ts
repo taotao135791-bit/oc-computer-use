@@ -41,7 +41,6 @@ import {
   defaultSocketPath,
   type ComputerUseClient,
   type Health,
-  type SessionResult,
 } from "@computer-use/sdk";
 
 // ---------------------------------------------------------------------------
@@ -156,13 +155,18 @@ export async function statusText(client: ComputerUseClient): Promise<string> {
     `active_sessions: ${health.active_sessions}`,
   ];
   try {
-    const s: SessionResult = await client.session("status");
-    lines.push(
-      `session: ${s.session_id} state=${s.state} paused=${s.paused} takeover=${s.user_takeover} lock=${s.lock_held}`,
-      ...(s.owner_client_name ? [`owner: ${s.owner_client_name}`] : []),
-      ...(s.current_frame_id ? [`current_frame_id: ${s.current_frame_id}`] : []),
-      ...(s.trace_dir ? [`trace_dir: ${s.trace_dir}`] : []),
-    );
+    // The coarse `session.summary` view is the only tokenless session read —
+    // this CLI has no credential (credentials live in `cu`'s files), so the
+    // detailed `status` is out of reach in v3: it is a sensitive read.
+    const s = await client.sessionSummary();
+    if (s.session_id) {
+      lines.push(
+        `session: ${s.session_id} state=${s.state ?? "?"} lock=${s.lock_held}`,
+        ...(s.owner_client_name ? [`owner: ${s.owner_client_name}`] : []),
+      );
+    } else {
+      lines.push("session: none");
+    }
   } catch (err) {
     if (err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND") {
       lines.push("session: none");
@@ -180,6 +184,8 @@ export async function statusText(client: ComputerUseClient): Promise<string> {
 export interface StoredCredential {
   sessionId: string;
   controlToken: string;
+  /** Read-only capability, written by `cu session start` since v3 (absent on old files). */
+  observationToken?: string;
 }
 
 /** `~/.local/state/oc-computer-use/credentials` — where `cu` keeps tokens. */
@@ -198,9 +204,16 @@ export function listStoredCredentials(): StoredCredential[] {
       const j = JSON.parse(readFileSync(join(dir, f), "utf8")) as {
         session_id?: unknown;
         control_token?: unknown;
+        observation_token?: unknown;
       };
       if (typeof j.session_id === "string" && typeof j.control_token === "string") {
-        out.push({ sessionId: j.session_id, controlToken: j.control_token });
+        out.push({
+          sessionId: j.session_id,
+          controlToken: j.control_token,
+          ...(typeof j.observation_token === "string"
+            ? { observationToken: j.observation_token }
+            : {}),
+        });
       }
     } catch {
       // Unreadable/corrupt credential — ignore; `cu` prunes those.
@@ -222,7 +235,13 @@ export async function cleanupSession(client: ComputerUseClient): Promise<{ stopp
   const creds = listStoredCredentials();
   if (creds.length === 0) {
     try {
-      const s: SessionResult = await client.session("status");
+      // The coarse summary is the tokenless probe for "does a session exist
+      // and who owns it" — the detailed `status` is a sensitive read in v3,
+      // and this CLI holds no credential for a session it did not start.
+      const s = await client.sessionSummary();
+      if (!s.session_id) {
+        return { stopped: false, message: "no active session to clean up" };
+      }
       return {
         stopped: false,
         message:

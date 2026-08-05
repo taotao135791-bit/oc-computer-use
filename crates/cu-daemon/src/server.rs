@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use cu_core::security::SecretTokenHash;
 use cu_core::{ErrorCode, RpcRequest, RpcResponse};
 use cu_driver::ComputerDriver;
 use cu_driver_macos::MacosDriver;
@@ -28,6 +29,11 @@ use crate::jsonrpc::dispatch;
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
+    /// Where the daemon persists its admin token (default
+    /// `~/.local/state/oc-computer-use/daemon-admin.json`, 0600). The CLI
+    /// reads this file to shut the daemon down; a daemon that cannot persist
+    /// its token refuses to start (it would otherwise be unstoppable).
+    pub admin_token_path: PathBuf,
     /// Per-request deadline in seconds. Generous by default; session
     /// pause/stop/cancel remain the responsive cancellation path.
     pub request_timeout_secs: u64,
@@ -52,6 +58,7 @@ impl Default for DaemonConfig {
         );
         Self {
             socket_path: cu_core::config::socket_path(),
+            admin_token_path: cu_core::config::daemon_admin_path(),
             request_timeout_secs: 600,
             runtime_config,
         }
@@ -72,6 +79,21 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             tracing::info!(removed, "pruned old trace files");
         }
     }
+
+    // Generate and persist the daemon admin token BEFORE the socket binds, so
+    // the daemon never accepts shutdown requests it could not authorize (and
+    // never runs without a way for the CLI to stop it). A persistence failure
+    // refuses to start — a silent fallback would leave the daemon unstoppable.
+    let admin_token = cu_core::security::generate_daemon_admin_token();
+    let admin_token_path = &config.admin_token_path;
+    if let Err(e) = cu_core::security::save_daemon_admin_token_to(&admin_token, admin_token_path) {
+        anyhow::bail!(
+            "cannot persist daemon admin token at {}: {e} — refusing to start",
+            admin_token_path.display()
+        );
+    }
+    tracing::info!(path = %admin_token_path.display(), "daemon admin token stored (0600)");
+    let admin_hash = SecretTokenHash::from_token(&admin_token);
 
     let socket = &config.socket_path;
     if let Some(parent) = socket.parent() {
@@ -113,9 +135,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                         let runtime = runtime.clone();
                         let shutdown = app_shutdown.clone();
                         let timeout = config.request_timeout_secs;
+                        let admin_hash = admin_hash.clone();
                         let connection_id = connection_counter.fetch_add(1, Ordering::Relaxed);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, connection_id, runtime, shutdown, timeout).await {
+                            if let Err(e) = handle_connection(stream, connection_id, runtime, shutdown, admin_hash, timeout).await {
                                 tracing::debug!(error = %e, "connection handler ended");
                             }
                         });
@@ -129,6 +152,9 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     tracing::info!("shutting down daemon");
     let _ = runtime.shutdown().await;
     let _ = std::fs::remove_file(socket);
+    // The admin token dies with the daemon: a stale file would make the next
+    // `stop` misread state (and leak a live credential to nothing).
+    cu_core::security::remove_daemon_admin_token_from(admin_token_path);
     Ok(())
 }
 
@@ -143,11 +169,15 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
 ///
 /// `connection_id` seeds every request key on this connection, so request
 /// cancellation is scoped to the connection that issued it.
+///
+/// `admin_hash` is the digest of the daemon's admin token; `runtime.shutdown`
+/// only honors a request presenting the matching token.
 async fn handle_connection(
     stream: UnixStream,
     connection_id: u64,
     runtime: Arc<Runtime>,
     app_shutdown: CancellationToken,
+    admin_hash: SecretTokenHash,
     timeout_secs: u64,
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = stream.into_split();
@@ -174,9 +204,16 @@ async fn handle_connection(
 
         let runtime = runtime.clone();
         let shutdown = app_shutdown.clone();
+        let admin_hash = admin_hash.clone();
         let writer = writer.clone();
         inflight.push(tokio::spawn(async move {
-            let fut = dispatch(&runtime, &shutdown, connection_id, request.clone());
+            let fut = dispatch(
+                &runtime,
+                &shutdown,
+                connection_id,
+                request.clone(),
+                &admin_hash,
+            );
             let timeout = tokio::time::Duration::from_secs(timeout_secs);
             let resp = match tokio::time::timeout(timeout, fut).await {
                 Ok(resp) => resp,

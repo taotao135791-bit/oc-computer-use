@@ -1,5 +1,7 @@
 # computer-use
 
+[![CI](https://github.com/taotao135791-bit/oc-computer-use/actions/workflows/ci.yml/badge.svg)](https://github.com/taotao135791-bit/oc-computer-use/actions/workflows/ci.yml)
+
 A **model-agnostic, vision-first Computer Use runtime for macOS** (macOS 14+).
 
 External agents (Claude Code, Pi, OpenCode, Codex CLI, or any model) drive the
@@ -91,26 +93,45 @@ not by the client, so every adapter gets the same guarantees.
 
 - **Socket**: Unix domain socket at `~/.computer-use/runtime.sock`, mode `0700`
   — only your user can connect.
-- **Sessions**: one active session at a time (control lock). The first
-  client request auto-creates a session; the creator is recorded as its
+- **Sessions**: one active session at a time (control lock). Auto-creation is
+  an *adapter* convenience (SDK/CLI/MCP/Pi resolve `status` first and start
+  only on `SESSION_NOT_FOUND`) — the raw `computer.observe` / `computer.act`
+  methods never create a session. The creator is recorded as the session's
   **owner** and is the only client that stops it. A session owned by another
-  client is refused with `CONTROL_LOCKED` (the Pi extension can opt into
-  `attach` mode to use, but never stop, a foreign session). Every
-  observe/act carries a `session_id`. Actions on a stale, paused,
-  taken-over, or stopped session are rejected with a specific error code.
-- **Control tokens (capability)**: `session start` returns a session's
-  **control token exactly once** (256-bit random). **Knowing a session ID
-  does not grant control** — every mutating operation (pause / resume /
-  takeover / release / stop, act, cancel) requires the token
-  (`CONTROL_TOKEN_REQUIRED` without it, `INVALID_CONTROL_TOKEN` when wrong),
-  while read-only calls (`status`, `observe`, `inspect`) need none and never
-  repeat the token. The daemon stores only a SHA-256 hash, never logs it,
-  and `stop` or a daemon restart invalidates it. The SDK and CLI keep the
-  token in per-session credential files (`0600`) and inject it automatically
-  into the calls they own. **Existing sessions default to `reject`**: a
-  client that finds a session it does not own must not silently attach —
-  `read_only` (observe-only) and `attach_with_token` (caller supplies the
-  token) are explicit opt-ins.
+  client is refused with `CONTROL_LOCKED`. Every observe/act carries a
+  `session_id`. Actions on a stale, paused, taken-over, or stopped session
+  are rejected with a specific error code.
+- **Capability tokens**: `session start` returns a session's **two tokens
+  exactly once** (each 256-bit CSPRNG): an `observation_token` for sensitive
+  reads and a `control_token` for mutating operations (which also opens
+  reads). **Knowing a session ID grants no observation or control
+  permission** — the daemon verifies SHA-256 hashes of presented tokens and
+  never repeats them after `start`. `status` never re-issues them, and `stop`
+  or a daemon restart invalidates them. The CLI persists session credentials
+  to files with mode `0600`; the SDK keeps them in memory only.
+- **Existing sessions default to `reject`**: a client that finds a session it
+  does not own must not silently attach — `read_only` (observe-only, no
+  token held) and `attach_with_token` (caller supplies the token) are
+  explicit opt-ins.
+- **Daemon admin token**: `runtime.shutdown` requires a per-install admin
+  token (256-bit CSPRNG, persisted `0600` at daemon startup) — only the
+  daemon manager (CLI / LaunchAgent) holds it; a corrupt store refuses
+  startup rather than leaving the daemon unstoppable.
+
+### Capability matrix
+
+| Operation | Session ID alone | Observation token | Control token | Admin token |
+|---|---|---|---|---|
+| `status` | `OBSERVATION_TOKEN_REQUIRED` | ✅ | ✅ | — |
+| `observe` / `inspect` | `OBSERVATION_TOKEN_REQUIRED` | ✅ | ✅ | — |
+| trace list / get / export / replay | `OBSERVATION_TOKEN_REQUIRED` | ✅ | ✅ | — |
+| `act` / `cancel` / `pause` / `resume` / `takeover` / `release` / `stop` | `CONTROL_TOKEN_REQUIRED` | ❌ | ✅ | — |
+| `runtime.shutdown` | `DAEMON_ADMIN_TOKEN_REQUIRED` | ❌ | ❌ | ✅ |
+
+The control token includes observation permission (it verifies for reads
+too); the observation token never grants mutation. Token errors are
+deliberately non-descriptive (`INVALID_*` never says which token was wrong).
+
 - **Stale frames**: acting on anything but the session's current frame is
   rejected (`STALE_FRAME`) under the default `strict` policy; the
   `visual_match` policy (env `COMPUTER_USE_STALE_POLICY`) additionally
@@ -118,7 +139,8 @@ not by the client, so every adapter gets the same guarantees.
   visual comparison + app-change + age backstop always run on top.
 - **Bounds**: actions outside the display are rejected (`OUT_OF_BOUNDS`).
 - **Redaction**: `type` records `{ text_redacted: true, character_count }` in
-  traces; full text only under an explicit opt-in.
+  traces; full text only under an explicit opt-in. Clipboard contents are
+  never recorded, and no capability token ever appears in a trace.
 - **Takeover**: a human can grab the mouse at any time; the session flips to
   `user_takeover` and the runtime refuses further actions. `resume` cannot
   bypass it — the agent must `release` first (`USER_TAKEOVER_ACTIVE`).
@@ -167,7 +189,7 @@ Real-environment acceptance (needs a logged-in GUI session, Screen
 Recording + Accessibility permissions, daemon running, no active session):
 
 ```bash
-node scripts/pi-host-acceptance.mjs       # Pi extension, real code, real daemon/screen — 31 checks
+node scripts/pi-host-acceptance.mjs       # Pi extension, real code, real daemon/screen — 32 checks
 node scripts/opencode-mcp-acceptance.mjs  # real computer-use-mcp binary over stdio, real daemon/screen — 17 checks
 node scripts/ownership-scenario-a.mjs     # ownership: MCP-owned session vs. the Pi extension — 6 checks
 ```

@@ -31,7 +31,9 @@ function startFakeDaemon() {
         if (!line) continue;
         const req = JSON.parse(line);
         const respond = (obj) => conn.write(`${JSON.stringify(obj)}\n`);
-        if (req.method === "computer.session") {
+        if (req.method === "runtime.version") {
+          respond({ jsonrpc: "2.0", id: req.id, result: { name: "fake", version: "0.1.0", protocol_version: 3 } });
+        } else if (req.method === "computer.session") {
           respond({ jsonrpc: "2.0", id: req.id, result: { session_id: "s1", state: "active", paused: false, user_takeover: false, lock_held: true, display_id: "1", created_at: "2026-08-03T00:00:00Z", started_by: "test", current_frame_id: "frame_1" } });
         } else if (req.method === "computer.observe") {
           respond({ jsonrpc: "2.0", id: req.id, result: { session_id: "s1", frame_id: "frame_1", width: 1440, height: 900, display_id: "1", scale_factor: 2, active_application: "FakeApp", image_path: framePath, image_mime_type: "image/jpeg", captured_at: "2026-08-03T00:00:00Z" } });

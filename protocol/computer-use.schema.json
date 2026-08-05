@@ -1,196 +1,1552 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://computer-use.local/protocol/computer-use.schema.json",
-  "title": "Computer Use Runtime Protocol",
-  "description": "The JSON-RPC 2.0 method and payload schema exposed by the Computer Use daemon over its local Unix domain socket.",
-  "definitions": {
-    "coordinate_space": {
-      "type": "string",
-      "enum": ["normalized_1000", "image_pixels"]
-    },
-    "point": {
-      "type": "object",
-      "required": ["x", "y"],
+  "$defs": {
+    "ActParams": {
+      "description": "`computer.act` request.",
       "properties": {
-        "x": { "type": "number" },
-        "y": { "type": "number" }
-      }
+        "actions": {
+          "items": {
+            "$ref": "#/$defs/ComputerAction"
+          },
+          "type": "array"
+        },
+        "control_token": {
+          "description": "The session's control token. Required: without it the batch is rejected before any action is parsed, queued, or executed.",
+          "type": "string"
+        },
+        "fixed_wait_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "frame_id": {
+          "type": "string"
+        },
+        "policy_context": {
+          "type": "string"
+        },
+        "requires_confirmation": {
+          "type": "boolean"
+        },
+        "return_screenshot": {
+          "type": "boolean"
+        },
+        "risk_level": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "wait_policy": {
+          "$ref": "#/$defs/WaitPolicy"
+        }
+      },
+      "required": [
+        "actions",
+        "frame_id",
+        "session_id"
+      ],
+      "type": "object"
     },
-    "mouse_button": {
-      "type": "string",
-      "enum": ["left", "right", "middle"]
+    "ActResult": {
+      "description": "`computer.act` result.",
+      "properties": {
+        "action_results": {
+          "items": {
+            "$ref": "#/$defs/ActionResultReport"
+          },
+          "type": "array"
+        },
+        "executed": {
+          "type": "boolean"
+        },
+        "next_frame_id": {
+          "type": "string"
+        },
+        "screen_changed": {
+          "type": "boolean"
+        },
+        "screenshot": {
+          "$ref": "#/$defs/ObserveResult"
+        },
+        "stabilization": {
+          "$ref": "#/$defs/StabilizationInfo"
+        },
+        "stable": {
+          "type": "boolean"
+        },
+        "trace": {
+          "$ref": "#/$defs/TraceReport",
+          "description": "Trace-recording status for this batch. Present when the session has a recorder; `degraded`/`warnings` surface best-effort recording problems so callers know the trace may be incomplete."
+        }
+      },
+      "required": [
+        "action_results",
+        "executed",
+        "screen_changed",
+        "stable"
+      ],
+      "type": "object"
     },
-    "text_input_method": {
-      "type": "string",
-      "enum": ["keyboard", "clipboard"]
+    "ActionResultReport": {
+      "description": "Result of one action inside a batch.",
+      "properties": {
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "index": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "duration_ms",
+        "index",
+        "status"
+      ],
+      "type": "object"
     },
-    "computer_action": {
-      "type": "object",
-      "required": ["type"],
+    "BoundsDetail": {
+      "description": "Detail attached to a [`CuError::OutOfBounds`].",
+      "properties": {
+        "coordinate_space": {
+          "type": "string"
+        },
+        "image_height": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "image_width": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "x": {
+          "format": "double",
+          "type": "number"
+        },
+        "y": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "coordinate_space",
+        "image_height",
+        "image_width",
+        "x",
+        "y"
+      ],
+      "type": "object"
+    },
+    "CancelParams": {
+      "description": "`computer.cancel` request.\n\nCancellation is **precise**: with `request_id` set, only the request with that JSON-RPC id (on the *same connection*) is cancelled — the runtime keys the in-flight batch by `(connection_id, request_id)`, so cancelling request A never touches request B, and client A can never cancel client B's request even with an identical id. Without `request_id` the whole session's in-flight batch is cancelled (still token-verified).",
+      "properties": {
+        "control_token": {
+          "description": "The session's control token — required; cancelling is a mutating op.",
+          "type": "string"
+        },
+        "request_id": true,
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "CancelResult": {
+      "description": "`computer.cancel` result.",
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cancelled",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "ClientInfo": {
+      "description": "Identity of the client that started a session. Recorded on the session so owners can be told apart: a client must not stop a session it did not start. `client_instance_id` distinguishes multiple processes of the same client (e.g. two Pi instances).",
+      "properties": {
+        "client_id": {
+          "type": "string"
+        },
+        "client_instance_id": {
+          "type": "string"
+        },
+        "client_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id",
+        "client_instance_id",
+        "client_name"
+      ],
+      "type": "object"
+    },
+    "ComputerAction": {
+      "description": "A single atomic computer action.",
       "oneOf": [
         {
           "properties": {
-            "type": { "const": "click" },
-            "x": { "type": "number" },
-            "y": { "type": "number" },
-            "button": { "$ref": "#/definitions/mouse_button" },
-            "coordinate_space": { "$ref": "#/definitions/coordinate_space" }
-          },
-          "required": ["type", "x", "y", "button", "coordinate_space"],
-          "additionalProperties": false
-        },
-        {
-          "properties": {
-            "type": { "const": "double_click" },
-            "x": { "type": "number" },
-            "y": { "type": "number" },
-            "button": { "$ref": "#/definitions/mouse_button" },
-            "coordinate_space": { "$ref": "#/definitions/coordinate_space" }
-          },
-          "required": ["type", "x", "y", "button", "coordinate_space"],
-          "additionalProperties": false
-        },
-        {
-          "properties": {
-            "type": { "const": "move" },
-            "x": { "type": "number" },
-            "y": { "type": "number" },
-            "coordinate_space": { "$ref": "#/definitions/coordinate_space" },
-            "duration_ms": { "type": ["number", "null"] }
-          },
-          "required": ["type", "x", "y", "coordinate_space"],
-          "additionalProperties": false
-        },
-        {
-          "properties": {
-            "type": { "const": "type" },
-            "text": { "type": "string", "minLength": 0, "maxLength": 4096 },
-            "method": { "$ref": "#/definitions/text_input_method" }
-          },
-          "required": ["type", "text", "method"],
-          "additionalProperties": false
-        },
-        {
-          "properties": {
-            "type": { "const": "key" },
-            "keys": {
-              "type": "array",
-              "items": { "type": "string" },
-              "minItems": 1,
-              "maxItems": 8
+            "button": {
+              "$ref": "#/$defs/MouseButton"
+            },
+            "coordinate_space": {
+              "$ref": "#/$defs/CoordinateSpace"
+            },
+            "type": {
+              "enum": [
+                "click"
+              ],
+              "type": "string"
+            },
+            "x": {
+              "format": "double",
+              "type": "number"
+            },
+            "y": {
+              "format": "double",
+              "type": "number"
             }
           },
-          "required": ["type", "keys"],
-          "additionalProperties": false
+          "required": [
+            "button",
+            "coordinate_space",
+            "type",
+            "x",
+            "y"
+          ],
+          "type": "object"
         },
         {
           "properties": {
-            "type": { "const": "scroll" },
-            "x": { "type": ["number", "null"] },
-            "y": { "type": ["number", "null"] },
-            "delta_x": { "type": "number" },
-            "delta_y": { "type": "number" },
-            "coordinate_space": { "$ref": "#/definitions/coordinate_space" }
+            "button": {
+              "$ref": "#/$defs/MouseButton"
+            },
+            "coordinate_space": {
+              "$ref": "#/$defs/CoordinateSpace"
+            },
+            "type": {
+              "enum": [
+                "double_click"
+              ],
+              "type": "string"
+            },
+            "x": {
+              "format": "double",
+              "type": "number"
+            },
+            "y": {
+              "format": "double",
+              "type": "number"
+            }
           },
-          "required": ["type", "delta_x", "delta_y", "coordinate_space"],
-          "additionalProperties": false
+          "required": [
+            "button",
+            "coordinate_space",
+            "type",
+            "x",
+            "y"
+          ],
+          "type": "object"
         },
         {
           "properties": {
-            "type": { "const": "drag" },
-            "from": { "$ref": "#/definitions/point" },
-            "to": { "$ref": "#/definitions/point" },
-            "coordinate_space": { "$ref": "#/definitions/coordinate_space" },
-            "duration_ms": { "type": ["number", "null"] }
+            "coordinate_space": {
+              "$ref": "#/$defs/CoordinateSpace"
+            },
+            "duration_ms": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "move"
+              ],
+              "type": "string"
+            },
+            "x": {
+              "format": "double",
+              "type": "number"
+            },
+            "y": {
+              "format": "double",
+              "type": "number"
+            }
           },
-          "required": ["type", "from", "to", "coordinate_space"],
-          "additionalProperties": false
+          "required": [
+            "coordinate_space",
+            "type",
+            "x",
+            "y"
+          ],
+          "type": "object"
         },
         {
           "properties": {
-            "type": { "const": "wait" },
-            "duration_ms": { "type": "integer", "minimum": 0, "maximum": 600000 }
+            "method": {
+              "$ref": "#/$defs/TextInputMethod",
+              "default": "keyboard"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "type"
+              ],
+              "type": "string"
+            }
           },
-          "required": ["type", "duration_ms"],
-          "additionalProperties": false
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "keys": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "key"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "keys",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "coordinate_space": {
+              "$ref": "#/$defs/CoordinateSpace"
+            },
+            "delta_x": {
+              "default": 0.0,
+              "format": "double",
+              "type": "number"
+            },
+            "delta_y": {
+              "default": 0.0,
+              "format": "double",
+              "type": "number"
+            },
+            "type": {
+              "enum": [
+                "scroll"
+              ],
+              "type": "string"
+            },
+            "x": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "y": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "coordinate_space",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "coordinate_space": {
+              "$ref": "#/$defs/CoordinateSpace"
+            },
+            "duration_ms": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "from": {
+              "$ref": "#/$defs/Point"
+            },
+            "to": {
+              "$ref": "#/$defs/Point"
+            },
+            "type": {
+              "enum": [
+                "drag"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "coordinate_space",
+            "from",
+            "to",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "duration_ms": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "wait"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "duration_ms",
+            "type"
+          ],
+          "type": "object"
         }
       ]
+    },
+    "ConfirmationDetail": {
+      "description": "Detail attached to a [`CuError::ConfirmationRequired`].",
+      "properties": {
+        "policy_context": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "requires_confirmation": {
+          "type": "boolean"
+        },
+        "risk_level": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "requires_confirmation",
+        "risk_level"
+      ],
+      "type": "object"
+    },
+    "CoordinateSpace": {
+      "description": "Coordinate space a caller used when describing a location or region.",
+      "oneOf": [
+        {
+          "description": "Image treated as a 1000x1000 canvas; top-left is (0,0).",
+          "enum": [
+            "normalized_1000"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Raw pixels inside the captured image.",
+          "enum": [
+            "image_pixels"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ErrorCode": {
+      "description": "Well-known structured error codes. These are the stable strings that appear in the `data.code` field of a JSON-RPC error response.",
+      "oneOf": [
+        {
+          "enum": [
+            "PARSE_ERROR",
+            "INVALID_REQUEST",
+            "INVALID_PARAMS",
+            "METHOD_NOT_FOUND",
+            "INTERNAL",
+            "NOT_READY",
+            "PERMISSION",
+            "STALE_FRAME",
+            "CONTROL_LOCKED",
+            "PAUSED",
+            "USER_TAKEOVER",
+            "OUT_OF_BOUNDS",
+            "UNKNOWN_FRAME",
+            "SESSION_NOT_FOUND",
+            "INVALID_SESSION_STATE",
+            "CONFIRMATION_REQUIRED",
+            "CANCELLED",
+            "TRACE_ERROR",
+            "DRIVER_ERROR",
+            "UNSUPPORTED"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Attempted to `resume` a session that is in `UserTakeover`. The user must `release` first; resume can only recover a paused session.",
+          "enum": [
+            "USER_TAKEOVER_ACTIVE"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A request/action batch exceeded the daemon's request deadline. This is distinct from `Cancelled` (explicit cancellation): the batch was still running when the deadline hit.",
+          "enum": [
+            "ACTION_TIMEOUT"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Capturing the screen failed (driver/capture failure, e.g. the screen recording session dropped).",
+          "enum": [
+            "CAPTURE_FAILED"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A mutating operation was attempted without a control token.",
+          "enum": [
+            "CONTROL_TOKEN_REQUIRED"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A control token was presented but did not verify. The error is deliberately non-descriptive — it must not hint whether the token was malformed, wrong-length, or simply not this session's.",
+          "enum": [
+            "INVALID_CONTROL_TOKEN"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A sensitive read (observe / inspect / status / trace) was attempted without an observation or control token. The session id alone grants no observation permission.",
+          "enum": [
+            "OBSERVATION_TOKEN_REQUIRED"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A token was presented for a sensitive read but did not verify as either the session's observation or control token. Deliberately non-descriptive, like `InvalidControlToken`.",
+          "enum": [
+            "INVALID_OBSERVATION_TOKEN"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A mutating operation targeted a session that is already stopped.",
+          "enum": [
+            "SESSION_STOPPED"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The SDK-side request deadline expired. Distinct from `ActionTimeout` (daemon-side): the client timed out waiting, and reports whether the runtime confirmed the cancellation.",
+          "enum": [
+            "REQUEST_TIMEOUT"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The client's protocol version is incompatible with the daemon's.",
+          "enum": [
+            "PROTOCOL_VERSION_MISMATCH"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`runtime.shutdown` was attempted without the daemon admin token.",
+          "enum": [
+            "DAEMON_ADMIN_TOKEN_REQUIRED"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An admin token was presented for `runtime.shutdown` but did not verify. Deliberately non-descriptive.",
+          "enum": [
+            "INVALID_DAEMON_ADMIN_TOKEN"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "InspectMapping": {
+      "description": "Mapping info that lets a model safely translate an inspect-relative coordinate back into global desktop coordinates.",
+      "properties": {
+        "global_origin": {
+          "description": "Global desktop point corresponding to the crop's top-left corner.",
+          "items": false,
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "format": "double",
+              "type": "number"
+            },
+            {
+              "format": "double",
+              "type": "number"
+            }
+          ],
+          "type": "array"
+        },
+        "normalized_1000_origin": {
+          "description": "The crop's top-left corner in the original frame's normalized_1000 space.",
+          "items": false,
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "format": "double",
+              "type": "number"
+            },
+            {
+              "format": "double",
+              "type": "number"
+            }
+          ],
+          "type": "array"
+        },
+        "source_image_rect": {
+          "$ref": "#/$defs/Region",
+          "description": "Where the crop sits in the original image (pixels)."
+        }
+      },
+      "required": [
+        "global_origin",
+        "normalized_1000_origin",
+        "source_image_rect"
+      ],
+      "type": "object"
+    },
+    "InspectParams": {
+      "description": "`computer.inspect` request.",
+      "properties": {
+        "control_token": {
+          "type": "string"
+        },
+        "frame_id": {
+          "type": "string"
+        },
+        "observation_token": {
+          "description": "Observation (or control) token — required; a session id alone grants no observation permission.",
+          "type": "string"
+        },
+        "region": {
+          "$ref": "#/$defs/Region"
+        },
+        "scale": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "frame_id",
+        "region",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "InspectResult": {
+      "description": "`computer.inspect` result.",
+      "properties": {
+        "frame_id": {
+          "type": "string"
+        },
+        "height": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "image_base64": {
+          "type": "string"
+        },
+        "image_mime_type": {
+          "type": "string"
+        },
+        "mapping": {
+          "$ref": "#/$defs/InspectMapping"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "width": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "frame_id",
+        "height",
+        "image_base64",
+        "image_mime_type",
+        "mapping",
+        "session_id",
+        "width"
+      ],
+      "type": "object"
+    },
+    "MouseButton": {
+      "description": "Mouse buttons understood by the macOS driver.",
+      "enum": [
+        "left",
+        "right",
+        "middle"
+      ],
+      "type": "string"
+    },
+    "ObserveParams": {
+      "description": "`computer.observe` request.",
+      "properties": {
+        "control_token": {
+          "description": "The session's control token — accepted in place of the observation token (control includes observation).",
+          "type": "string"
+        },
+        "display_id": {
+          "type": "string"
+        },
+        "image_format": {
+          "type": "string"
+        },
+        "include_cursor": {
+          "type": "boolean"
+        },
+        "include_image": {
+          "description": "When true, the response carries the image as base64. Off by default so a plain `observe` stays cheap; adapters that need pixels (MCP, vision harnesses) turn it on.",
+          "type": "boolean"
+        },
+        "jpeg_quality": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_width": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "observation_token": {
+          "description": "The session's **observation token**. Required — observing captures the desktop; a session id alone grants no observation permission. A valid control token is accepted in its place.",
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ObserveResult": {
+      "description": "`computer.observe` result.",
+      "properties": {
+        "active_application": {
+          "type": "string"
+        },
+        "active_window": {
+          "type": "string"
+        },
+        "captured_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_id": {
+          "type": "string"
+        },
+        "frame_id": {
+          "type": "string"
+        },
+        "height": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "image_base64": {
+          "description": "Base64-encoded image (only present when the caller requested it).",
+          "type": "string"
+        },
+        "image_mime_type": {
+          "type": "string"
+        },
+        "image_path": {
+          "description": "Absolute path to the stored image file.",
+          "type": "string"
+        },
+        "scale_factor": {
+          "format": "double",
+          "type": "number"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "width": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "captured_at",
+        "display_id",
+        "frame_id",
+        "height",
+        "image_mime_type",
+        "image_path",
+        "scale_factor",
+        "session_id",
+        "width"
+      ],
+      "type": "object"
+    },
+    "PermissionIssue": {
+      "description": "Extra structured detail attached to a [`CuError::Permission`].",
+      "properties": {
+        "granted": {
+          "type": "boolean"
+        },
+        "guidance": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PermissionKind"
+        }
+      },
+      "required": [
+        "granted",
+        "guidance",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "PermissionKind": {
+      "description": "Which macOS permission is missing. Used to generate actionable guidance.",
+      "enum": [
+        "screen_recording",
+        "accessibility"
+      ],
+      "type": "string"
+    },
+    "Point": {
+      "description": "A 2D point in some coordinate space.",
+      "properties": {
+        "x": {
+          "format": "double",
+          "type": "number"
+        },
+        "y": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y"
+      ],
+      "type": "object"
+    },
+    "RedactedText": {
+      "description": "Redacted description of a `type` action used in traces and logs by default.",
+      "properties": {
+        "character_count": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "text_redacted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "character_count",
+        "text_redacted"
+      ],
+      "type": "object"
+    },
+    "Region": {
+      "description": "A rectangle expressed in one of the image-relative coordinate spaces.",
+      "properties": {
+        "coordinate_space": {
+          "$ref": "#/$defs/CoordinateSpace"
+        },
+        "height": {
+          "format": "double",
+          "type": "number"
+        },
+        "width": {
+          "format": "double",
+          "type": "number"
+        },
+        "x": {
+          "format": "double",
+          "type": "number"
+        },
+        "y": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "coordinate_space",
+        "height",
+        "width",
+        "x",
+        "y"
+      ],
+      "type": "object"
+    },
+    "RpcError": {
+      "properties": {
+        "code": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "data": true,
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "RpcRequest": {
+      "description": "A JSON-RPC 2.0 request as received by the daemon.",
+      "properties": {
+        "id": true,
+        "jsonrpc": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": true
+      },
+      "required": [
+        "jsonrpc",
+        "method"
+      ],
+      "type": "object"
+    },
+    "RpcResponse": {
+      "description": "A JSON-RPC 2.0 response written by the daemon.",
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        },
+        "id": true,
+        "jsonrpc": {
+          "type": "string"
+        },
+        "result": true
+      },
+      "required": [
+        "jsonrpc"
+      ],
+      "type": "object"
+    },
+    "RuntimeVersionResult": {
+      "description": "`runtime.version` result — the protocol-version contract.",
+      "properties": {
+        "maximum_client_protocol_version": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "minimum_client_protocol_version": {
+          "description": "Inclusive lower bound of the client protocol versions this daemon accepts. A client below this (or above `maximum_client_protocol_version`) gets `PROTOCOL_VERSION_MISMATCH`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtime_version": {
+          "description": "Wire name is `runtime_version` (the protocol spec's field name); the Rust field stays `version` to avoid `version.version`-style confusion.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "maximum_client_protocol_version",
+        "minimum_client_protocol_version",
+        "name",
+        "protocol_version",
+        "runtime_version"
+      ],
+      "type": "object"
+    },
+    "SessionAction": {
+      "description": "Actions a caller may issue against a session via `computer.session`.",
+      "enum": [
+        "start",
+        "status",
+        "pause",
+        "resume",
+        "stop",
+        "takeover",
+        "release"
+      ],
+      "type": "string"
+    },
+    "SessionParams": {
+      "description": "`computer.session` request.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/SessionAction"
+        },
+        "client_id": {
+          "description": "Identity of the client performing the action; recorded on `start`.",
+          "type": "string"
+        },
+        "client_instance_id": {
+          "type": "string"
+        },
+        "client_name": {
+          "type": "string"
+        },
+        "control_token": {
+          "description": "The session's control token. Required for `pause`/`resume`/`takeover`/ `release`/`stop`; `start` does not need one. `status` needs either this or the observation token (full status is a sensitive read).",
+          "type": "string"
+        },
+        "display_id": {
+          "type": "string"
+        },
+        "observation_token": {
+          "description": "The session's observation token — accepted for `status` in place of the control token.",
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "SessionResult": {
+      "description": "`computer.session` result (shape depends on `action`).",
+      "properties": {
+        "control_token": {
+          "description": "The session's control token. **Only present in the `start` response** — it is issued exactly once, on creation, and never repeated by `status` or any other read-only call. Keep it in memory (or the CLI's 0600 credential file), never in logs or traces.",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "current_frame_id": {
+          "type": "string"
+        },
+        "display_id": {
+          "type": "string"
+        },
+        "last_action_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "lock_held": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        },
+        "observation_token": {
+          "description": "The session's observation token (read-only capability). **Only present in the `start` response**, like the control token. A holder of only this token can observe/inspect/read traces, but can never act, cancel, pause, or stop.",
+          "type": "string"
+        },
+        "owner_client_id": {
+          "description": "Who created this session (backward-compatible name of the starting client). The owner_* fields carry the structured identity; only the creating client may stop the session on exit.",
+          "type": "string"
+        },
+        "owner_client_name": {
+          "type": "string"
+        },
+        "owner_instance_id": {
+          "type": "string"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "started_by": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/SessionState"
+        },
+        "trace_dir": {
+          "type": "string"
+        },
+        "user_takeover": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "created_at",
+        "display_id",
+        "lock_held",
+        "paused",
+        "session_id",
+        "started_by",
+        "state",
+        "user_takeover"
+      ],
+      "type": "object"
+    },
+    "SessionState": {
+      "description": "Lifecycle state of a computer-use session.",
+      "enum": [
+        "starting",
+        "active",
+        "paused",
+        "user_takeover",
+        "stopping",
+        "stopped",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "SessionSummary": {
+      "description": "`session.summary` — the **public** view of the active session. No token needed: it exposes only coarse state and non-secret owner identity. Full `status` (which includes `display_id`, `frame_id`, `trace_dir`) requires an observation or control token.",
+      "properties": {
+        "lock_held": {
+          "description": "True when the session is the control-lock holder.",
+          "type": "boolean"
+        },
+        "message": {
+          "description": "Human-readable hint for the common case: the active session is owned by another client.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owner_client_id": {
+          "description": "The non-secret identity of the creating client (name only — never a token, never an instance id or frame/trace paths).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owner_client_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "description": "`null` when no session exists — every field is always present on the wire (explicit nulls, never omitted keys): consumers read `summary.session_id == null` without juggling absence.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "lock_held",
+        "message",
+        "owner_client_id",
+        "owner_client_name",
+        "session_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "ShutdownParams": {
+      "description": "`runtime.shutdown` request — requires the daemon admin token.",
+      "properties": {
+        "admin_token": {
+          "description": "The daemon admin token (per-install credential held by the daemon manager — the CLI / LaunchAgent). Ordinary clients never hold it.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "StabilizationInfo": {
+      "description": "Outcome of the post-batch stabilization wait (`WaitPolicy::UntilStable`). `change_score` is the **last measured** thumbnail difference — on timeout it carries the real score (never a fabricated 0), so the caller can tell a screen that nearly settled from one that kept animating.",
+      "properties": {
+        "change_score": {
+          "format": "double",
+          "type": "number"
+        },
+        "elapsed_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "samples": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "change_score",
+        "outcome",
+        "samples"
+      ],
+      "type": "object"
+    },
+    "StaleFrameDetail": {
+      "description": "Detail attached to a [`CuError::StaleFrame`].",
+      "properties": {
+        "change_score": {
+          "format": "double",
+          "type": "number"
+        },
+        "current_frame_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "referenced_frame_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "change_score",
+        "current_frame_id",
+        "reason",
+        "referenced_frame_id"
+      ],
+      "type": "object"
+    },
+    "StaleFramePolicy": {
+      "description": "How strictly a referenced `frame_id` must match the current screen.",
+      "oneOf": [
+        {
+          "description": "Only the **current** frame is actionable. Acting on any older `frame_id` is `STALE_FRAME`, regardless of visual similarity. This is the default: an agent must re-observe between action batches.",
+          "enum": [
+            "Strict"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Older frames are acceptable as long as the live screen still matches them (visual comparison + app change + age backstop).",
+          "enum": [
+            "VisualMatch"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "TextInputMethod": {
+      "description": "How text is inserted. `keyboard` synthesizes key events with the unicode string; `clipboard` swaps the pasteboard, pastes, and restores it (with a fallback when synthetic key events are unreliable for CJK input).",
+      "enum": [
+        "keyboard",
+        "clipboard"
+      ],
+      "type": "string"
+    },
+    "TraceEntry": {
+      "description": "One entry inside a trace file (JSONL).",
+      "properties": {
+        "action": true,
+        "active_application": {
+          "type": "string"
+        },
+        "change_score": {
+          "format": "double",
+          "type": "number"
+        },
+        "display_id": {
+          "type": "string"
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": true,
+        "event": {
+          "type": "string"
+        },
+        "frame_id": {
+          "type": "string"
+        },
+        "redaction": {
+          "$ref": "#/$defs/RedactedText"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "result": true,
+        "runtime_version": {
+          "type": "string"
+        },
+        "seq": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "stable": {
+          "type": "boolean"
+        },
+        "ts": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "seq",
+        "ts"
+      ],
+      "type": "object"
+    },
+    "TraceExport": {
+      "description": "`trace.export` result.",
+      "properties": {
+        "exported_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "format": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exported_at",
+        "format",
+        "path",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "TraceExportParams": {
+      "description": "`trace.export` request — exporting a trace requires an observation or control token.",
+      "properties": {
+        "control_token": {
+          "type": "string"
+        },
+        "dest": {
+          "type": "string"
+        },
+        "observation_token": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "dest",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "TraceGetParams": {
+      "description": "`trace.get` / `trace.replay` request — trace contents are a sensitive read; an observation or control token is required.",
+      "properties": {
+        "control_token": {
+          "type": "string"
+        },
+        "observation_token": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "TraceMode": {
+      "description": "How strictly traces are recorded.",
+      "oneOf": [
+        {
+          "description": "A trace write failure fails the operation (session start or act batch).",
+          "enum": [
+            "Required"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A trace write failure is logged as degraded but the operation proceeds (the default).",
+          "enum": [
+            "BestEffort"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "No trace is recorded for this session.",
+          "enum": [
+            "Disabled"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "TraceReplayParams": {
+      "description": "`trace.replay` request (token-verified like `trace.get`).",
+      "properties": {
+        "control_token": {
+          "type": "string"
+        },
+        "observation_token": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "TraceReport": {
+      "description": "Recording status of the session's trace for one `computer.act` batch.",
+      "properties": {
+        "degraded": {
+          "description": "True when the trace could not be written in best-effort mode (or the recorder degraded); the operation itself still succeeded.",
+          "type": "boolean"
+        },
+        "mode": {
+          "description": "\"required\" | \"best_effort\" | \"disabled\" — the daemon's trace mode.",
+          "type": "string"
+        },
+        "warnings": {
+          "description": "Human-readable warnings produced while recording this batch.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "degraded",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "TraceSummary": {
+      "description": "`trace.list` entry.",
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "entries": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "last_entry_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "bytes",
+        "entries",
+        "path",
+        "session_id",
+        "started_at"
+      ],
+      "type": "object"
+    },
+    "WaitPolicy": {
+      "description": "What the runtime should do after executing an action batch.",
+      "enum": [
+        "none",
+        "fixed",
+        "until_stable"
+      ],
+      "type": "string"
     }
   },
-  "properties": {
-    "computer.observe": {
-      "params": {
-        "type": "object",
-        "properties": {
-          "session_id": { "type": ["string", "null"] },
-          "target": { "type": "string", "enum": ["full_screen", "active_window"] },
-          "display_id": { "type": ["string", "null"] },
-          "include_cursor": { "type": "boolean" },
-          "max_width": { "type": "integer", "minimum": 32, "maximum": 8192 },
-          "image_format": { "type": "string", "enum": ["png", "jpeg"] },
-          "jpeg_quality": { "type": "integer", "minimum": 1, "maximum": 100 }
-        },
-        "additionalProperties": false
-      }
-    },
-    "computer.act": {
-      "params": {
-        "type": "object",
-        "required": ["session_id", "frame_id", "actions"],
-        "properties": {
-          "session_id": { "type": "string" },
-          "frame_id": { "type": "string" },
-          "actions": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 64,
-            "items": { "$ref": "#/definitions/computer_action" }
-          },
-          "wait_policy": { "type": "string", "enum": ["none", "fixed", "until_stable"] },
-          "fixed_wait_ms": { "type": ["integer", "null"], "minimum": 0 },
-          "return_screenshot": { "type": "boolean" }
-        },
-        "additionalProperties": false
-      }
-    },
-    "computer.inspect": {
-      "params": {
-        "type": "object",
-        "required": ["session_id", "frame_id", "region"],
-        "properties": {
-          "session_id": { "type": "string" },
-          "frame_id": { "type": "string" },
-          "region": {
-            "type": "object",
-            "required": ["x", "y", "width", "height", "coordinate_space"],
-            "properties": {
-              "x": { "type": "number" },
-              "y": { "type": "number" },
-              "width": { "type": "number", "minimum": 1 },
-              "height": { "type": "number", "minimum": 1 },
-              "coordinate_space": { "$ref": "#/definitions/coordinate_space" }
-            },
-            "additionalProperties": false
-          },
-          "scale": { "type": "integer", "minimum": 1, "maximum": 8 }
-        },
-        "additionalProperties": false
-      }
-    },
-    "computer.session": {
-      "params": {
-        "type": "object",
-        "required": ["action"],
-        "properties": {
-          "action": {
-            "type": "string",
-            "enum": ["start", "status", "pause", "resume", "stop", "takeover", "release"]
-          },
-          "session_id": { "type": ["string", "null"] },
-          "display_id": { "type": ["string", "null"] }
-        },
-        "additionalProperties": false
-      }
-    }
+  "$id": "https://github.com/taotao135791-bit/oc-computer-use/blob/main/protocol/computer-use.schema.json",
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "description": "JSON-RPC 2.0 wire protocol between the Computer Use daemon and its adapters (SDK, MCP server, Pi extension). Generated from the Rust wire types — edit the Rust source, then run `pnpm generate:protocol`. Capability tokens (control / observation / admin) are 256-bit secrets issued exactly once; the daemon stores only their SHA-256 hashes and never repeats them in responses.",
+  "title": "Computer Use Protocol v3",
+  "type": "object",
+  "x-protocol-meta": {
+    "jsonrpc_version": "2.0",
+    "maximum_client_protocol_version": 3,
+    "minimum_client_protocol_version": 3,
+    "protocol_version": 3
   }
 }

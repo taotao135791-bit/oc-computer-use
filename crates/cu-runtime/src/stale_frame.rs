@@ -15,7 +15,7 @@ use chrono::Utc;
 use cu_core::{ScreenSnapshot, StaleFrameDetail, StaleFrameVerdict};
 
 /// How strictly a referenced `frame_id` must match the current screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, schemars::JsonSchema)]
 pub enum StaleFramePolicy {
     /// Only the **current** frame is actionable. Acting on any older
     /// `frame_id` is `STALE_FRAME`, regardless of visual similarity. This is

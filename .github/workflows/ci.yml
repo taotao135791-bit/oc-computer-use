@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Rust: format, lint (warnings are errors), full test suite. macOS runner:
+  # cu-daemon links cu-driver-macos, which uses CoreGraphics FFI.
+  rust:
+    name: Rust (fmt / clippy / test)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+
+  # TypeScript workspace: lint, typecheck, build, test (tests run against
+  # dist/, so build precedes test). Frozen lockfile: no silent dependency
+  # drift on CI.
+  typescript:
+    name: TypeScript (lint / typecheck / build / test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm -r lint
+      - name: Typecheck
+        run: pnpm -r typecheck
+      - name: Build
+        run: pnpm -r build
+      - name: Test
+        run: pnpm -r test
+
+  # Protocol single source of truth: the committed JSON Schema + the three
+  # generated TypeScript bindings must be byte-identical to what the Rust
+  # wire types produce. Any drift fails the build.
+  protocol-drift:
+    name: Protocol drift check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Regenerate and compare
+        run: pnpm check:protocol
+
+  # Secrets: gitleaks with the repo's allowlist (capability tokens are
+  # generated at runtime, never committed; fake test values are allowlisted
+  # in .gitleaks.toml).
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Swift bridge: compiles on both macOS architectures and lipo's into a
+  # universal binary — proves the bundled source builds everywhere it ships.
+  swift-bridge:
+    name: Swift bridge (arm64 + x86_64 + universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build arm64
+        run: |
+          swiftc -O -target arm64-apple-macosx14.0 \
+            -o /tmp/cubridge-arm64 \
+            crates/cu-driver-macos/swift/CUBridge/Sources/CUBridge/main.swift \
+            -framework ScreenCaptureKit -framework CoreGraphics -framework AppKit \
+            -framework ApplicationServices -framework CoreImage
+      - name: Build x86_64
+        run: |
+          swiftc -O -target x86_64-apple-macosx14.0 \
+            -o /tmp/cubridge-x86_64 \
+            crates/cu-driver-macos/swift/CUBridge/Sources/CUBridge/main.swift \
+            -framework ScreenCaptureKit -framework CoreGraphics -framework AppKit \
+            -framework ApplicationServices -framework CoreImage
+      - name: Lipo universal
+        run: |
+          lipo -create -output /tmp/cubridge-universal /tmp/cubridge-arm64 /tmp/cubridge-x86_64
+          lipo -info /tmp/cubridge-universal
+          test "$(lipo -archs /tmp/cubridge-universal | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
+
+  # Package smoke: every automated gate (Rust + TS) in one shot, no daemon
+  # or display needed — the same command maintainers run locally.
+  package-smoke:
+    name: Package smoke
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Smoke
+        run: bash scripts/smoke.sh

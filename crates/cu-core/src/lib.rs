@@ -23,8 +23,12 @@ pub use frames::{ScreenFrame, ScreenSnapshot, StaleFrameVerdict};
 pub use protocol::{
     ActParams, ActResult, ActionResultReport, CancelParams, CancelResult, ClientInfo,
     InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult, RequestKey,
-    RpcRequest, RpcResponse, SessionParams, SessionResult, StabilizationInfo, TraceEntry,
-    TraceExport, TraceReport, TraceSummary,
+    RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams, SessionResult, SessionSummary,
+    ShutdownParams, StabilizationInfo, TraceEntry, TraceExport, TraceExportParams, TraceGetParams,
+    TraceReplayParams, TraceReport, TraceSummary,
 };
-pub use security::{generate_control_token, ControlToken, SecretTokenHash};
+pub use security::{
+    generate_control_token, generate_daemon_admin_token, generate_observation_token, ControlToken,
+    DaemonAdminToken, ObservationToken, SecretTokenHash,
+};
 pub use sessions::{SessionAction, SessionState, SessionStatus};

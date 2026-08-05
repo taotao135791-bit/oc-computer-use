@@ -9,7 +9,7 @@ Example:
 
 ```
 → {"jsonrpc":"2.0","id":1,"method":"runtime.health","params":null}
-← {"jsonrpc":"2.0","id":1,"result":{"version":"0.1.0","ready":true,...}}
+← {"jsonrpc":"2.0","id":1,"result":{"version":"0.2.0-alpha.1","ready":true,...}}
 ```
 
 ## Error shape
@@ -48,6 +48,7 @@ referenced `frame_id` itself is checked (`COMPUTER_USE_STALE_POLICY`):
 | JSON-RPC code | Machine code | Meaning |
 |---|---|---|
 | -32700 | `PARSE_ERROR` | request was not valid JSON |
+| -32600 | `INVALID_REQUEST` | request not a valid JSON-RPC request object |
 | -32601 | `METHOD_NOT_FOUND` | unknown method |
 | -32602 | `INVALID_PARAMS` | missing/wrong params (e.g. observe without `session_id`) |
 | -32000 | `INTERNAL` | internal failure |
@@ -66,7 +67,11 @@ referenced `frame_id` itself is checked (`COMPUTER_USE_STALE_POLICY`):
 | -32020 | `INVALID_CONTROL_TOKEN` | a control token was presented but did not verify (deliberately non-descriptive) |
 | -32021 | `SESSION_STOPPED` | a mutating operation targeted a session that is already stopped |
 | -32022 | `REQUEST_TIMEOUT` | the client-side request deadline expired (reported by the SDK, see below) |
-| -32023 | `PROTOCOL_VERSION_MISMATCH` | the client's `protocol_version` is incompatible with the daemon's |
+| -32023 | `PROTOCOL_VERSION_MISMATCH` | the client's `protocol_version` is incompatible with the daemon's (`data` carries the version bounds, never a secret) |
+| -32024 | `OBSERVATION_TOKEN_REQUIRED` | a sensitive read (observe / inspect / status / trace) was attempted with no observation or control token |
+| -32025 | `INVALID_OBSERVATION_TOKEN` | a presented observation/control token did not verify (deliberately non-descriptive) |
+| -32026 | `DAEMON_ADMIN_TOKEN_REQUIRED` | `runtime.shutdown` was attempted without the daemon admin token |
+| -32027 | `INVALID_DAEMON_ADMIN_TOKEN` | an admin token was presented but did not verify |
 | — | `OUT_OF_BOUNDS` | coordinate outside the display |
 | — | `DRIVER_ERROR` | bridge/driver failure (e.g. Screen Recording permission missing) |
 | — | `PERMISSION` | macOS permission missing |
@@ -97,53 +102,80 @@ daemon runs with `COMPUTER_USE_TRACE_DEV_MODE=1`.
 | Method | Params | Result highlights |
 |---|---|---|
 | `runtime.health` | — | `version`, `ready`, `permissions`, `active_sessions`, `uptime_secs`, `frame_cache` |
-| `runtime.version` | `{protocol_version}` | `name`, `version`, `protocol_version` — advertise your protocol version (`2`); a mismatch is `PROTOCOL_VERSION_MISMATCH` |
+| `runtime.version` | — | `{runtime_version, protocol_version, minimum_client_protocol_version, maximum_client_protocol_version}` — the daemon's version contract (v3); a client outside the bounds is refused with `PROTOCOL_VERSION_MISMATCH` carrying the bounds (never a secret) |
 | `runtime.permissions` | — | `screen_recording`, `accessibility` + guidance |
 | `runtime.displays` | — | array of `{id, name, bounds, pixel_width, pixel_height, scale_factor, is_main}` |
 | `runtime.desktop_layout` | — | `primary_id`, `displays` |
 | `runtime.pointer` | — | `location: {x, y}` |
 | `runtime.active_application` | — | `bundle_id`, `name`, optional `window_title` |
-| `runtime.shutdown` | — | `{status: "shutting_down"}` |
+| `runtime.shutdown` | `{admin_token}` | `{status: "shutting_down"}` — refused with `DAEMON_ADMIN_TOKEN_REQUIRED` / `INVALID_DAEMON_ADMIN_TOKEN` without the daemon admin token (see below); the daemon exits only when it verifies |
 
 ### Sessions
 
-`computer.session` — params `{action, session_id?, display_id?, control_token?,
-client_id?, client_name?, client_instance_id?}`.
+`computer.session` — params `{action, session_id?, display_id?,
+control_token?, observation_token?, client_id?, client_name?,
+client_instance_id?}`.
 
 Actions: `start`, `status`, `pause`, `resume`, `takeover`, `release`, `stop`.
 Result: `{session_id, state, paused, user_takeover, lock_held, display_id,
 created_at, last_action_at, current_frame_id, trace_dir, owner_client_id,
-owner_client_name, owner_instance_id, control_token?}`.
+owner_client_name, owner_instance_id, control_token?, observation_token?}`.
+Both token fields appear **only** in the `start` response.
 
-#### Control token (capability)
+#### Capability tokens
 
-The daemon issues a session's **control token exactly once**, in the `start`
-response. It is a 256-bit random value (base64url), returned **only there**:
-`status` and every other read-only call never repeat it. The daemon stores
-only a SHA-256 hash and never logs, traces, or prints it. **Every mutating
-operation — `pause`, `resume`, `takeover`, `release`, `stop`, `computer.act`,
-`computer.cancel` — is refused without the token** (`CONTROL_TOKEN_REQUIRED`),
-and a wrong token is refused (`INVALID_CONTROL_TOKEN`) with no side effects.
-Read-only operations (`status`, `observe`, `inspect`, ...) need no token.
+The daemon issues a session's **two capability tokens exactly once**, in the
+`start` response. Each is a 256-bit random value (base64url, from the OS
+CSPRNG), returned **only there** — `status` and every other call never repeat
+them. The daemon stores only SHA-256 hashes and never logs, traces, or prints
+plaintext.
 
-**Knowing a session ID does not grant control.** A client that knows a
-session's id — through `status`, a trace, or another client's output — can
-read it, but cannot pause, stop, or cancel it. The token is the capability;
+- **`control_token`** — authorizes every mutating operation (`pause`,
+  `resume`, `takeover`, `release`, `stop`, `computer.act`, `computer.cancel`)
+  and doubles as an observation credential.
+- **`observation_token`** — authorizes sensitive reads (`status`, `observe`,
+  `inspect`, trace methods). The control token verifies there too; either
+  token opens a read, a mutating operation always needs the control token.
+
+A mutating operation without a token is `CONTROL_TOKEN_REQUIRED`; a wrong
+token is `INVALID_CONTROL_TOKEN` with no side effects. A read with no token
+is `OBSERVATION_TOKEN_REQUIRED`; a wrong read token is
+`INVALID_OBSERVATION_TOKEN` (deliberately non-descriptive — it must not
+reveal which token was wrong or how close the guess was).
+
+**Knowing a session ID grants no observation or control permission.** A
+client that knows a session's id — through `status`, a trace, or another
+client's output — can address the session, but cannot read its frames or
+pause, stop, or cancel it without a token. The tokens are the capabilities;
 the id is an address.
 
 Token lifecycle:
 
-- `pause` / `resume` / `takeover` / `release` never change the token.
-- `stop` ends the session; the token dies with it (the daemon forgets the
-  hash, and a later `stop` on the stopped session is `SESSION_STOPPED`).
+- `pause` / `resume` / `takeover` / `release` never change the tokens.
+- `stop` ends the session; the tokens die with it (the daemon forgets the
+  hashes, and a later `stop` on the stopped session is `SESSION_STOPPED`).
 - A daemon restart ends every in-memory session and invalidates every token;
   stored credentials must be treated as dead after a restart.
 
+#### Daemon admin token
+
+`runtime.shutdown` is the one capability outside session ownership: a
+**daemon admin token** is generated at daemon startup (256-bit CSPRNG) and
+persisted to `~/.local/state/oc-computer-use/daemon-admin.json` (directory
+0700, file 0600, fsync'd). Only the daemon manager (CLI / LaunchAgent) holds
+it; a shutdown without it is `DAEMON_ADMIN_TOKEN_REQUIRED`, and the daemon
+exits only when the presented token verifies. A corrupt admin-token file
+refuses startup (never a silent downgrade to an unstoppable daemon).
+
 #### Session behavior
 
-- **Auto-create on first use.** Clients that expect a session (SDK
-  `ensureSession`, CLI, MCP, Pi extension) resolve the active session with
-  `status` first and start one **only** when `status` fails with
+- **The protocol never creates a session implicitly.** The raw
+  `computer.observe` / `computer.act` / `computer.inspect` methods do **not**
+  create a session: with no active session they fail with `SESSION_NOT_FOUND`,
+  and with a session but no token they fail with the token errors above.
+  Auto-creation is an **adapter** convenience: clients that expect a session
+  (SDK `ensureSession`, CLI, MCP, Pi extension) resolve the active session
+  with `status` first and start one **only** when `status` fails with
   `SESSION_NOT_FOUND` — other errors are rethrown, never masked. The resolve
   is single-flight, so concurrent first calls start exactly one session.
 - **Ownership.** `start` takes optional identity params
@@ -191,8 +223,10 @@ so the caller can re-check state instead of assuming.
 
 ### computer.observe
 
-Params: `{session_id, display_id?, include_image?, max_width?, format?,
-quality?}`.
+Params: `{session_id, observation_token?, control_token?, display_id?,
+include_image?, max_width?, format?, quality?}`. At least one token is
+required — either the observation token or the control token opens the read;
+a missing token is `OBSERVATION_TOKEN_REQUIRED`.
 
 Result:
 
@@ -215,7 +249,10 @@ Result:
 
 ### computer.act
 
-Params: `{session_id, frame_id?, actions: [ComputerAction]}`.
+Params: `{session_id, control_token, frame_id?, actions: [ComputerAction]}`.
+The control token is required — an act batch without it is
+`CONTROL_TOKEN_REQUIRED`, and the batch executes no action when the token
+does not verify.
 
 `ComputerAction` is a discriminated union on `"type"`:
 
@@ -244,8 +281,10 @@ settling. `trace` is `{mode, degraded, warnings}` (see [Trace modes](#trace-mode
 
 ### computer.inspect
 
-Params: `{session_id, frame_id?, region: {x, y, width, height,
-coordinate_space}, scale?}`. Returns `{session_id, frame_id, width, height,
+Params: `{session_id, observation_token?, control_token?, frame_id?, region:
+{x, y, width, height, coordinate_space}, scale?}`. Same token rule as
+`computer.observe`: either token opens the read, none is
+`OBSERVATION_TOKEN_REQUIRED`. Returns `{session_id, frame_id, width, height,
 image_mime_type, image}` plus `mapping: {global_origin: [x, y]}` so the agent
 can translate cropped pixels back to global coordinates.
 

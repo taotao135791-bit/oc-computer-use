@@ -27,6 +27,16 @@ const NOT_FOUND_ERROR = {
   data: { code: "SESSION_NOT_FOUND", message: "No active computer-use session exists." },
 };
 
+const OBSERVATION_REQUIRED_ERROR = {
+  code: -32024,
+  message: "OBSERVATION_TOKEN_REQUIRED",
+  data: {
+    code: "OBSERVATION_TOKEN_REQUIRED",
+    message:
+      "This operation requires the session observation token (or its control token). A session id alone grants no observation permission.",
+  },
+};
+
 function startFakeDaemon() {
   const dir = mkdtempSync(join(tmpdir(), "cu-mcp-test-"));
   const socketPath = join(dir, "fake.sock");
@@ -65,20 +75,53 @@ function startFakeDaemon() {
               owner_client_name: req.params?.client_name ?? "JSON-RPC client",
               owner_instance_id: req.params?.client_instance_id ?? "unknown",
             };
-            // The control token appears exactly once — in the start response.
-            // Status (below) never repeats it.
+            // Both capability tokens appear exactly once — in the start
+            // response. Status (below) never repeats either.
             respond({
               jsonrpc: "2.0",
               id: req.id,
-              result: { ...state.session, control_token: "mcp-fake-control-token" },
+              result: {
+                ...state.session,
+                control_token: "mcp-fake-control-token",
+                observation_token: "mcp-fake-observation-token",
+              },
             });
           } else if (action === "status") {
-            if (!state.session) respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
-            else respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+            // v3: status is a sensitive read — a session id alone grants no
+            // observation permission.
+            if (!state.session) {
+              respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
+            } else if (
+              req.params?.observation_token !== "mcp-fake-observation-token" &&
+              req.params?.control_token !== "mcp-fake-control-token"
+            ) {
+              respond({
+                jsonrpc: "2.0",
+                id: req.id,
+                error: OBSERVATION_REQUIRED_ERROR,
+              });
+            } else {
+              respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+            }
           } else {
             if (!state.session) respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
             else respond({ jsonrpc: "2.0", id: req.id, result: state.session });
           }
+        } else if (req.method === "session.summary") {
+          // v3 public coarse view: tokenless. `null` session_id when none.
+          const s = state.session;
+          respond({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: {
+              session_id: s?.session_id ?? null,
+              state: s?.state ?? null,
+              lock_held: s?.lock_held ?? false,
+              owner_client_id: s?.owner_client_id ?? null,
+              owner_client_name: s?.owner_client_name ?? null,
+              message: s ? "knowing its id grants no observation or control permission" : null,
+            },
+          });
         } else if (req.method === "computer.observe") {
           respond({
             jsonrpc: "2.0",
@@ -141,7 +184,7 @@ function startFakeDaemon() {
           respond({
             jsonrpc: "2.0",
             id: req.id,
-            result: { name: "fake", version: "0.1.0", protocol_version: 2 },
+            result: { name: "fake", version: "0.1.0", protocol_version: 3 },
           });
         } else if (req.method === "trace.list") {
           respond({ jsonrpc: "2.0", id: req.id, result: { traces: [] } });
@@ -467,6 +510,75 @@ test("computer_inspect rejects an invalid region with a field-level error", { ti
     });
     assert.equal(result.isError, true);
     assert.match(result.content.find((b) => b.type === "text").text, /region/);
+  } finally {
+    proc.kill();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("MCP tool params conform to the core protocol schema", { timeout: 20000 }, async () => {
+  // The MCP server's zod schemas are adapter-side conveniences; the params it
+  // actually sends to the daemon must be schema-valid against the generated
+  // protocol (single source of truth). Validate the recorded wire params of
+  // every computer.* request with ajv against the matching $defs entry.
+  const { readFileSync } = await import("node:fs");
+  const { default: Ajv2019 } = await import("ajv/dist/2019.js");
+  const schema = JSON.parse(
+    readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "protocol", "computer-use.schema.json"),
+      "utf8",
+    ),
+  );
+  const ajv = new Ajv2019({ strict: false });
+  const validateAgainst = (defName) =>
+    ajv.compile({
+      $schema: "https://json-schema.org/draft/2019-09/schema",
+      $ref: `#/$defs/${defName}`,
+      $defs: schema.$defs,
+    });
+
+  const fake = startFakeDaemon();
+  const { proc, client } = spawnServer(fake);
+  try {
+    await client.initialize();
+    await client.callTool("computer_observe", { include_image: true });
+    await client.callTool("computer_act", {
+      session_id: "s_started",
+      frame_id: "frame_1",
+      actions: [{ type: "click", x: 100, y: 200, button: "left", coordinate_space: "normalized_1000" }],
+      wait_policy: "until_stable",
+    });
+    await client.callTool("computer_inspect", {
+      session_id: "s_started",
+      frame_id: "frame_1",
+      region: { x: 0, y: 0, width: 100, height: 100, coordinate_space: "image_pixels" },
+    });
+    await client.callTool("computer_session", { action: "status" });
+    await client.callTool("computer_cancel", { session_id: "s_started" });
+    await client.callTool("trace_get", { session_id: "s_started" });
+
+    const byDef = {
+      "computer.session": "SessionParams",
+      "computer.observe": "ObserveParams",
+      "computer.act": "ActParams",
+      "computer.inspect": "InspectParams",
+      "computer.cancel": "CancelParams",
+      "trace.get": "TraceGetParams",
+    };
+    const seen = new Set();
+    for (const req of fake.requests) {
+      const defName = byDef[req.method];
+      if (!defName) continue;
+      seen.add(req.method);
+      const validateFn = validateAgainst(defName);
+      const ok = validateFn(req.params);
+      assert.ok(
+        ok,
+        `${req.method} params violate ${defName}: ${JSON.stringify(validateFn.errors)} — ${JSON.stringify(req.params)}`,
+      );
+    }
+    // Every tool actually talked to the daemon during this test.
+    assert.deepEqual([...seen].sort(), Object.keys(byDef).sort());
   } finally {
     proc.kill();
     stopFakeDaemon(fake);

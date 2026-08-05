@@ -38,10 +38,16 @@ The extension talks to the daemon at `~/.computer-use/runtime.sock`
   `COMPUTER_USE_EXISTING_SESSION_POLICY`:
   - `reject` (default): tools fail with `CONTROL_LOCKED`, whose payload names
     the owner's non-secret identity — the extension never takes over.
-  - `attach`: observe-only use of the foreign session. The extension holds
+  - `read_only`: observe-only use of the foreign session. The extension holds
     **no control token** for it (the token is issued exactly once, at `start`,
     to the creating client), so mutating calls are refused by the daemon with
-    `CONTROL_TOKEN_REQUIRED` and the extension can never stop it.
+    `CONTROL_TOKEN_REQUIRED` and the extension can never stop it. It also
+    holds no observation token, so observing a foreign session requires the
+    owner to share one (v3: a session id alone grants no observation
+    permission) — a tokenless `read_only` attach is refused with
+    `attachReadOnly` rather than silently observed. The pre-0.2 value
+    `attach` is still accepted for the same behavior, with a deprecation
+    warning.
   There is deliberately no `start_new` policy — the runtime allows only one
   active session — and no token-less takeover: attaching without the
   capability would be silently powerless.
@@ -96,5 +102,5 @@ Saved screenshots never touch the repo, project, or working directory:
 ## Tests
 
 ```bash
-pnpm test   # 14 tests (stateful fake daemon, drive the registered tools directly)
+pnpm test   # 16 tests (stateful fake daemon, drive the registered tools directly)
 ```

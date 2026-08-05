@@ -7,9 +7,11 @@
 
 use std::path::Path;
 
+use cu_core::security::SecretTokenHash;
 use cu_core::{
     ActParams, CancelParams, CancelResult, CuError, InspectParams, ObserveParams, RequestKey,
-    RpcRequest, RpcResponse, SessionParams, TraceSummary,
+    RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams, SessionSummary, ShutdownParams,
+    TraceExportParams, TraceGetParams, TraceReplayParams, TraceSummary,
 };
 use cu_runtime::Runtime;
 use serde::de::DeserializeOwned;
@@ -22,9 +24,16 @@ fn to_result<T: Serialize>(v: T) -> Result<serde_json::Value, CuError> {
     serde_json::to_value(v).map_err(|e| CuError::Internal(format!("cannot serialize result: {e}")))
 }
 
-/// Parse request params into the typed wire struct.
+/// Parse request params into the typed wire struct. A JSON `null` (a request
+/// with no `params` member) is treated as an empty object so methods with
+/// all-optional params (e.g. `runtime.shutdown`) work without one.
 fn parse_params<T: DeserializeOwned>(params: &serde_json::Value) -> Result<T, CuError> {
-    serde_json::from_value(params.clone())
+    let params = if params.is_null() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        params.clone()
+    };
+    serde_json::from_value(params)
         .map_err(|e| CuError::InvalidParams(format!("invalid params: {e}")))
 }
 
@@ -42,33 +51,22 @@ fn validate_session_id(id: &str) -> Result<(), CuError> {
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-struct TraceGetParams {
-    session_id: String,
-}
-
-#[derive(serde::Deserialize)]
-struct TraceExportParams {
-    session_id: String,
-    dest: String,
-}
-
-#[derive(serde::Deserialize)]
-struct TraceReplayParams {
-    session_id: String,
-}
-
 /// Dispatch one request. Never panics; every path yields a response.
 ///
 /// `connection_id` identifies the connection the request arrived on. Together
 /// with the request's JSON-RPC id it forms the [`RequestKey`] that scopes
 /// cancellation: `computer.cancel` may only cancel requests issued on the
 /// *same* connection (and only with the session's control token).
+///
+/// `admin_hash` is the digest of the daemon's admin token, the only
+/// credential that authorizes `runtime.shutdown` (session capability tokens
+/// never do — a leaked control token must not be able to kill the daemon).
 pub async fn dispatch(
     runtime: &std::sync::Arc<Runtime>,
     app_shutdown: &CancellationToken,
     connection_id: u64,
     req: RpcRequest,
+    admin_hash: &SecretTokenHash,
 ) -> RpcResponse {
     let id = req.id.clone();
     let method = req.method.clone();
@@ -87,12 +85,16 @@ pub async fn dispatch(
             // explicit PROTOCOL_VERSION_MISMATCH (never a confusing success),
             // so an old SDK talking to a new daemon fails loudly instead of
             // misbehaving. Clients that don't advertise still get the version
-            // to check themselves; their tokenless mutating calls will fail
-            // with CONTROL_TOKEN_REQUIRED regardless.
+            // (with the min/max bounds) to check themselves; their tokenless
+            // calls will fail with the token errors regardless.
             if let serde_json::Value::Object(map) = &params {
                 if let Some(serde_json::Value::Number(n)) = map.get("protocol_version") {
                     let got = n.as_u64().unwrap_or(u64::MAX) as u32;
-                    if got != cu_core::security::PROTOCOL_VERSION {
+                    let (min, max) = (
+                        cu_core::security::MIN_CLIENT_PROTOCOL_VERSION,
+                        cu_core::security::MAX_CLIENT_PROTOCOL_VERSION,
+                    );
+                    if got < min || got > max {
                         return error_response(
                             id,
                             CuError::ProtocolVersionMismatch {
@@ -103,11 +105,13 @@ pub async fn dispatch(
                     }
                 }
             }
-            Ok(serde_json::json!({
-                "name": cu_core::config::RUNTIME_NAME,
-                "version": cu_core::config::RUNTIME_VERSION,
-                "protocol_version": cu_core::security::PROTOCOL_VERSION,
-            }))
+            to_result(RuntimeVersionResult {
+                name: cu_core::config::RUNTIME_NAME.into(),
+                version: cu_core::config::RUNTIME_VERSION.into(),
+                protocol_version: cu_core::security::PROTOCOL_VERSION,
+                minimum_client_protocol_version: cu_core::security::MIN_CLIENT_PROTOCOL_VERSION,
+                maximum_client_protocol_version: cu_core::security::MAX_CLIENT_PROTOCOL_VERSION,
+            })
         }
         "runtime.permissions" => runtime.permissions().await.and_then(to_result),
         "runtime.displays" => runtime.displays().await.and_then(to_result),
@@ -115,8 +119,25 @@ pub async fn dispatch(
         "runtime.pointer" => runtime.pointer_location().await.and_then(to_result),
         "runtime.active_application" => runtime.active_application().await.and_then(to_result),
         "runtime.shutdown" => {
-            app_shutdown.cancel();
-            Ok(serde_json::json!({ "status": "shutting_down" }))
+            // Only the daemon's admin token may shut it down. The token is
+            // presented by the CLI (which read it from the admin token file);
+            // a missing token is DAEMON_ADMIN_TOKEN_REQUIRED and a wrong one
+            // (including any session capability token) is
+            // INVALID_DAEMON_ADMIN_TOKEN — nothing is cancelled either way.
+            let p: ShutdownParams = match parse_params(&params) {
+                Ok(p) => p,
+                Err(e) => return error_response(id, e),
+            };
+            match p.admin_token.as_deref() {
+                None => Err(CuError::DaemonAdminTokenRequired),
+                Some(presented) if !admin_hash.verify(presented) => {
+                    Err(CuError::InvalidDaemonAdminToken)
+                }
+                Some(_) => {
+                    app_shutdown.cancel();
+                    Ok(serde_json::json!({ "status": "shutting_down" }))
+                }
+            }
         }
 
         // --- computer.session ---
@@ -146,10 +167,17 @@ pub async fn dispatch(
                     p.display_id,
                     client,
                     p.control_token.as_deref(),
+                    p.observation_token.as_deref(),
                 )
                 .await
                 .and_then(to_result)
         }
+
+        // --- session.summary: the *public* session view ---
+        // Coarse state + non-secret owner identity only. This is the one
+        // session query that needs no token; it must never reveal display
+        // ids, frame ids, trace paths, or any capability token.
+        "session.summary" => to_result::<SessionSummary>(runtime.session_summary()),
 
         // --- computer.observe ---
         "computer.observe" => {
@@ -212,14 +240,33 @@ pub async fn dispatch(
         }
 
         // --- trace management ---
-        "trace.list" => cu_trace::list_traces(runtime.traces_dir())
-            .and_then(|list| to_result(serde_json::json!({ "traces": list }))),
+        // Trace contents are a sensitive read: every trace method verifies an
+        // observation or control token against the session's stored hashes
+        // BEFORE touching any file. A session-id-only caller gets
+        // OBSERVATION_TOKEN_REQUIRED and no file I/O happens.
+        "trace.list" => {
+            // Only the trace *listing* (session ids, paths, sizes) of sessions
+            // whose identity the caller can prove… but a list inherently spans
+            // sessions. The list is a table of trace summaries — the same
+            // metadata `session.summary` already exposes publicly — so it stays
+            // tokenless, exactly like `session.summary`. Every entry's
+            // *content* access (get/export/replay) is token-verified.
+            cu_trace::list_traces(runtime.traces_dir())
+                .and_then(|list| to_result(serde_json::json!({ "traces": list })))
+        }
         "trace.get" => {
             let p: TraceGetParams = match parse_params(&params) {
                 Ok(p) => p,
                 Err(e) => return error_response(id, e),
             };
             if let Err(e) = validate_session_id(&p.session_id) {
+                return error_response(id, e);
+            }
+            if let Err(e) = runtime.verify_session_read(
+                &p.session_id,
+                p.observation_token.as_deref(),
+                p.control_token.as_deref(),
+            ) {
                 return error_response(id, e);
             }
             let path = runtime.traces_dir().join(format!("{}.jsonl", p.session_id));
@@ -231,6 +278,13 @@ pub async fn dispatch(
                 Err(e) => return error_response(id, e),
             };
             if let Err(e) = validate_session_id(&p.session_id) {
+                return error_response(id, e);
+            }
+            if let Err(e) = runtime.verify_session_read(
+                &p.session_id,
+                p.observation_token.as_deref(),
+                p.control_token.as_deref(),
+            ) {
                 return error_response(id, e);
             }
             let src = runtime.traces_dir().join(format!("{}.jsonl", p.session_id));
@@ -254,10 +308,18 @@ pub async fn dispatch(
             if let Err(e) = validate_session_id(&p.session_id) {
                 return error_response(id, e);
             }
+            if let Err(e) = runtime.verify_session_read(
+                &p.session_id,
+                p.observation_token.as_deref(),
+                p.control_token.as_deref(),
+            ) {
+                return error_response(id, e);
+            }
             let path = runtime.traces_dir().join(format!("{}.jsonl", p.session_id));
             cu_trace::replay_from_file(&p.session_id, &path).and_then(to_result)
         }
         "trace.summaries" => {
+            // Same public-metadata treatment as `trace.list`.
             let list = match cu_trace::list_traces(runtime.traces_dir()) {
                 Ok(l) => l,
                 Err(e) => return error_response(id, e),
@@ -296,6 +358,9 @@ mod tests {
     #[derive(Default)]
     struct FakeDriver {
         pub executes: std::sync::atomic::AtomicUsize,
+        /// Capture count — the observable side effect of `computer.observe`.
+        /// A rejected observe must leave this at zero.
+        pub captures: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -326,8 +391,16 @@ mod tests {
             &self,
             request: CaptureRequest,
         ) -> Result<cu_driver::CapturedFrame, CuError> {
-            // Nothing ever re-parses the bytes in this test path.
-            std::fs::write(&request.output_path, b"fake-png").unwrap();
+            self.captures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // A real (tiny) PNG so the inspect pixel-read path can decode it.
+            let png: &[u8] = &[
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 2, 0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99,
+                248, 207, 192, 0, 0, 3, 1, 1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68,
+                174, 66, 96, 130,
+            ];
+            std::fs::write(&request.output_path, png).unwrap();
             Ok(cu_driver::CapturedFrame {
                 display_id: request.display_id,
                 width: 4,
@@ -340,7 +413,7 @@ mod tests {
                     height: 4.0,
                 },
                 image_path: request.output_path,
-                image_bytes: b"fake-png".to_vec(),
+                image_bytes: png.to_vec(),
                 format: request.format,
                 active_application: None,
                 captured_at: chrono::Utc::now(),
@@ -404,7 +477,22 @@ mod tests {
         }
     }
 
-    /// Dispatch one request as if it arrived on connection `conn`.
+    /// The daemon's admin credential for tests: one shared token/hash pair so
+    /// shutdown tests can present the token they verified against.
+    fn test_admin() -> (cu_core::security::DaemonAdminToken, SecretTokenHash) {
+        static ADMIN: std::sync::OnceLock<(cu_core::security::DaemonAdminToken, SecretTokenHash)> =
+            std::sync::OnceLock::new();
+        ADMIN
+            .get_or_init(|| {
+                let token = cu_core::security::generate_daemon_admin_token();
+                let hash = SecretTokenHash::from_token(&token);
+                (token, hash)
+            })
+            .clone()
+    }
+
+    /// Dispatch one request as if it arrived on connection `conn`, against the
+    /// shared test admin credential.
     async fn call(
         rt: &Arc<Runtime>,
         conn: u64,
@@ -412,9 +500,33 @@ mod tests {
         id: u64,
         params: serde_json::Value,
     ) -> RpcResponse {
+        let (_token, admin_hash) = test_admin();
+        call_with(
+            rt,
+            conn,
+            method,
+            id,
+            params,
+            &admin_hash,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// Dispatch against an explicit admin hash and shutdown token (so shutdown
+    /// tests can observe what was cancelled and what was not).
+    async fn call_with(
+        rt: &Arc<Runtime>,
+        conn: u64,
+        method: &str,
+        id: u64,
+        params: serde_json::Value,
+        admin_hash: &SecretTokenHash,
+        app_shutdown: &CancellationToken,
+    ) -> RpcResponse {
         dispatch(
             rt,
-            &CancellationToken::new(),
+            app_shutdown,
             conn,
             RpcRequest {
                 jsonrpc: "2.0".into(),
@@ -422,6 +534,7 @@ mod tests {
                 method: method.into(),
                 params: Some(params),
             },
+            admin_hash,
         )
         .await
     }
@@ -439,8 +552,9 @@ mod tests {
         })
     }
 
-    /// Start a session on `conn`, returning its session_id and control token.
-    async fn start_session(rt: &Arc<Runtime>, conn: u64) -> (String, String) {
+    /// Start a session on `conn`, returning its session_id, control token, and
+    /// observation token.
+    async fn start_session(rt: &Arc<Runtime>, conn: u64) -> (String, String, String) {
         let resp = call(
             rt,
             conn,
@@ -461,11 +575,20 @@ mod tests {
                 .as_str()
                 .expect("start response must issue the control token")
                 .to_string(),
+            result["observation_token"]
+                .as_str()
+                .expect("start response must issue the observation token")
+                .to_string(),
         )
     }
 
     /// Observe on `conn` and return the frame id.
-    async fn observe_frame(rt: &Arc<Runtime>, conn: u64, session_id: &str) -> String {
+    async fn observe_frame(
+        rt: &Arc<Runtime>,
+        conn: u64,
+        session_id: &str,
+        observation_token: &str,
+    ) -> String {
         let resp = call(
             rt,
             conn,
@@ -473,6 +596,7 @@ mod tests {
             2,
             serde_json::json!({
                 "session_id": session_id,
+                "observation_token": observation_token,
                 "include_image": false,
             }),
         )
@@ -484,6 +608,28 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    /// Start a session and observe with its observation token (the minimum
+    /// credential an observe call is issued with).
+    async fn start_and_observe(rt: &Arc<Runtime>, conn: u64) -> (String, String, String) {
+        let (sid, control, observation) = start_session(rt, conn).await;
+        let frame = call(
+            rt,
+            conn,
+            "computer.observe",
+            2,
+            serde_json::json!({
+                "session_id": sid,
+                "observation_token": observation,
+                "include_image": false,
+            }),
+        )
+        .await;
+        frame
+            .result
+            .expect("observe with the observation token must succeed");
+        (sid, control, observation)
     }
 
     #[test]
@@ -558,7 +704,19 @@ mod tests {
         let rt = test_runtime().await;
         let resp = call(&rt, 1, "runtime.version", 1, serde_json::Value::Null).await;
         let result = resp.result.expect("version must succeed");
-        assert_eq!(result["protocol_version"], serde_json::json!(2));
+        assert_eq!(result["protocol_version"], serde_json::json!(3));
+        assert_eq!(
+            result["minimum_client_protocol_version"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            result["maximum_client_protocol_version"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            result["runtime_version"],
+            serde_json::json!("0.2.0-alpha.1")
+        );
 
         // An old client that advertises protocol 1 is told explicitly that it
         // cannot talk to this daemon.
@@ -580,10 +738,13 @@ mod tests {
     #[tokio::test]
     async fn start_returns_token_once_and_status_never() {
         let rt = test_runtime().await;
-        let (sid, token) = start_session(&rt, 1).await;
-        assert_eq!(token.len(), 43, "token must be 256-bit base64url");
+        let (sid, token, observation) = start_session(&rt, 1).await;
+        assert_eq!(token.len(), 43, "control token must be 256-bit base64url");
+        assert_eq!(observation.len(), 43, "observation token must be 256-bit");
+        assert_ne!(token, observation, "the two tokens must be independent");
 
-        // Read-only status must never leak the token.
+        // status without any token is a sensitive read: refused with
+        // OBSERVATION_TOKEN_REQUIRED — a session id alone grants nothing.
         let resp = call(
             &rt,
             1,
@@ -592,10 +753,43 @@ mod tests {
             serde_json::json!({ "action": "status", "session_id": sid }),
         )
         .await;
-        let result = resp.result.expect("status must succeed");
+        assert_eq!(
+            error_code(&resp),
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024)),
+            "status must require an observation or control token"
+        );
+
+        // With the observation token, status succeeds — and must never leak
+        // either capability token back.
+        let resp = call(
+            &rt,
+            1,
+            "computer.session",
+            4,
+            serde_json::json!({
+                "action": "status",
+                "session_id": sid,
+                "observation_token": observation,
+            }),
+        )
+        .await;
+        let result = resp.result.expect("status with token must succeed");
         assert!(
             result.get("control_token").is_none(),
             "status must never return the control token"
+        );
+        assert!(
+            result.get("observation_token").is_none(),
+            "status must never return the observation token"
+        );
+
+        // The public session.summary works tokenless and carries no secrets.
+        let resp = call(&rt, 1, "session.summary", 5, serde_json::Value::Null).await;
+        let result = resp.result.expect("summary is public");
+        assert_eq!(result["session_id"], serde_json::json!(sid));
+        assert!(
+            result.get("control_token").is_none() && result.get("observation_token").is_none(),
+            "summary must never contain capability tokens"
         );
     }
 
@@ -605,8 +799,8 @@ mod tests {
     #[tokio::test]
     async fn cross_connection_cancel_is_isolated() {
         let (rt, fake) = test_runtime_with_driver().await;
-        let (sid, token) = start_session(&rt, 1).await;
-        let frame = observe_frame(&rt, 1, &sid).await;
+        let (sid, token, observation) = start_and_observe(&rt, 1).await;
+        let frame = observe_frame(&rt, 1, &sid, &observation).await;
 
         // Client A (connection 1) starts a long act, request_id 5. The Move
         // proves the batch is executing (driver count), the 10s Wait keeps it
@@ -734,10 +928,11 @@ mod tests {
     #[tokio::test]
     async fn mutating_ops_require_the_token_and_leave_no_side_effects() {
         let (rt, fake) = test_runtime_with_driver().await;
-        let (sid, token) = start_session(&rt, 1).await;
+        let (sid, token, observation) = start_and_observe(&rt, 1).await;
 
         // pause without token → CONTROL_TOKEN_REQUIRED, and the session is
-        // still Active afterwards (no side effect).
+        // still Active afterwards (no side effect). The tokenless state probe
+        // is the public session.summary — status itself is token-gated.
         let resp = call(
             &rt,
             1,
@@ -747,14 +942,7 @@ mod tests {
         )
         .await;
         assert_eq!(error_code(&resp), Some(("CONTROL_TOKEN_REQUIRED", -32019)));
-        let st = call(
-            &rt,
-            1,
-            "computer.session",
-            5,
-            serde_json::json!({ "action": "status", "session_id": sid }),
-        )
-        .await;
+        let st = call(&rt, 1, "session.summary", 5, serde_json::Value::Null).await;
         assert_eq!(st.result.unwrap()["state"], serde_json::json!("active"));
 
         // Wrong token → INVALID_CONTROL_TOKEN, session still Active.
@@ -771,19 +959,12 @@ mod tests {
         )
         .await;
         assert_eq!(error_code(&resp), Some(("INVALID_CONTROL_TOKEN", -32020)));
-        let st = call(
-            &rt,
-            1,
-            "computer.session",
-            7,
-            serde_json::json!({ "action": "status", "session_id": sid }),
-        )
-        .await;
+        let st = call(&rt, 1, "session.summary", 7, serde_json::Value::Null).await;
         assert_eq!(st.result.unwrap()["state"], serde_json::json!("active"));
 
         // act without a token → CONTROL_TOKEN_REQUIRED, and nothing reaches
         // the driver.
-        let frame = observe_frame(&rt, 1, &sid).await;
+        let frame = observe_frame(&rt, 1, &sid, &observation).await;
         let resp = call(
             &rt,
             1,
@@ -827,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn stop_requires_token_and_is_idempotent_with_it() {
         let rt = test_runtime().await;
-        let (sid, token) = start_session(&rt, 1).await;
+        let (sid, token, _observation) = start_session(&rt, 1).await;
 
         let resp = call(
             &rt,
@@ -876,5 +1057,484 @@ mod tests {
             "double stop with token is idempotent"
         );
         assert_eq!(resp.result.unwrap()["state"], serde_json::json!("stopped"));
+    }
+
+    /// §二: the observation capability matrix. observe without a token →
+    /// OBSERVATION_TOKEN_REQUIRED **with zero side effects** (no capture, no
+    /// frame file, no trace entry, no frame-id consumed); a wrong token →
+    /// INVALID_OBSERVATION_TOKEN (non-descriptive); the observation token
+    /// observes but cannot act; the control token also observes.
+    #[tokio::test]
+    async fn observation_capability_matrix() {
+        let (rt, fake) = test_runtime_with_driver().await;
+        let (sid, token, observation) = start_and_observe(&rt, 1).await;
+
+        // 1) No token → OBSERVATION_TOKEN_REQUIRED, and NOTHING happened:
+        //    no capture, no frame file, no trace entry, no frame-id consumed.
+        let resp = call(
+            &rt,
+            1,
+            "computer.observe",
+            10,
+            serde_json::json!({ "session_id": sid, "include_image": false }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024)),
+            "a session id alone grants no observation permission"
+        );
+        assert_eq!(
+            fake.captures.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the rejected observe must not have captured — only the startup observe did"
+        );
+        let n_frames = std::fs::read_dir(test_config().frames_dir)
+            .map(|d| {
+                d.filter(|e| {
+                    e.as_ref()
+                        .map(|f| {
+                            f.file_name()
+                                .to_string_lossy()
+                                .starts_with(&format!("{sid}_"))
+                        })
+                        .unwrap_or(false)
+                })
+                .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            n_frames, 1,
+            "the rejected observe must not write a frame file — only the startup observe did"
+        );
+        // The trace exists (the startup observe began it). Its entry count
+        // must be unchanged by the rejected observe — rejected reads are not
+        // recorded in the sensitive trace.
+        let trace_path = test_config().traces_dir.join(format!("{sid}.jsonl"));
+        let trace_entries = |p: &std::path::Path| {
+            std::fs::read_to_string(p)
+                .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                .unwrap_or(0)
+        };
+        let baseline = trace_entries(&trace_path);
+        assert!(baseline >= 1, "the startup observe must have been traced");
+
+        // 2) Wrong token → INVALID_OBSERVATION_TOKEN, never WHICH was wrong.
+        let resp = call(
+            &rt,
+            1,
+            "computer.observe",
+            11,
+            serde_json::json!({
+                "session_id": sid,
+                "observation_token": "wrong-token",
+                "include_image": false,
+            }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_OBSERVATION_TOKEN", -32025))
+        );
+        assert_eq!(fake.captures.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            trace_entries(&trace_path),
+            baseline,
+            "a wrong-token observe must not record a trace entry either"
+        );
+
+        // 3) The observation token observes…
+        let resp = call(
+            &rt,
+            1,
+            "computer.observe",
+            12,
+            serde_json::json!({
+                "session_id": sid,
+                "observation_token": observation,
+                "include_image": false,
+            }),
+        )
+        .await;
+        assert!(resp.result.is_some(), "observation token must observe");
+        assert_eq!(fake.captures.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // …but cannot act: act with the observation token is refused as if no
+        // control credential existed (CONTROL_TOKEN_REQUIRED), nothing executes.
+        let frame = resp.result.unwrap()["frame_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = call(
+            &rt,
+            1,
+            "computer.act",
+            13,
+            serde_json::json!({
+                "session_id": sid,
+                "frame_id": frame,
+                "observation_token": observation,
+                "actions": [{ "type": "wait", "duration_ms": 1 }],
+            }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("CONTROL_TOKEN_REQUIRED", -32019)),
+            "the observation token must never grant control"
+        );
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no action may reach the driver with only an observation token"
+        );
+
+        // 4) The control token observes too — control includes observation.
+        let resp = call(
+            &rt,
+            1,
+            "computer.observe",
+            14,
+            serde_json::json!({
+                "session_id": sid,
+                "control_token": token,
+                "include_image": false,
+            }),
+        )
+        .await;
+        assert!(resp.result.is_some(), "control token must also observe");
+        assert_eq!(fake.captures.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// §二.4: inspect is a sensitive read — tokenless → OBSERVATION_TOKEN_REQUIRED,
+    /// wrong → INVALID_OBSERVATION_TOKEN, both tokens work.
+    #[tokio::test]
+    async fn inspect_requires_an_observation_credential() {
+        let (rt, fake) = test_runtime_with_driver().await;
+        let (sid, _token, observation) = start_and_observe(&rt, 1).await;
+        let frame_id = call(
+            &rt,
+            1,
+            "computer.observe",
+            2,
+            serde_json::json!({
+                "session_id": sid,
+                "observation_token": observation,
+                "include_image": false,
+            }),
+        )
+        .await
+        .result
+        .unwrap()["frame_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // A well-formed inspect request (frame_id + region) with no token.
+        let params = |extra: serde_json::Value| {
+            let mut m = serde_json::json!({
+                "session_id": sid,
+                "frame_id": frame_id,
+                "region": {
+                    "x": 0,
+                    "y": 0,
+                    "width": 1,
+                    "height": 1,
+                    "coordinate_space": "image_pixels",
+                },
+            });
+            if let Some(v) = extra.get("observation_token") {
+                m["observation_token"] = v.clone();
+            }
+            m
+        };
+
+        let resp = call(
+            &rt,
+            1,
+            "computer.inspect",
+            10,
+            params(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024))
+        );
+
+        let resp = call(
+            &rt,
+            1,
+            "computer.inspect",
+            11,
+            params(serde_json::json!({ "observation_token": "wrong" })),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_OBSERVATION_TOKEN", -32025))
+        );
+        assert_eq!(fake.captures.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let resp = call(
+            &rt,
+            1,
+            "computer.inspect",
+            12,
+            params(serde_json::json!({ "observation_token": observation })),
+        )
+        .await;
+        assert!(resp.result.is_some(), "inspect with token must succeed");
+    }
+
+    /// §二.5: trace contents are sensitive — get/export/replay are token-gated
+    /// (even for a *stopped* session); the list itself is public metadata.
+    #[tokio::test]
+    async fn trace_reads_require_an_observation_credential() {
+        let (rt, _fake) = test_runtime_with_driver().await;
+        let (sid, _token, observation) = start_and_observe(&rt, 1).await;
+        // Stop the session: trace reads must still work for a stopped session
+        // (the session id remains addressable in the trace registry).
+        call(
+            &rt,
+            1,
+            "computer.session",
+            20,
+            serde_json::json!({
+                "action": "stop",
+                "session_id": sid,
+                "control_token": _token,
+            }),
+        )
+        .await;
+
+        // trace.get without a token → OBSERVATION_TOKEN_REQUIRED, no file read.
+        let resp = call(
+            &rt,
+            1,
+            "trace.get",
+            21,
+            serde_json::json!({ "session_id": sid }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024))
+        );
+
+        // Wrong token → INVALID_OBSERVATION_TOKEN.
+        let resp = call(
+            &rt,
+            1,
+            "trace.get",
+            22,
+            serde_json::json!({ "session_id": sid, "observation_token": "wrong" }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_OBSERVATION_TOKEN", -32025))
+        );
+
+        // export with a wrong token → INVALID_OBSERVATION_TOKEN.
+        let dest = std::env::temp_dir().join(format!("cu-trace-export-{sid}.jsonl"));
+        let resp = call(
+            &rt,
+            1,
+            "trace.export",
+            23,
+            serde_json::json!({
+                "session_id": sid,
+                "observation_token": "wrong",
+                "dest": dest.to_string_lossy(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_OBSERVATION_TOKEN", -32025))
+        );
+
+        // The observation token reads the stopped session's trace.
+        let resp = call(
+            &rt,
+            1,
+            "trace.get",
+            24,
+            serde_json::json!({ "session_id": sid, "observation_token": observation }),
+        )
+        .await;
+        assert!(
+            resp.result.is_some(),
+            "observation token must read a stopped session's trace"
+        );
+
+        // The list itself is public metadata (like session.summary).
+        let resp = call(&rt, 1, "trace.list", 25, serde_json::Value::Null).await;
+        let list = resp.result.expect("trace.list is public");
+        let ids: Vec<&str> = list["traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["session_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&sid.as_str()));
+        // …but list entries carry metadata only, never tokens.
+        for entry in list["traces"].as_array().unwrap() {
+            assert!(entry.get("control_token").is_none());
+            assert!(entry.get("observation_token").is_none());
+        }
+    }
+
+    /// §二.3: session.summary is the public (tokenless) coarse-grained window —
+    /// the inverse of `computer.session status`, which is a sensitive read.
+    #[tokio::test]
+    async fn summary_is_public_and_status_is_not() {
+        let (rt, _fake) = test_runtime_with_driver().await;
+        let (sid, _token, observation) = start_and_observe(&rt, 1).await;
+
+        // summary: tokenless, coarse, carries no secrets.
+        let resp = call(&rt, 1, "session.summary", 1, serde_json::Value::Null).await;
+        let result = resp.result.expect("summary is public");
+        assert_eq!(result["session_id"], serde_json::json!(sid));
+        assert_eq!(result["state"], serde_json::json!("active"));
+        assert_eq!(result["lock_held"], serde_json::json!(true));
+        assert!(result.get("observation_token").is_none() && result.get("control_token").is_none());
+
+        // status: sensitive read — no token → refused.
+        let resp = call(
+            &rt,
+            1,
+            "computer.session",
+            2,
+            serde_json::json!({ "action": "status", "session_id": sid }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("OBSERVATION_TOKEN_REQUIRED", -32024))
+        );
+
+        // status: observation token → fine.
+        let resp = call(
+            &rt,
+            1,
+            "computer.session",
+            3,
+            serde_json::json!({
+                "action": "status",
+                "session_id": sid,
+                "observation_token": observation,
+            }),
+        )
+        .await;
+        assert!(resp.result.is_some(), "status with token must succeed");
+    }
+
+    /// §三: runtime.shutdown is the daemon's kill switch — the admin token
+    /// gates it. No token → DAEMON_ADMIN_TOKEN_REQUIRED, nothing cancelled.
+    /// A wrong token — including a session's control token — →
+    /// INVALID_DAEMON_ADMIN_TOKEN, nothing cancelled. Only the correct admin
+    /// token cancels, and it reports shutting_down.
+    #[tokio::test]
+    async fn shutdown_requires_the_admin_token() {
+        let rt = test_runtime().await;
+        let (admin_token, admin_hash) = test_admin();
+        let shutdown = CancellationToken::new();
+
+        // 1) No token at all → DAEMON_ADMIN_TOKEN_REQUIRED, not cancelled.
+        let resp = call_with(
+            &rt,
+            1,
+            "runtime.shutdown",
+            1,
+            serde_json::json!({}),
+            &admin_hash,
+            &shutdown,
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("DAEMON_ADMIN_TOKEN_REQUIRED", -32026)),
+            "a tokenless shutdown must be refused"
+        );
+        assert!(!shutdown.is_cancelled(), "nothing may be cancelled");
+
+        // 2) A garbage token → INVALID_DAEMON_ADMIN_TOKEN, not cancelled.
+        let resp = call_with(
+            &rt,
+            1,
+            "runtime.shutdown",
+            2,
+            serde_json::json!({ "admin_token": "not-the-admin-token" }),
+            &admin_hash,
+            &shutdown,
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_DAEMON_ADMIN_TOKEN", -32027)),
+            "a wrong admin token must be refused non-descriptively"
+        );
+        assert!(!shutdown.is_cancelled(), "nothing may be cancelled");
+
+        // 3) A session's control token must never shut the daemon down.
+        let (_sid, control_token, _obs) = start_session(&rt, 1).await;
+        let resp = call_with(
+            &rt,
+            1,
+            "runtime.shutdown",
+            3,
+            serde_json::json!({ "admin_token": control_token }),
+            &admin_hash,
+            &shutdown,
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_DAEMON_ADMIN_TOKEN", -32027)),
+            "a session capability token must never authorize shutdown"
+        );
+        assert!(!shutdown.is_cancelled(), "nothing may be cancelled");
+
+        // 4) The correct admin token cancels and reports shutting_down.
+        let resp = call_with(
+            &rt,
+            1,
+            "runtime.shutdown",
+            4,
+            serde_json::json!({ "admin_token": admin_token.as_str() }),
+            &admin_hash,
+            &shutdown,
+        )
+        .await;
+        let result = resp.result.expect("authorized shutdown must succeed");
+        assert_eq!(result["status"], serde_json::json!("shutting_down"));
+        assert!(shutdown.is_cancelled(), "the daemon must be stopping");
+    }
+
+    /// A request with malformed shutdown params is an INVALID_PARAMS, and the
+    /// daemon stays up.
+    #[tokio::test]
+    async fn shutdown_with_malformed_params_is_invalid_params() {
+        let rt = test_runtime().await;
+        let (_admin_token, admin_hash) = test_admin();
+        let shutdown = CancellationToken::new();
+        let resp = call_with(
+            &rt,
+            1,
+            "runtime.shutdown",
+            1,
+            serde_json::json!({ "admin_token": 42 }),
+            &admin_hash,
+            &shutdown,
+        )
+        .await;
+        assert_eq!(
+            error_code(&resp),
+            Some(("INVALID_PARAMS", -32602)),
+            "a non-string admin_token is a malformed request"
+        );
+        assert!(!shutdown.is_cancelled());
     }
 }

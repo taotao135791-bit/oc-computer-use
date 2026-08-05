@@ -24,8 +24,11 @@ import {
   type SessionResult,
 } from "@computer-use/sdk";
 
+// Wire types generated from the Rust protocol source of truth (never hand-edited).
+export * from "./generated/protocol.js";
+
 export const SERVER_NAME = "computer-use";
-export const SERVER_VERSION = "0.1.0";
+export const SERVER_VERSION = "0.2.0-alpha.1";
 
 type ContentBlock = CallToolResult["content"][number];
 

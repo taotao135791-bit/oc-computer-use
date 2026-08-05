@@ -15,7 +15,13 @@ import {
   ERROR_CODES,
   errorCodeName,
 } from "../dist/index.js";
-import { startFakeDaemon, stopFakeDaemon } from "./fake-daemon.mjs";
+import {
+  START_TOKEN,
+  START_OBSERVATION_TOKEN,
+  ADMIN_TOKEN,
+  startFakeDaemon,
+  stopFakeDaemon,
+} from "./fake-daemon.mjs";
 
 test("round-trip request and structured result", async () => {
   const fake = startFakeDaemon();
@@ -357,6 +363,79 @@ test("convenience wrappers pass params through", async () => {
   }
 });
 
+test("sensitive reads carry the observation token from the credential", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const started = await client.session("start");
+    // observe / inspect / trace reads are sensitive — the SDK injects the
+    // observation token it holds (start issued it) without the caller asking.
+    await client.observe({ session_id: started.session_id });
+    await client.inspect({
+      session_id: started.session_id,
+      frame_id: "f1",
+      region: { x: 0, y: 0, width: 1, height: 1, coordinate_space: "image_pixels" },
+    });
+    await client.traceGet(started.session_id);
+    await client.traceExport(started.session_id, "/tmp/trace.jsonl");
+    await client.traceReplay(started.session_id);
+    for (const method of [
+      "computer.observe",
+      "computer.inspect",
+      "trace.get",
+      "trace.export",
+      "trace.replay",
+    ]) {
+      const req = fake.requests.find((r) => r.method === method);
+      assert.ok(req, `${method} was sent`);
+      assert.equal(
+        req.params.observation_token,
+        START_OBSERVATION_TOKEN,
+        `${method} carries the session's observation token`,
+      );
+    }
+    // A status without a session_id resolves the active session — still a
+    // sensitive read, so the held credential's token rides along.
+    await client.session("status");
+    const statusReq = fake.requests.find((r) => r.method === "computer.session" && r.params.action === "status");
+    assert.ok(statusReq, "status was sent");
+    assert.equal(statusReq.params.observation_token, START_OBSERVATION_TOKEN);
+
+    // An explicit token always wins over the injected one.
+    await client.observe({ session_id: started.session_id, observation_token: "explicit-obs" });
+    const explicit = fake.requests.filter((r) => r.method === "computer.observe").at(-1);
+    assert.equal(explicit.params.observation_token, "explicit-obs");
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("session.summary is the public tokenless view", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    const empty = await client.sessionSummary();
+    assert.equal(empty.session_id, null);
+    assert.equal(empty.state, null);
+    assert.equal(empty.lock_held, false);
+    await client.session("start");
+    const full = await client.sessionSummary();
+    assert.equal(full.session_id, "s1");
+    assert.equal(full.state, "active");
+    assert.equal(full.lock_held, true);
+    // The coarse view never carried a capability token — and its result type
+    // has no slot for one (the fake models the daemon's shape).
+    const req = fake.requests.find((r) => r.method === "session.summary");
+    assert.ok(req, "summary request was sent");
+    assert.equal(req.params.observation_token, undefined);
+    assert.equal(req.params.control_token, undefined);
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
 test("session lifecycle actions mutate state on the stateful fake", async () => {
   const fake = startFakeDaemon();
   const client = await connect({ socketPath: fake.socketPath });
@@ -375,6 +454,35 @@ test("session lifecycle actions mutate state on the stateful fake", async () => 
     const notFound = await client.session("status").catch((e) => e);
     assert.ok(notFound instanceof ComputerUseError);
     assert.equal(notFound.code, "SESSION_NOT_FOUND");
+  } finally {
+    client.close();
+    stopFakeDaemon(fake);
+  }
+});
+
+test("shutdown requires the admin token, never a session token", async () => {
+  const fake = startFakeDaemon();
+  const client = await connect({ socketPath: fake.socketPath });
+  try {
+    // Missing token → DAEMON_ADMIN_TOKEN_REQUIRED.
+    const missing = await client.shutdown("").catch((e) => e);
+    assert.ok(missing instanceof ComputerUseError);
+    assert.equal(missing.code, "DAEMON_ADMIN_TOKEN_REQUIRED");
+
+    // A session control token must never shut the daemon down.
+    await client.session("start");
+    const wrong = await client.shutdown(START_TOKEN).catch((e) => e);
+    assert.ok(wrong instanceof ComputerUseError);
+    assert.equal(wrong.code, "INVALID_DAEMON_ADMIN_TOKEN");
+    assert.equal(fake.state.shutDown, undefined, "daemon must stay up");
+
+    // The correct admin token shuts it down, carrying the token in params.
+    const result = await client.shutdown(ADMIN_TOKEN);
+    assert.deepEqual(result, { status: "shutting_down" });
+    assert.equal(fake.state.shutDown, true);
+    const shutdownReqs = fake.requests.filter((r) => r.method === "runtime.shutdown");
+    const req = shutdownReqs[shutdownReqs.length - 1];
+    assert.equal(req.params.admin_token, ADMIN_TOKEN);
   } finally {
     client.close();
     stopFakeDaemon(fake);

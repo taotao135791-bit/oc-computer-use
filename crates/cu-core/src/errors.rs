@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// Well-known structured error codes. These are the stable strings that appear
 /// in the `data.code` field of a JSON-RPC error response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     ParseError,
@@ -48,6 +48,14 @@ pub enum ErrorCode {
     /// deliberately non-descriptive — it must not hint whether the token was
     /// malformed, wrong-length, or simply not this session's.
     InvalidControlToken,
+    /// A sensitive read (observe / inspect / status / trace) was attempted
+    /// without an observation or control token. The session id alone grants
+    /// no observation permission.
+    ObservationTokenRequired,
+    /// A token was presented for a sensitive read but did not verify as either
+    /// the session's observation or control token. Deliberately
+    /// non-descriptive, like `InvalidControlToken`.
+    InvalidObservationToken,
     /// A mutating operation targeted a session that is already stopped.
     SessionStopped,
     /// The SDK-side request deadline expired. Distinct from `ActionTimeout`
@@ -56,6 +64,11 @@ pub enum ErrorCode {
     RequestTimeout,
     /// The client's protocol version is incompatible with the daemon's.
     ProtocolVersionMismatch,
+    /// `runtime.shutdown` was attempted without the daemon admin token.
+    DaemonAdminTokenRequired,
+    /// An admin token was presented for `runtime.shutdown` but did not verify.
+    /// Deliberately non-descriptive.
+    InvalidDaemonAdminToken,
 }
 
 impl ErrorCode {
@@ -92,6 +105,10 @@ impl ErrorCode {
             SessionStopped => -32021,
             RequestTimeout => -32022,
             ProtocolVersionMismatch => -32023,
+            ObservationTokenRequired => -32024,
+            InvalidObservationToken => -32025,
+            DaemonAdminTokenRequired => -32026,
+            InvalidDaemonAdminToken => -32027,
         }
     }
 
@@ -123,15 +140,19 @@ impl ErrorCode {
             CaptureFailed => "CAPTURE_FAILED",
             ControlTokenRequired => "CONTROL_TOKEN_REQUIRED",
             InvalidControlToken => "INVALID_CONTROL_TOKEN",
+            ObservationTokenRequired => "OBSERVATION_TOKEN_REQUIRED",
+            InvalidObservationToken => "INVALID_OBSERVATION_TOKEN",
             SessionStopped => "SESSION_STOPPED",
             RequestTimeout => "REQUEST_TIMEOUT",
             ProtocolVersionMismatch => "PROTOCOL_VERSION_MISMATCH",
+            DaemonAdminTokenRequired => "DAEMON_ADMIN_TOKEN_REQUIRED",
+            InvalidDaemonAdminToken => "INVALID_DAEMON_ADMIN_TOKEN",
         }
     }
 }
 
 /// Which macOS permission is missing. Used to generate actionable guidance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionKind {
     ScreenRecording,
@@ -139,7 +160,7 @@ pub enum PermissionKind {
 }
 
 /// Extra structured detail attached to a [`CuError::Permission`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PermissionIssue {
     pub kind: PermissionKind,
     pub granted: bool,
@@ -147,7 +168,7 @@ pub struct PermissionIssue {
 }
 
 /// Detail attached to a [`CuError::StaleFrame`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StaleFrameDetail {
     pub referenced_frame_id: String,
     pub current_frame_id: String,
@@ -156,7 +177,7 @@ pub struct StaleFrameDetail {
 }
 
 /// Detail attached to a [`CuError::OutOfBounds`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BoundsDetail {
     pub coordinate_space: String,
     pub x: f64,
@@ -166,7 +187,7 @@ pub struct BoundsDetail {
 }
 
 /// Detail attached to a [`CuError::ConfirmationRequired`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ConfirmationDetail {
     pub reason: String,
     pub risk_level: String,
@@ -228,6 +249,15 @@ pub enum CuError {
     /// session's — that would leak verification details.
     #[error("Invalid control token for this session.")]
     InvalidControlToken,
+    /// A sensitive read (observe / inspect / status / trace) required an
+    /// observation or control token and none was supplied. A session id alone
+    /// grants no observation permission.
+    #[error("This operation requires the session observation token (or its control token). A session id alone grants no observation permission.")]
+    ObservationTokenRequired,
+    /// A token was presented for a sensitive read but did not verify as the
+    /// session's observation or control token. Deliberately non-descriptive.
+    #[error("Invalid observation token for this session.")]
+    InvalidObservationToken,
     /// A mutating operation targeted a session that is already stopped.
     #[error("session is stopped")]
     SessionStopped,
@@ -250,6 +280,14 @@ pub enum CuError {
     Driver(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// `runtime.shutdown` requires the daemon admin token (a per-install
+    /// credential only the daemon manager — CLI / LaunchAgent — holds).
+    #[error("This operation requires the daemon admin token. Ordinary clients cannot shut the daemon down.")]
+    DaemonAdminTokenRequired,
+    /// An admin token was presented but did not verify. Deliberately
+    /// non-descriptive.
+    #[error("Invalid daemon admin token.")]
+    InvalidDaemonAdminToken,
 }
 
 impl CuError {
@@ -272,6 +310,8 @@ impl CuError {
             CaptureFailed(_) => ErrorCode::CaptureFailed,
             ControlTokenRequired => ErrorCode::ControlTokenRequired,
             InvalidControlToken => ErrorCode::InvalidControlToken,
+            ObservationTokenRequired => ErrorCode::ObservationTokenRequired,
+            InvalidObservationToken => ErrorCode::InvalidObservationToken,
             SessionStopped => ErrorCode::SessionStopped,
             RequestTimeout(_) => ErrorCode::RequestTimeout,
             ProtocolVersionMismatch { .. } => ErrorCode::ProtocolVersionMismatch,
@@ -284,6 +324,8 @@ impl CuError {
             Trace(_) => ErrorCode::TraceError,
             Driver(_) => ErrorCode::DriverError,
             Unsupported(_) => ErrorCode::Unsupported,
+            DaemonAdminTokenRequired => ErrorCode::DaemonAdminTokenRequired,
+            InvalidDaemonAdminToken => ErrorCode::InvalidDaemonAdminToken,
         }
     }
 

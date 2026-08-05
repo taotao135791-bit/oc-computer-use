@@ -1,10 +1,13 @@
 //! Session credential store for the CLI.
 //!
-//! The daemon issues a session's control token **exactly once**, in the
-//! `start` response, and stores only a hash of it. The CLI keeps its copy on
-//! disk so later mutating commands (pause/resume/takeover/release/stop/act)
-//! can authenticate: the token is the capability — knowing a session id alone
-//! grants nothing, and the daemon refuses every mutating request without it.
+//! The daemon issues a session's capability tokens **exactly once**, in the
+//! `start` response (a control token and an observation token), and stores
+//! only hashes of them. The CLI keeps its copies on disk so later commands
+//! can authenticate: the control token for mutating commands
+//! (pause/resume/takeover/release/stop/act), the observation token for
+//! sensitive reads (observe/inspect/status/trace). Knowing a session id alone
+//! grants nothing — the daemon refuses every sensitive request without a
+//! capability.
 //!
 //! Files live in `~/.local/state/oc-computer-use/credentials/<session-id>.json`
 //! with mode 0600 (directory 0700), and are deleted when the session is
@@ -21,7 +24,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoredCredential {
     pub session_id: String,
+    /// Full capability — the session's control token, issued once at start.
     pub control_token: String,
+    /// Read-only capability — the session's observation token, issued once at
+    /// start (v3). Absent in pre-v3 files (`#[serde(default)]`), which can
+    /// still control but cannot read.
+    #[serde(default)]
+    pub observation_token: String,
     /// Identity of the CLI instance that started the session.
     pub client_instance_id: String,
     /// UTC RFC 3339 timestamp of the start.
@@ -56,11 +65,12 @@ fn credential_path(session_id: &str) -> PathBuf {
     credentials_dir().join(format!("{safe}.json"))
 }
 
-/// Save the token issued by a `start` response. The directory is created
+/// Save the tokens issued by a `start` response. The directory is created
 /// 0700 and the file 0600 — readable only by the current user.
 pub fn save(
     session_id: &str,
     control_token: &str,
+    observation_token: &str,
     client_instance_id: &str,
     created_at: &str,
 ) -> std::io::Result<()> {
@@ -71,6 +81,7 @@ pub fn save(
     let cred = StoredCredential {
         session_id: session_id.to_string(),
         control_token: control_token.to_string(),
+        observation_token: observation_token.to_string(),
         client_instance_id: client_instance_id.to_string(),
         created_at: created_at.to_string(),
     };
@@ -107,6 +118,18 @@ pub fn load(session_id: &str) -> Option<StoredCredential> {
 /// Delete the credential for a session (after a successful `stop`).
 pub fn delete(session_id: &str) {
     let _ = fs::remove_file(credential_path(session_id));
+}
+
+/// The read credential for a session, if this CLI holds one: its observation
+/// token, or (pre-v3 files, and the read for a full-credential owner) its
+/// control token — control includes observation, so either verifies server-side.
+pub fn read_token(session_id: &str) -> Option<String> {
+    let cred = load(session_id)?;
+    if !cred.observation_token.is_empty() {
+        Some(cred.observation_token)
+    } else {
+        Some(cred.control_token)
+    }
 }
 
 /// Every credential this CLI holds, in arbitrary order.
@@ -149,7 +172,14 @@ mod tests {
         let _guard = HOME_LOCK.lock().unwrap();
         let home = temp_home("roundtrip");
         let dir = credentials_dir();
-        save("sess-1", "secret-token", "cu-42", "2026-08-04T00:00:00Z").unwrap();
+        save(
+            "sess-1",
+            "secret-token",
+            "obs-token",
+            "cu-42",
+            "2026-08-04T00:00:00Z",
+        )
+        .unwrap();
 
         // Directory is 0700 and the file 0600.
         let dperm = fs::metadata(&dir).unwrap().permissions();
@@ -162,7 +192,12 @@ mod tests {
         let cred = load("sess-1").unwrap();
         assert_eq!(cred.session_id, "sess-1");
         assert_eq!(cred.control_token, "secret-token");
+        assert_eq!(cred.observation_token, "obs-token");
         assert_eq!(cred.client_instance_id, "cu-42");
+
+        // read_token prefers the observation token; a pre-v3 file (no
+        // observation_token field) falls back to the control token.
+        assert_eq!(read_token("sess-1").as_deref(), Some("obs-token"));
 
         // Missing / mismatched ids resolve to None.
         assert!(load("sess-nope").is_none());
@@ -173,11 +208,35 @@ mod tests {
     }
 
     #[test]
+    fn pre_v3_files_without_observation_token_still_load() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let home = temp_home("prev3");
+        let dir = credentials_dir();
+        fs::create_dir_all(&dir).unwrap();
+        // A file written before v3 has no observation_token field.
+        fs::write(
+            credential_path("old-sess"),
+            r#"{
+  "session_id": "old-sess",
+  "control_token": "old-control",
+  "client_instance_id": "cu-1",
+  "created_at": "2026-08-03T00:00:00Z"
+}"#,
+        )
+        .unwrap();
+        let cred = load("old-sess").expect("pre-v3 file loads");
+        assert_eq!(cred.observation_token, "", "serde default");
+        // Reads fall back to the control token (control includes observation).
+        assert_eq!(read_token("old-sess").as_deref(), Some("old-control"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn all_lists_held_credentials() {
         let _guard = HOME_LOCK.lock().unwrap();
         let home = temp_home("all");
-        save("a", "tok-a", "cu-1", "2026-08-04T00:00:00Z").unwrap();
-        save("b", "tok-b", "cu-1", "2026-08-04T00:00:00Z").unwrap();
+        save("a", "tok-a", "obs-a", "cu-1", "2026-08-04T00:00:00Z").unwrap();
+        save("b", "tok-b", "obs-b", "cu-1", "2026-08-04T00:00:00Z").unwrap();
         let mut ids: Vec<String> = all().into_iter().map(|c| c.session_id).collect();
         ids.sort();
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
@@ -191,7 +250,7 @@ mod tests {
         let evil = "../evil";
         // save() with a traversal id still writes (the id is daemon-generated;
         // the guard keeps load/delete from ever escaping the directory).
-        save(evil, "tok", "cu-1", "2026-08-04T00:00:00Z").unwrap();
+        save(evil, "tok", "obs", "cu-1", "2026-08-04T00:00:00Z").unwrap();
         assert!(!credentials_dir()
             .parent()
             .unwrap()

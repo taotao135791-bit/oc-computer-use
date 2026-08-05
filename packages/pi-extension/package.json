@@ -1,6 +1,6 @@
 {
   "name": "@computer-use/pi-extension",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.1",
   "description": "Pi (pi-coding-agent) extension exposing the computer-use runtime's four tools to agents, with real screenshot image blocks",
   "type": "module",
   "main": "./dist/index.js",
@@ -25,6 +25,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.83.0",
     "@types/node": "^24.0.0",
+    "ajv": "^8.20.0",
     "typescript": "^5.5.0"
   }
 }

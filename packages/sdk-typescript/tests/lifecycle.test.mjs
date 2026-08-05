@@ -16,7 +16,12 @@ import {
   TransportError,
   AbortError,
 } from "../dist/index.js";
-import { startFakeDaemon, stopFakeDaemon } from "./fake-daemon.mjs";
+import {
+  START_OBSERVATION_TOKEN,
+  START_TOKEN,
+  startFakeDaemon,
+  stopFakeDaemon,
+} from "./fake-daemon.mjs";
 
 test("an aborted request leaves no abort listener behind", async () => {
   const fake = startFakeDaemon();
@@ -296,20 +301,42 @@ test("ensureSession with the default reject policy surfaces CONTROL_LOCKED with 
   }
 });
 
-test("ensureSession read_only returns the foreign session without a credential", async () => {
+test("read_only requires an observation token; attachReadOnly observes but cannot act", async () => {
   const fake = startFakeDaemon({ seedSession: FOREIGN_SESSION });
   const client = await connect({ socketPath: fake.socketPath });
   try {
-    const s = await client.ensureSession(undefined, {}, undefined, "read_only");
-    assert.equal(s.session_id, "s_foreign");
-    assert.equal(client.getSessionCredential(), null, "read_only must not hold the token");
+    // A session id alone grants nothing: read_only without a token is refused
+    // (v3 requires an explicit observation token for a read-only attach).
+    await assert.rejects(client.ensureSession(undefined, {}, undefined, "read_only"), (err) => {
+      assert.equal(err.code, "INVALID_PARAMS");
+      assert.match(err.message, /attachReadOnly/);
+      return true;
+    });
+    assert.equal(client.getSessionCredential(), null);
     assert.equal(fake.state.startCount, 0, "read_only never starts a session");
-    // With no credential, an act is sent without a control_token — the daemon
-    // refuses it (CONTROL_TOKEN_REQUIRED), which is the point of read_only.
+
+    // The explicit read-only attach with the observation token works: the
+    // credential is read-only, and later reads carry the token.
+    const s = await client.attachReadOnly("s_foreign", START_OBSERVATION_TOKEN);
+    assert.equal(s.session_id, "s_foreign");
+    const cred = client.getSessionCredential();
+    assert.ok(cred, "credential held after a read-only attach");
+    assert.equal(cred.sessionId, "s_foreign");
+    assert.equal(cred.access, "read_only");
+    assert.equal(cred.observationToken, START_OBSERVATION_TOKEN);
+    assert.equal(cred.controlToken, undefined, "read-only credential holds no control token");
+    assert.equal(cred.ownerClientId, "opencode");
+
+    // A sensitive read (observe) carries the observation token automatically.
+    await client.observe({ session_id: "s_foreign" });
+    const obsReq = fake.requests.find((r) => r.method === "computer.observe");
+    assert.equal(obsReq.params.observation_token, START_OBSERVATION_TOKEN);
+
+    // With no control token, an act is sent tokenless — the daemon refuses it
+    // (CONTROL_TOKEN_REQUIRED), which is the point of read_only.
     await client.act({ session_id: "s_foreign", frame_id: "f1", actions: [{ type: "wait", duration_ms: 1 }] });
-    const actReq = fake.requests.find((r) => r.method === "computer.act");
-    assert.ok(actReq, "act was attempted");
-    assert.equal(actReq.params.control_token, undefined, "no credential → no token injected");
+    const actReq = fake.requests.filter((r) => r.method === "computer.act").at(-1);
+    assert.equal(actReq.params.control_token, undefined, "read-only client injects no control token");
   } finally {
     client.close();
     stopFakeDaemon(fake);
@@ -320,19 +347,31 @@ test("ensureSession attach_with_token adopts the session with the caller's token
   const fake = startFakeDaemon({ seedSession: FOREIGN_SESSION });
   const client = await connect({ socketPath: fake.socketPath });
   try {
-    const s = await client.ensureSession(undefined, {}, undefined, "attach_with_token", "my-attach-token");
+    // The attach token must be the session's real control token — the daemon
+    // verifies it before adoption (a wrong one is refused, never stored).
+    await assert.rejects(
+      client.ensureSession(undefined, {}, undefined, "attach_with_token", "my-attach-token"),
+      (err) => {
+        assert.equal(err.code, "INVALID_OBSERVATION_TOKEN");
+        return true;
+      },
+    );
+    assert.equal(client.getSessionCredential(), null, "a wrong token is never adopted");
+
+    const s = await client.ensureSession(undefined, {}, undefined, "attach_with_token", START_TOKEN);
     assert.equal(s.session_id, "s_foreign");
     const cred = client.getSessionCredential();
     assert.ok(cred, "credential held after attach");
     assert.equal(cred.sessionId, "s_foreign");
-    assert.equal(cred.controlToken, "my-attach-token");
+    assert.equal(cred.controlToken, START_TOKEN);
+    assert.equal(cred.access, "control");
     assert.equal(cred.ownerClientId, "opencode");
     assert.equal(cred.ownerInstanceId, "opencode-inst-1");
     assert.equal(fake.state.startCount, 0, "attach never starts a session");
     // The attached token is injected into later mutating calls.
     await client.act({ session_id: "s_foreign", frame_id: "f1", actions: [{ type: "wait", duration_ms: 1 }] });
     const actReq = fake.requests.find((r) => r.method === "computer.act");
-    assert.equal(actReq.params.control_token, "my-attach-token");
+    assert.equal(actReq.params.control_token, START_TOKEN);
     // An explicit token always wins over the injected one.
     await client.act(
       { session_id: "s_foreign", frame_id: "f1", actions: [{ type: "wait", duration_ms: 1 }], control_token: "explicit" },

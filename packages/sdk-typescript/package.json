@@ -1,6 +1,6 @@
 {
   "name": "@computer-use/sdk",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.1",
   "description": "TypeScript client for the computer-use daemon — JSON-RPC 2.0 over a Unix domain socket, zero runtime dependencies",
   "type": "module",
   "main": "./dist/index.js",
@@ -25,6 +25,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "ajv": "^8.20.0",
     "typescript": "^5.5.0"
   }
 }

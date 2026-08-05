@@ -27,7 +27,7 @@ pub struct RequestKey {
 pub const JSONRPC_VERSION: &str = "2.0";
 
 /// A JSON-RPC 2.0 request as received by the daemon.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RpcRequest {
     pub jsonrpc: String,
     pub id: Option<serde_json::Value>,
@@ -37,7 +37,7 @@ pub struct RpcRequest {
 }
 
 /// A JSON-RPC 2.0 response written by the daemon.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RpcResponse {
     pub jsonrpc: String,
     pub id: Option<serde_json::Value>,
@@ -47,7 +47,7 @@ pub struct RpcResponse {
     pub error: Option<RpcError>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
@@ -84,7 +84,7 @@ impl RpcResponse {
 }
 
 /// `computer.observe` request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, schemars::JsonSchema)]
 pub struct ObserveParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -92,6 +92,15 @@ pub struct ObserveParams {
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_id: Option<String>,
+    /// The session's **observation token**. Required — observing captures the
+    /// desktop; a session id alone grants no observation permission. A valid
+    /// control token is accepted in its place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<String>,
+    /// The session's control token — accepted in place of the observation
+    /// token (control includes observation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_cursor: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,7 +117,7 @@ pub struct ObserveParams {
 }
 
 /// `computer.observe` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ObserveResult {
     pub session_id: String,
     pub frame_id: String,
@@ -130,7 +139,7 @@ pub struct ObserveResult {
 }
 
 /// `computer.act` request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ActParams {
     pub session_id: String,
     pub frame_id: String,
@@ -156,7 +165,7 @@ pub struct ActParams {
 }
 
 /// Result of one action inside a batch.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ActionResultReport {
     pub index: usize,
     pub status: String, // success | failed | cancelled
@@ -169,7 +178,7 @@ pub struct ActionResultReport {
 /// `change_score` is the **last measured** thumbnail difference — on timeout
 /// it carries the real score (never a fabricated 0), so the caller can tell a
 /// screen that nearly settled from one that kept animating.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StabilizationInfo {
     pub outcome: String, // "stable" | "timed_out"
     pub change_score: f64,
@@ -179,7 +188,7 @@ pub struct StabilizationInfo {
 }
 
 /// `computer.act` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ActResult {
     pub executed: bool,
     pub action_results: Vec<ActionResultReport>,
@@ -199,7 +208,7 @@ pub struct ActResult {
 }
 
 /// Recording status of the session's trace for one `computer.act` batch.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraceReport {
     /// "required" | "best_effort" | "disabled" — the daemon's trace mode.
     pub mode: String,
@@ -212,18 +221,24 @@ pub struct TraceReport {
 }
 
 /// `computer.inspect` request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct InspectParams {
     pub session_id: String,
     pub frame_id: String,
     pub region: Region,
+    /// Observation (or control) token — required; a session id alone grants
+    /// no observation permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<u32>,
 }
 
 /// Mapping info that lets a model safely translate an inspect-relative
 /// coordinate back into global desktop coordinates.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct InspectMapping {
     /// Where the crop sits in the original image (pixels).
     pub source_image_rect: Region,
@@ -234,7 +249,7 @@ pub struct InspectMapping {
 }
 
 /// `computer.inspect` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct InspectResult {
     pub session_id: String,
     pub frame_id: String,
@@ -249,7 +264,7 @@ pub struct InspectResult {
 /// owners can be told apart: a client must not stop a session it did not
 /// start. `client_instance_id` distinguishes multiple processes of the same
 /// client (e.g. two Pi instances).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ClientInfo {
     pub client_id: String,
     pub client_name: String,
@@ -257,7 +272,7 @@ pub struct ClientInfo {
 }
 
 /// `computer.session` request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionParams {
     pub action: SessionAction,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -265,9 +280,14 @@ pub struct SessionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_id: Option<String>,
     /// The session's control token. Required for `pause`/`resume`/`takeover`/
-    /// `release`/`stop`; `start` and `status` do not need one.
+    /// `release`/`stop`; `start` does not need one. `status` needs either this
+    /// or the observation token (full status is a sensitive read).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_token: Option<String>,
+    /// The session's observation token — accepted for `status` in place of the
+    /// control token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<String>,
     /// Identity of the client performing the action; recorded on `start`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
@@ -277,8 +297,46 @@ pub struct SessionParams {
     pub client_instance_id: Option<String>,
 }
 
+/// `session.summary` — the **public** view of the active session. No token
+/// needed: it exposes only coarse state and non-secret owner identity. Full
+/// `status` (which includes `display_id`, `frame_id`, `trace_dir`) requires an
+/// observation or control token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionSummary {
+    /// `null` when no session exists — every field is always present on the
+    /// wire (explicit nulls, never omitted keys): consumers read
+    /// `summary.session_id == null` without juggling absence.
+    pub session_id: Option<String>,
+    pub state: Option<SessionState>,
+    /// True when the session is the control-lock holder.
+    pub lock_held: bool,
+    /// The non-secret identity of the creating client (name only — never a
+    /// token, never an instance id or frame/trace paths).
+    pub owner_client_id: Option<String>,
+    pub owner_client_name: Option<String>,
+    /// Human-readable hint for the common case: the active session is owned by
+    /// another client.
+    pub message: Option<String>,
+}
+
+/// `runtime.version` result — the protocol-version contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RuntimeVersionResult {
+    pub name: String,
+    /// Wire name is `runtime_version` (the protocol spec's field name); the
+    /// Rust field stays `version` to avoid `version.version`-style confusion.
+    #[serde(rename = "runtime_version")]
+    pub version: String,
+    pub protocol_version: u32,
+    /// Inclusive lower bound of the client protocol versions this daemon
+    /// accepts. A client below this (or above `maximum_client_protocol_version`)
+    /// gets `PROTOCOL_VERSION_MISMATCH`.
+    pub minimum_client_protocol_version: u32,
+    pub maximum_client_protocol_version: u32,
+}
+
 /// `computer.session` result (shape depends on `action`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionResult {
     pub session_id: String,
     pub state: SessionState,
@@ -300,6 +358,12 @@ pub struct SessionResult {
     /// credential file), never in logs or traces.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_token: Option<String>,
+    /// The session's observation token (read-only capability). **Only present
+    /// in the `start` response**, like the control token. A holder of only
+    /// this token can observe/inspect/read traces, but can never act, cancel,
+    /// pause, or stop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<String>,
     /// Who created this session (backward-compatible name of the starting
     /// client). The owner_* fields carry the structured identity; only the
     /// creating client may stop the session on exit.
@@ -321,7 +385,7 @@ pub struct SessionResult {
 /// request A never touches request B, and client A can never cancel client B's
 /// request even with an identical id. Without `request_id` the whole session's
 /// in-flight batch is cancelled (still token-verified).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CancelParams {
     pub session_id: String,
     /// The session's control token — required; cancelling is a mutating op.
@@ -333,14 +397,56 @@ pub struct CancelParams {
 }
 
 /// `computer.cancel` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CancelResult {
     pub cancelled: bool,
     pub session_id: String,
 }
 
+/// `trace.get` / `trace.replay` request — trace contents are a sensitive read;
+/// an observation or control token is required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TraceGetParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
+}
+
+/// `trace.export` request — exporting a trace requires an observation or
+/// control token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TraceExportParams {
+    pub session_id: String,
+    pub dest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
+}
+
+/// `trace.replay` request (token-verified like `trace.get`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TraceReplayParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
+}
+
+/// `runtime.shutdown` request — requires the daemon admin token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ShutdownParams {
+    /// The daemon admin token (per-install credential held by the daemon
+    /// manager — the CLI / LaunchAgent). Ordinary clients never hold it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_token: Option<String>,
+}
+
 /// `trace.list` entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraceSummary {
     pub session_id: String,
     pub path: String,
@@ -352,7 +458,7 @@ pub struct TraceSummary {
 }
 
 /// One entry inside a trace file (JSONL).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraceEntry {
     pub seq: u64,
     pub ts: DateTime<Utc>,
@@ -386,7 +492,7 @@ pub struct TraceEntry {
 }
 
 /// `trace.export` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraceExport {
     pub session_id: String,
     pub path: String,

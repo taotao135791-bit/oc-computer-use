@@ -47,6 +47,7 @@ import {
   type SessionCredential,
   type SessionParams,
   type SessionResult,
+  type SessionSummary,
   type TraceEntry,
   type TraceExport,
   type TraceList,
@@ -388,12 +389,88 @@ export class ComputerUseClient {
     return undefined;
   }
 
+  /**
+   * The observation credential held for `sessionId`: the observation token,
+   * or — control includes observation — the control token when the caller has
+   * no separate observation token. `undefined` when this client holds neither.
+   */
+  private observationTokenFor(sessionId: string): string | undefined {
+    if (!this.sessionCredential || this.sessionCredential.sessionId !== sessionId) {
+      return undefined;
+    }
+    return this.sessionCredential.observationToken ?? this.sessionCredential.controlToken;
+  }
+
+  /**
+   * Inject the observation credential into a sensitive-read request
+   * (observe / inspect / status / trace). Never overrides an explicit token
+   * the caller supplied in either slot.
+   */
+  private withObservationTokens<
+    T extends { session_id?: string } & Partial<{ observation_token?: string; control_token?: string }>,
+  >(p: T): T {
+    if (p.session_id && !p.observation_token && !p.control_token) {
+      const token = this.observationTokenFor(p.session_id);
+      if (token) {
+        return { ...p, observation_token: token };
+      }
+    }
+    return p;
+  }
+
+  /**
+   * Attach to an existing session as a **read-only** observer. The
+   * `observationToken` (issued once by the session's `start`) becomes this
+   * client's credential: observe / inspect / status / trace work, but every
+   * mutating call is refused — this client holds no control token.
+   *
+   * Throws INVALID_PARAMS when the session is not active, the token is
+   * rejected, or a session id alone was supplied (a session id grants no
+   * observation permission).
+   */
+  async attachReadOnly(
+    sessionId: string,
+    observationToken: string,
+    options?: RequestOptions,
+  ): Promise<SessionResult> {
+    if (!sessionId || !observationToken) {
+      throw new ComputerUseError(
+        -32602,
+        "attachReadOnly requires both a session id and its observation token",
+        { code: "INVALID_PARAMS" },
+      );
+    }
+    const status = await this.session(
+      "status",
+      { session_id: sessionId, observation_token: observationToken },
+      options,
+    );
+    this.setSessionCredential({
+      sessionId,
+      observationToken,
+      ownerClientId: status.owner_client_id,
+      ownerInstanceId: status.owner_instance_id,
+      access: "read_only",
+    });
+    return status;
+  }
+
   // -------------------------------------------------------------------------
   // Runtime introspection
   // -------------------------------------------------------------------------
 
   health(): Promise<Health> {
     return this.request<Health>("runtime.health");
+  }
+
+  /**
+   * The public coarse session view — the only tokenless session read. Answers
+   * "is there a session and roughly what state is it in" for discovery and
+   * status text; it grants nothing (knowing a session id conveys no
+   * observation or control permission — sensitive reads still need the token).
+   */
+  sessionSummary(): Promise<SessionSummary> {
+    return this.request<SessionSummary>("session.summary", {});
   }
 
   version(): Promise<RuntimeVersion> {
@@ -422,8 +499,18 @@ export class ComputerUseClient {
     return this.request<ApplicationInfo>("runtime.active_application");
   }
 
-  shutdown(): Promise<{ status: string }> {
-    return this.request<{ status: string }>("runtime.shutdown");
+  /**
+   * Shut the daemon down gracefully. Requires the daemon admin token — a
+   * per-install credential held only by the daemon manager (CLI /
+   * LaunchAgent). Ordinary adapters (Pi, MCP, OpenCode) never call this, and
+   * the SDK never stores the token. Passing a wrong or missing token is
+   * refused by the daemon (DAEMON_ADMIN_TOKEN_REQUIRED /
+   * INVALID_DAEMON_ADMIN_TOKEN).
+   */
+  shutdown(adminToken: string): Promise<{ status: string }> {
+    return this.request<{ status: string }>("runtime.shutdown", {
+      admin_token: adminToken,
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -444,23 +531,41 @@ export class ComputerUseClient {
       p.client_instance_id = this.clientInfo.client_instance_id;
     }
     // Mutating actions need the session's control token; `start` issues it and
-    // `status` is read-only, so neither ever carries one. Only inject when the
-    // client actually holds the token for this session — never override an
+    // `status` is a *sensitive read* needing the observation credential (or the
+    // control token — control includes observation). Only inject when this
+    // client actually holds the capability for this session — never override an
     // explicit token the caller provided.
-    if (action !== "start" && action !== "status" && p.session_id && !p.control_token) {
-      const token = this.tokenFor(p.session_id);
-      if (token) p.control_token = token;
+    //
+    // A `status` without a session_id resolves the daemon's active session —
+    // still a sensitive read, so the held credential's observation token rides
+    // along (the daemon refuses it if the active session is not ours).
+    if (action !== "start" && (p.session_id || action === "status")) {
+      if (action === "status" && !p.observation_token && !p.control_token) {
+        const obs = p.session_id
+          ? this.observationTokenFor(p.session_id)
+          : this.sessionCredential
+            ? (this.sessionCredential.observationToken ?? this.sessionCredential.controlToken)
+            : undefined;
+        if (obs) p.observation_token = obs;
+      } else if (!p.control_token && !p.observation_token) {
+        // Reachable only with a session_id: either action !== "status" (the
+        // outer condition demands one) or status carried a token already.
+        const token = this.tokenFor(p.session_id!);
+        if (token) p.control_token = token;
+      }
     }
     const result = await this.request<SessionResult>("computer.session", p, options ?? {});
-    // Hold the capability the daemon just issued — it appears exactly once, in
-    // the start response, and every later mutating call needs it. A successful
-    // stop kills the token server-side, so the credential goes with it.
-    if (action === "start" && result.control_token) {
+    // Hold the capabilities the daemon just issued — they appear exactly once,
+    // in the start response, and every later read/mutating call needs them. A
+    // successful stop kills them server-side, so the credential goes with it.
+    if (action === "start" && result.observation_token) {
       this.setSessionCredential({
         sessionId: result.session_id,
-        controlToken: result.control_token,
+        observationToken: result.observation_token,
+        ...(result.control_token ? { controlToken: result.control_token } : {}),
         ownerClientId: result.owner_client_id,
         ownerInstanceId: result.owner_instance_id,
+        access: result.control_token ? "control" : "read_only",
       });
     } else if (action === "stop" && this.sessionCredential?.sessionId === result.session_id) {
       this.clearSessionCredential();
@@ -483,14 +588,16 @@ export class ComputerUseClient {
    *
    * - `"reject"` (default): the start attempt is refused and the daemon's
    *   CONTROL_LOCKED error (with the owner's identity, never a token) surfaces.
-   * - `"read_only"`: the session's status is returned; the client must not act
-   *   on it (it holds no token).
+   * - `"read_only"`: requires an explicit observation token — call
+   *   `attachReadOnly(sessionId, observationToken)` first (a session id alone
+   *   grants no observation permission). Without a token this policy throws
+   *   INVALID_PARAMS.
    * - `"attach_with_token"`: `attachControlToken` is the caller-supplied
    *   capability for the existing session, and becomes this client's
    *   credential, so later mutating requests are authorized.
    *
-   * When no session exists, a new one is started and its freshly-issued token
-   * is stored in the credential.
+   * When no session exists, a new one is started and its freshly-issued
+   * capabilities are stored in the credential.
    */
   ensureSession(
     displayId?: string,
@@ -540,35 +647,71 @@ export class ComputerUseClient {
     }
 
     // 2. No usable credential: is there an active session we do not own?
-    let active: SessionResult | null = null;
+    //    A tokenless `status` is refused server-side in v3, so the cheap probe
+    //    is the public `session.summary` — coarse state, no token needed.
+    let activeId: string | null = null;
     try {
-      active = await this.session("status", {}, options);
+      const summary = await this.sessionSummary();
+      if (summary && typeof summary.session_id === "string" && summary.session_id) {
+        activeId = summary.session_id;
+      }
     } catch (err) {
-      if (!(err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND")) {
+      // A daemon that errors on the summary probe (permissions, auth, …) must
+      // surface that error — only the v2-era "no such method" is a fallback
+      // signal. The v2 daemon served a tokenless status, so probe with it.
+      if (!(err instanceof ComputerUseError && err.jsonrpcCode === -32601)) {
         throw err;
+      }
+      try {
+        const status = await this.session("status", {}, options);
+        if (status && status.session_id) activeId = status.session_id;
+      } catch (err2) {
+        // SESSION_NOT_FOUND means no active session — anything else (a
+        // permission failure, a transport error) must surface.
+        if (!(err2 instanceof ComputerUseError && err2.jsonrpcCode === -32009)) {
+          throw err2;
+        }
       }
     }
 
-    if (active) {
+    if (activeId) {
       if (policy === "attach_with_token") {
         if (!attachControlToken) {
           throw new ComputerUseError(-32602, "policy attach_with_token requires attachControlToken", {
             code: "INVALID_PARAMS",
           });
         }
-        // The caller provided the capability; from now on this client acts as
-        // an authorized operator of the existing session.
+        // Verify the caller-supplied capability against the daemon FIRST — a
+        // wrong token must never be adopted into the credential. The status
+        // call verifies it (control slot) before any state changes here.
+        const verified = await this.session(
+          "status",
+          { session_id: activeId, control_token: attachControlToken },
+          options,
+        );
+        // Verified: from now on this client acts as an authorized operator of
+        // the existing session. (Control includes observation — the same token
+        // satisfies reads, so it fills the observation slot as well.)
         this.setSessionCredential({
-          sessionId: active.session_id,
+          sessionId: activeId,
+          observationToken: attachControlToken,
           controlToken: attachControlToken,
-          ownerClientId: active.owner_client_id,
-          ownerInstanceId: active.owner_instance_id,
+          ownerClientId: verified.owner_client_id,
+          ownerInstanceId: verified.owner_instance_id,
+          access: "control",
         });
-        return active;
+        return verified;
       }
       if (policy === "read_only") {
-        // Return the status; the caller must not act — it holds no token.
-        return active;
+        // An explicit read-only attach must provide the observation token —
+        // a session id alone grants nothing. attachReadOnly() is the explicit
+        // path; calling it first stores the credential, and this flow then
+        // resolves the session through step 1.
+        throw new ComputerUseError(
+          -32602,
+          "policy read_only requires the session's observation token — call attachReadOnly(sessionId, observationToken) first",
+          { code: "INVALID_PARAMS" },
+        );
       }
       // "reject" (default): refuse to attach. Let the daemon answer the start
       // attempt — its CONTROL_LOCKED carries the real holder and the owner's
@@ -581,20 +724,12 @@ export class ComputerUseClient {
       );
     }
 
-    // 3. No active session: start one and hold its token.
+    // 3. No active session: start one and hold its capabilities.
     const started = await this.session(
       "start",
       { display_id: displayId, ...(clientInfo ? { ...clientInfo } : {}) },
       options,
     );
-    if (started.control_token) {
-      this.setSessionCredential({
-        sessionId: started.session_id,
-        controlToken: started.control_token,
-        ownerClientId: started.owner_client_id,
-        ownerInstanceId: started.owner_instance_id,
-      });
-    }
     return started;
   }
 
@@ -605,17 +740,21 @@ export class ComputerUseClient {
   /**
    * Capture a frame. When `session_id` is omitted, the active session is
    * resolved automatically (a new one is started if none exists).
+   *
+   * Observe is a sensitive read: the observation credential is injected
+   * automatically when this client holds one (explicit tokens always win).
    */
   async observe(params: ObserveParams = {}, options?: RequestOptions): Promise<ObserveResult> {
-    if (!params.session_id) {
+    let p: ObserveParams = params;
+    if (!p.session_id) {
       const session = await this.ensureSession(undefined, options);
-      return this.request<ObserveResult>(
-        "computer.observe",
-        { ...params, session_id: session.session_id },
-        options ?? {},
-      );
+      p = { ...params, session_id: session.session_id };
     }
-    return this.request<ObserveResult>("computer.observe", params, options ?? {});
+    return this.request<ObserveResult>(
+      "computer.observe",
+      this.withObservationTokens(p),
+      options ?? {},
+    );
   }
 
   act(params: ActParams, options?: RequestOptions): Promise<ActResult> {
@@ -630,8 +769,13 @@ export class ComputerUseClient {
     return this.request<ActResult>("computer.act", p, options ?? {});
   }
 
+  /** Inspect pixels of a stored frame — a sensitive read, token-injected. */
   inspect(params: InspectParams, options?: RequestOptions): Promise<InspectResult> {
-    return this.request<InspectResult>("computer.inspect", params, options ?? {});
+    return this.request<InspectResult>(
+      "computer.inspect",
+      this.withObservationTokens(params),
+      options ?? {},
+    );
   }
 
   cancel(params: CancelParams, options?: RequestOptions): Promise<CancelResult> {
@@ -647,20 +791,31 @@ export class ComputerUseClient {
   // Traces
   // -------------------------------------------------------------------------
 
+  /** List trace metadata — public, like `session.summary`. */
   traceList(): Promise<TraceList> {
     return this.request<TraceList>("trace.list");
   }
 
+  /** Trace contents are a sensitive read — the observation credential is injected. */
   traceGet(sessionId: string): Promise<TraceEntry[]> {
-    return this.request<TraceEntry[]>("trace.get", { session_id: sessionId });
+    return this.request<TraceEntry[]>(
+      "trace.get",
+      this.withObservationTokens({ session_id: sessionId }),
+    );
   }
 
   traceExport(sessionId: string, dest: string): Promise<TraceExport> {
-    return this.request<TraceExport>("trace.export", { session_id: sessionId, dest });
+    return this.request<TraceExport>(
+      "trace.export",
+      this.withObservationTokens({ session_id: sessionId, dest }),
+    );
   }
 
   traceReplay(sessionId: string): Promise<unknown> {
-    return this.request<unknown>("trace.replay", { session_id: sessionId });
+    return this.request<unknown>(
+      "trace.replay",
+      this.withObservationTokens({ session_id: sessionId }),
+    );
   }
 
   // -------------------------------------------------------------------------

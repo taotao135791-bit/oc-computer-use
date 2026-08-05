@@ -1,6 +1,6 @@
 {
   "name": "cu-inspector",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.1",
   "private": true,
   "description": "Minimal local dashboard for the computer-use daemon (health, session, live frame, traces)",
   "type": "module",

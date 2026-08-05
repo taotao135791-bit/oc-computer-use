@@ -67,11 +67,27 @@ function startFakeDaemon({ sessionHandler } = {}) {
               owner_client_name: "opencode-adapter-test",
             },
           });
+        } else if (req.method === "session.summary") {
+          // v3: the coarse public view — the only tokenless session read.
+          // sessionHandler may answer (e.g. SESSION_NOT_FOUND for "no session");
+          // the default reports the same s1 the session handler serves.
+          respond(sessionHandler?.(req) ?? {
+            jsonrpc: "2.0",
+            id: req.id,
+            result: {
+              session_id: "s1",
+              state: "active",
+              lock_held: true,
+              owner_client_id: "oc-test-conn-1",
+              owner_client_name: "opencode-adapter-test",
+              message: null,
+            },
+          });
         } else if (req.method === "runtime.version") {
           respond({
             jsonrpc: "2.0",
             id: req.id,
-            result: { name: "fake", version: "0.1.0", protocol_version: 2 },
+            result: { name: "fake", version: "0.1.0", protocol_version: 3 },
           });
         } else if (req.method === "runtime.health") {
           respond({
@@ -346,7 +362,9 @@ test("statusText reports real daemon health and session state", async () => {
     assert.match(text, /daemon: v0\.1\.0 ready/);
     assert.match(text, /screen_recording=true accessibility=true/);
     assert.match(text, /active_sessions: 1/);
-    assert.match(text, /session: s1 state=active paused=false takeover=false lock=true/);
+    // v3: `status` is a sensitive read; the status line comes from the coarse
+    // public `session.summary` — state + lock + owner name, no tokens.
+    assert.match(text, /session: s1 state=active lock=true/);
     // The owner is shown by name; the control token is never displayed.
     assert.match(text, /owner: opencode-adapter-test/);
     assert.doesNotMatch(text, /control_token|token:/);

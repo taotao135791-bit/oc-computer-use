@@ -43,6 +43,16 @@ const NOT_FOUND_ERROR = {
   data: { code: "SESSION_NOT_FOUND", message: "No active computer-use session exists." },
 };
 
+const OBSERVATION_REQUIRED_ERROR = {
+  code: -32024,
+  message: "OBSERVATION_TOKEN_REQUIRED",
+  data: {
+    code: "OBSERVATION_TOKEN_REQUIRED",
+    message:
+      "This operation requires the session observation token (or its control token). A session id alone grants no observation permission.",
+  },
+};
+
 /**
  * Start a fake daemon. `existingSession` seeds an active session owned by
  * another client (owner_client_id/name/instance_id). `jpeg` makes observe
@@ -129,17 +139,35 @@ function startFakeDaemon({ existingSession = null, jpeg = false } = {}) {
                 owner_client_name: req.params?.client_name ?? "JSON-RPC client",
                 owner_instance_id: req.params?.client_instance_id ?? "unknown",
               });
-              // The control token appears exactly once — in the start
-              // response. Status (below) never repeats it.
+              // Both capability tokens appear exactly once — in the start
+              // response. Status (below) never repeats either.
               respond({
                 jsonrpc: "2.0",
                 id: req.id,
-                result: { ...state.session, control_token: "pi-fake-control-token" },
+                result: {
+                  ...state.session,
+                  control_token: "pi-fake-control-token",
+                  observation_token: "pi-fake-observation-token",
+                },
               });
             }
           } else if (action === "status") {
-            if (!state.session) respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
-            else respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+            // v3: status is a sensitive read — a session id alone grants no
+            // observation permission.
+            if (!state.session) {
+              respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
+            } else if (
+              req.params?.observation_token !== "pi-fake-observation-token" &&
+              req.params?.control_token !== "pi-fake-control-token"
+            ) {
+              respond({
+                jsonrpc: "2.0",
+                id: req.id,
+                error: OBSERVATION_REQUIRED_ERROR,
+              });
+            } else {
+              respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+            }
           } else if (action === "stop") {
             if (!state.session) respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
             else {
@@ -164,6 +192,21 @@ function startFakeDaemon({ existingSession = null, jpeg = false } = {}) {
               respond({ jsonrpc: "2.0", id: req.id, result: s });
             }
           }
+        } else if (req.method === "session.summary") {
+          // v3 public coarse view: tokenless. `null` session_id when none.
+          const s = state.session;
+          respond({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: {
+              session_id: s?.session_id ?? null,
+              state: s?.state ?? null,
+              lock_held: s?.lock_held ?? false,
+              owner_client_id: s?.owner_client_id ?? null,
+              owner_client_name: s?.owner_client_name ?? null,
+              message: s ? "knowing its id grants no observation or control permission" : null,
+            },
+          });
         } else if (req.method === "computer.observe") {
           respond({
             jsonrpc: "2.0",
@@ -242,7 +285,7 @@ function startFakeDaemon({ existingSession = null, jpeg = false } = {}) {
           respond({
             jsonrpc: "2.0",
             id: req.id,
-            result: { name: "fake", version: "0.1.0", protocol_version: 2 },
+            result: { name: "fake", version: "0.1.0", protocol_version: 3 },
           });
         } else if (req.method === "hang") {
           // Never respond — used to exercise in-flight aborts.
@@ -330,12 +373,15 @@ test("first observe auto-creates exactly one session, owned by Pi", async () => 
     assert.match(text.text, /frame_id: frame_1/);
     assert.match(text.text, /active_application: FakeApp/);
     assert.match(text.text, /size: 1440x900/);
-    // First use: status found no session, then exactly ONE start happened.
+    // First use: the tokenless summary probe found no session, then exactly
+    // ONE start happened (v3: `status` is a sensitive read, so discovery
+    // goes through the public session.summary).
     assert.equal(fake.state.startCount, 1, "exactly one session start on first use");
-    const sessions = fake.requests.filter((r) => r.method === "computer.session");
-    const idxStatus = sessions.findIndex((r) => r.params?.action === "status");
-    const idxStart = sessions.findIndex((r) => r.params?.action === "start");
-    assert.ok(idxStatus >= 0 && idxStart > idxStatus, "status probed before start");
+    const idxSummary = fake.requests.findIndex((r) => r.method === "session.summary");
+    const idxStart = fake.requests.findIndex(
+      (r) => r.method === "computer.session" && r.params?.action === "start",
+    );
+    assert.ok(idxSummary >= 0 && idxStart > idxSummary, "summary probed before start");
     // The start carried Pi's identity (the session's recorded owner).
     assert.equal(fake.state.startCalls[0].client_id, "pi-extension");
     assert.equal(fake.state.startCalls[0].client_name, "Pi");
@@ -398,7 +444,7 @@ test("observe rejects a session owned by another client with CONTROL_LOCKED", as
   }
 });
 
-test("attach policy uses another client's session without starting or stopping it", async () => {
+async function foreignSessionRefused(policyValue, expectDeprecationWarning) {
   const fake = startFakeDaemon({
     existingSession: {
       session_id: "s_foreign",
@@ -415,24 +461,54 @@ test("attach policy uses another client's session without starting or stopping i
     },
   });
   process.env.COMPUTER_USE_SOCKET = fake.socketPath;
-  process.env.COMPUTER_USE_EXISTING_SESSION_POLICY = "attach";
+  process.env.COMPUTER_USE_EXISTING_SESSION_POLICY = policyValue;
+  const warnings = [];
+  const origWarn = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
   try {
     const { pi, tools, handlers } = fakePiApi();
     const createExtension = await loadExtension();
     createExtension(pi);
     const observe = tools.find((t) => t.name === "computer_observe");
-    const result = await observe.execute("call-3", {}, undefined, undefined, ctx);
-    const text = result.content.find((b) => b.type === "text");
-    assert.match(text.text, /session_id: s_foreign/);
+    // v3: a session id alone grants no observation permission. The read-only
+    // attach requires the session's observation token, which only the owner
+    // can share — a tokenless attach is refused (never silently observed).
+    await assert.rejects(
+      observe.execute("call-3", {}, undefined, undefined, ctx),
+      (err) => {
+        assert.equal(err.code, "INVALID_PARAMS");
+        assert.match(err.message, /attachReadOnly/);
+        return true;
+      },
+    );
     assert.equal(fake.state.startCount, 0, "attach never starts a session");
     // Shutdown must NOT stop a session we do not own.
     await handlers["session_shutdown"]();
     assert.equal(fake.state.stopCount, 0, "attached session is not stopped on shutdown");
+    return { warnings, fake };
   } finally {
+    console.warn = origWarn;
     delete process.env.COMPUTER_USE_SOCKET;
     delete process.env.COMPUTER_USE_EXISTING_SESSION_POLICY;
     stopFakeDaemon(fake);
   }
+}
+
+test("read_only policy without an observation token refuses and never touches the foreign session", async () => {
+  const { warnings } = await foreignSessionRefused("read_only", false);
+  assert.equal(
+    warnings.length,
+    0,
+    "the current policy name must not warn",
+  );
+});
+
+test("legacy attach policy value maps to read_only with a deprecation warning", async () => {
+  const { warnings } = await foreignSessionRefused("attach", true);
+  assert.ok(
+    warnings.some((w) => /attach.*deprecated.*read_only/.test(w)),
+    `expected a deprecation warning, got: ${JSON.stringify(warnings)}`,
+  );
 });
 
 test("computer_act executes and returns per-action results with the post-batch screenshot", async () => {
@@ -666,6 +742,80 @@ test("/computer-observe derives .jpg from a JPEG response", async () => {
     assert.equal(buf.subarray(0, 3).toString("hex"), "ffd8ff", "JPEG magic bytes");
     await handlers["session_shutdown"]();
     assert.equal(existsSync(dest), false);
+  } finally {
+    delete process.env.COMPUTER_USE_SOCKET;
+    stopFakeDaemon(fake);
+  }
+});
+
+test("Pi tool params conform to the core protocol schema", async () => {
+  // Pi's tool definitions are its own convenience layer; the params it sends
+  // to the daemon must be schema-valid against the generated protocol (single
+  // source of truth). Validate every recorded computer.* request with ajv
+  // against the matching $defs entry.
+  const { default: Ajv2019 } = await import("ajv/dist/2019.js");
+  const { dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const schema = JSON.parse(
+    readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "protocol", "computer-use.schema.json"),
+      "utf8",
+    ),
+  );
+  const ajv = new Ajv2019({ strict: false });
+  const validateAgainst = (defName) =>
+    ajv.compile({
+      $schema: "https://json-schema.org/draft/2019-09/schema",
+      $ref: `#/$defs/${defName}`,
+      $defs: schema.$defs,
+    });
+
+  const fake = startFakeDaemon();
+  process.env.COMPUTER_USE_SOCKET = fake.socketPath;
+  try {
+    const { pi, tools } = fakePiApi();
+    const createExtension = await loadExtension();
+    createExtension(pi);
+    const observe = tools.find((t) => t.name === "computer_observe");
+    await observe.execute("call-9", {}, undefined, undefined, ctx);
+    const act = tools.find((t) => t.name === "computer_act");
+    await act.execute(
+      "call-10",
+      { frame_id: "frame_1", actions: [{ type: "click", x: 500, y: 500, button: "left" }] },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const inspect = tools.find((t) => t.name === "computer_inspect");
+    await inspect.execute(
+      "call-11",
+      { frame_id: "frame_1", region: { x: 0, y: 0, width: 100, height: 100, coordinate_space: "image_pixels" } },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const session = tools.find((t) => t.name === "computer_session");
+    await session.execute("call-12", { action: "status" }, undefined, undefined, ctx);
+
+    const byDef = {
+      "computer.session": "SessionParams",
+      "computer.observe": "ObserveParams",
+      "computer.act": "ActParams",
+      "computer.inspect": "InspectParams",
+    };
+    const seen = new Set();
+    for (const req of fake.requests) {
+      const defName = byDef[req.method];
+      if (!defName) continue;
+      seen.add(req.method);
+      const validateFn = validateAgainst(defName);
+      const ok = validateFn(req.params);
+      assert.ok(
+        ok,
+        `${req.method} params violate ${defName}: ${JSON.stringify(validateFn.errors)} — ${JSON.stringify(req.params)}`,
+      );
+    }
+    assert.deepEqual([...seen].sort(), Object.keys(byDef).sort());
   } finally {
     delete process.env.COMPUTER_USE_SOCKET;
     stopFakeDaemon(fake);

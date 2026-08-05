@@ -33,6 +33,9 @@ import {
   type SessionAction,
 } from "@computer-use/sdk";
 
+// Wire types generated from the Rust protocol source of truth (never hand-edited).
+export * from "./generated/protocol.js";
+
 // ---------------------------------------------------------------------------
 // Daemon connection + session state (module-scoped per Pi runtime instance)
 // ---------------------------------------------------------------------------
@@ -78,7 +81,20 @@ type ExistingSessionPolicy = "reject" | "read_only";
 
 function existingSessionPolicy(): ExistingSessionPolicy {
   const v = process.env.COMPUTER_USE_EXISTING_SESSION_POLICY;
-  return v === "attach" ? "read_only" : "reject";
+  if (v === "read_only") {
+    return "read_only";
+  }
+  if (v === "attach") {
+    // `attach` was the pre-0.2 name for observe-only attachment; `read_only`
+    // is clearer (attachment grants no control — the daemon refuses mutating
+    // calls without a control token). Keep accepting the old value with a
+    // warning so existing configs don't silently change behavior.
+    console.warn(
+      "COMPUTER_USE_EXISTING_SESSION_POLICY=attach is deprecated; use read_only instead",
+    );
+    return "read_only";
+  }
+  return "reject";
 }
 
 /**
@@ -548,18 +564,20 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
         ];
         let sessionLine = "session: none";
         try {
-          const s = await c.session("status", {});
-          // Read-only: never adopt a foreign session here (that would bypass
-          // the existing-session policy for later observe/act calls). Shows
-          // the owner's identity (non-secret metadata) — never a control
-          // token, which status does not carry and must never print.
-          sessionLine = `session: ${s.session_id} state=${s.state} paused=${s.paused} takeover=${s.user_takeover} lock=${s.lock_held}`;
-          if (s.owner_client_name) sessionLine += ` owner=${s.owner_client_name}`;
-          if (s.owner_client_id && s.owner_client_id !== PI_CLIENT_INFO.client_id) {
-            sessionLine += ` (client ${s.owner_client_id})`;
+          // v3: `status` is a sensitive read — without the observation
+          // credential (a foreign session) the daemon refuses it. The coarse
+          // `session.summary` is the public tokenless view, good enough for a
+          // status line. Read-only: never adopt a foreign session here (that
+          // would bypass the existing-session policy for later calls).
+          const s = await c.sessionSummary();
+          if (s.session_id) {
+            sessionLine = `session: ${s.session_id} state=${s.state ?? "?"} lock=${s.lock_held}`;
+            if (s.owner_client_name) sessionLine += ` owner=${s.owner_client_name}`;
+            if (s.owner_client_id && s.owner_client_id !== PI_CLIENT_INFO.client_id) {
+              sessionLine += ` (client ${s.owner_client_id})`;
+            }
+            if (s.message) sessionLine += ` — ${s.message}`;
           }
-          if (s.current_frame_id) sessionLine += ` frame=${s.current_frame_id}`;
-          if (s.trace_dir) sessionLine += ` trace=${s.trace_dir}`;
         } catch (err) {
           if (!(err instanceof ComputerUseError && err.code === "SESSION_NOT_FOUND")) {
             sessionLine = `session: ${toToolError(err).message}`;

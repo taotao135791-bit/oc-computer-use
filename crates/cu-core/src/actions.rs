@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::coordinates::{CoordinateSpace, Point};
 
 /// Mouse buttons understood by the macOS driver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseButton {
     Left,
@@ -43,7 +43,7 @@ impl std::str::FromStr for MouseButton {
 /// How text is inserted. `keyboard` synthesizes key events with the unicode
 /// string; `clipboard` swaps the pasteboard, pastes, and restores it (with a
 /// fallback when synthetic key events are unreliable for CJK input).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum TextInputMethod {
@@ -66,7 +66,7 @@ impl std::str::FromStr for TextInputMethod {
 }
 
 /// A single atomic computer action.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ComputerAction {
     Click {
@@ -150,7 +150,7 @@ impl ComputerAction {
 }
 
 /// What the runtime should do after executing an action batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum WaitPolicy {
@@ -230,7 +230,7 @@ impl ActionBatch {
 }
 
 /// Redacted description of a `type` action used in traces and logs by default.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RedactedText {
     pub text_redacted: bool,
     pub character_count: usize,

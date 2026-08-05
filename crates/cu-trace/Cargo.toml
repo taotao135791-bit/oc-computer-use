@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+schemars = { workspace = true }
 cu-core = { path = "../cu-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }

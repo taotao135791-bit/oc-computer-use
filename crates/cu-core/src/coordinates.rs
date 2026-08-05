@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::errors::{BoundsDetail, CuError};
 
 /// A 2D point in some coordinate space.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Point {
     pub x: f64,
     pub y: f64,
@@ -33,7 +33,7 @@ impl Point {
 }
 
 /// Coordinate space a caller used when describing a location or region.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CoordinateSpace {
     /// Image treated as a 1000x1000 canvas; top-left is (0,0).
@@ -209,7 +209,7 @@ impl ImageGeometry {
 }
 
 /// A rectangle expressed in one of the image-relative coordinate spaces.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Region {
     pub x: f64,
     pub y: f64,

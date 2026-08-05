@@ -49,6 +49,23 @@ pub fn socket_path() -> std::path::PathBuf {
     runtime_dir().join("runtime.sock")
 }
 
+/// `~/.local/state/oc-computer-use` — where durable state files (the daemon
+/// admin token, the CLI's session credential store) live, 0700. Kept separate
+/// from `runtime_dir()` (the runtime's volatile working dir) so credentials
+/// are never confused with frames/traces.
+pub fn state_dir() -> std::path::PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".local").join("state").join("oc-computer-use"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".local/state/oc-computer-use"))
+}
+
+/// Path of the daemon admin token file (0600): the CLI's only way to shut the
+/// daemon down gracefully. Written by the daemon at startup, removed on
+/// graceful exit.
+pub fn daemon_admin_path() -> std::path::PathBuf {
+    state_dir().join("daemon-admin.json")
+}
+
 pub fn frames_dir() -> std::path::PathBuf {
     runtime_dir().join("frames")
 }

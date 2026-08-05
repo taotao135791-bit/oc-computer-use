@@ -56,13 +56,35 @@ in every session result.
 
 ## Session credentials (capability)
 
-The daemon issues a session's **control token exactly once**, in the `start`
-response. **Knowing a session ID does not grant control**: the SDK stores the
-token in a `SessionCredential` (`{sessionId, controlToken, ownerClientId,
-ownerInstanceId}`) and automatically injects it into the mutating calls it
-owns — `act`, `cancel`, `pause`, `resume`, `takeover`, `release`, `stop` (an
-explicit `control_token` in the params always wins). `stop` clears the
-credential. `close()` only closes the socket — it never stops a session.
+The daemon issues a session's **two capability tokens exactly once**, in the
+`start` response: an `observationToken` (sensitive reads: observe, inspect,
+status, trace) and a `controlToken` (mutating operations; also valid for
+reads). **Knowing a session ID grants neither observation nor control
+permission** — the daemon verifies token hashes before any side effect.
+
+The SDK holds the tokens in an in-memory `SessionCredential`:
+
+```ts
+interface SessionCredential {
+  sessionId: string;
+  observationToken: string;
+  controlToken?: string;   // absent for read_only adoptions
+  ownerClientId?: string;  // identity the owner reported at start
+  ownerInstanceId?: string;
+  access: "read_only" | "control";
+}
+```
+
+It automatically injects the right token into the calls it owns — `observe`,
+`inspect`, `status`, `trace*` carry the observation token; `act`, `cancel`,
+`pause`, `resume`, `takeover`, `release`, `stop` carry the control token (an
+explicit `*_token` in the params always wins). `stop` clears the credential.
+`close()` only closes the socket — it never stops a session.
+
+**Credentials stay in memory only.** The SDK never persists tokens to disk;
+if a process restarts it has no tokens (sessions started before the restart
+are simply owned by someone else). Only the CLI (`cu`) persists session
+credentials, to files with mode `0600` under `~/.local/state/oc-computer-use/`.
 
 **Existing sessions: default `reject`.** When `ensureSession` finds an active
 session it does not own, it must not silently attach. The `existingPolicy`

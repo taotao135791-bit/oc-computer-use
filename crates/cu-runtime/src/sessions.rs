@@ -26,6 +26,10 @@ pub struct Session {
     /// side effect. The plaintext token is issued once, on `start`, and never
     /// persisted by the runtime.
     pub control_token_hash: SecretTokenHash,
+    /// SHA-256 hash of the session's observation token (read-only capability).
+    /// Sensitive reads (observe / inspect / status / trace) verify against
+    /// **either** this hash or the control hash — control includes observation.
+    pub observation_token_hash: SecretTokenHash,
     state: Mutex<SessionState>,
     paused: AtomicBool,
     user_takeover: AtomicBool,
@@ -51,6 +55,7 @@ impl Session {
         started_by: String,
         owner: Option<ClientInfo>,
         control_token_hash: SecretTokenHash,
+        observation_token_hash: SecretTokenHash,
         trace: Option<cu_trace::TraceRecorder>,
     ) -> Self {
         Self {
@@ -60,6 +65,7 @@ impl Session {
             started_by,
             owner,
             control_token_hash,
+            observation_token_hash,
             state: Mutex::new(SessionState::Active),
             paused: AtomicBool::new(false),
             user_takeover: AtomicBool::new(false),
@@ -81,6 +87,42 @@ impl Session {
             None => Err(CuError::ControlTokenRequired),
             Some(t) if self.control_token_hash.verify(t) => Ok(()),
             Some(_) => Err(CuError::InvalidControlToken),
+        }
+    }
+
+    /// Verify a presented token for a **sensitive read** (observe / inspect /
+    /// status / trace). Either the session's observation token **or** its
+    /// control token verifies — control includes observation. No token is
+    /// `OBSERVATION_TOKEN_REQUIRED`; any mismatch is `INVALID_OBSERVATION_TOKEN`
+    /// (deliberately non-descriptive — it must not reveal which token was
+    /// wrong, or even whether the presented value was close to correct).
+    pub fn verify_read_token(&self, token: Option<&str>) -> Result<(), CuError> {
+        self.verify_read_tokens(token, None)
+    }
+
+    /// Verify both token slots of a sensitive read. The observation slot is
+    /// tried first, the control slot second (a control token is also a valid
+    /// observation credential); if either verifies, the read proceeds. A
+    /// missing token entirely is `OBSERVATION_TOKEN_REQUIRED`; any failure
+    /// with a token present is the non-descriptive `INVALID_OBSERVATION_TOKEN`.
+    pub fn verify_read_tokens(
+        &self,
+        observation: Option<&str>,
+        control: Option<&str>,
+    ) -> Result<(), CuError> {
+        if let Some(t) = observation {
+            if self.observation_token_hash.verify(t) {
+                return Ok(());
+            }
+        }
+        if let Some(t) = control {
+            if self.control_token_hash.verify(t) {
+                return Ok(());
+            }
+        }
+        match (observation, control) {
+            (None, None) => Err(CuError::ObservationTokenRequired),
+            _ => Err(CuError::InvalidObservationToken),
         }
     }
 
@@ -239,6 +281,21 @@ pub type SharedSession = Arc<Session>;
 mod tests {
     use super::*;
 
+    /// A test session with fresh independent control + observation hashes.
+    fn test_session() -> Arc<Session> {
+        let control = cu_core::generate_control_token();
+        let observation = cu_core::generate_observation_token();
+        Arc::new(Session::new(
+            "s".into(),
+            "1".into(),
+            "test".into(),
+            None,
+            cu_core::SecretTokenHash::from_token(&control),
+            cu_core::SecretTokenHash::from_token(&observation),
+            None,
+        ))
+    }
+
     #[test]
     fn lock_acquire_and_release() {
         let lock = ControlLock::new();
@@ -253,14 +310,7 @@ mod tests {
 
     #[test]
     fn session_transitions_are_legal() {
-        let s = Arc::new(Session::new(
-            "s".into(),
-            "1".into(),
-            "test".into(),
-            None,
-            cu_core::SecretTokenHash::from_token(&cu_core::generate_control_token()),
-            None,
-        ));
+        let s = test_session();
         assert_eq!(s.state(), SessionState::Active);
         s.transition(SessionState::Paused).unwrap();
         assert!(s.is_paused());
@@ -275,14 +325,7 @@ mod tests {
 
     #[test]
     fn takeover_sets_takeover_flag_not_paused() {
-        let s = Arc::new(Session::new(
-            "s".into(),
-            "1".into(),
-            "test".into(),
-            None,
-            cu_core::SecretTokenHash::from_token(&cu_core::generate_control_token()),
-            None,
-        ));
+        let s = test_session();
         s.transition(SessionState::UserTakeover).unwrap();
         assert!(s.is_user_takeover());
         assert!(
@@ -298,14 +341,7 @@ mod tests {
 
     #[test]
     fn takeover_from_paused_clears_paused() {
-        let s = Arc::new(Session::new(
-            "s".into(),
-            "1".into(),
-            "test".into(),
-            None,
-            cu_core::SecretTokenHash::from_token(&cu_core::generate_control_token()),
-            None,
-        ));
+        let s = test_session();
         s.transition(SessionState::Paused).unwrap();
         s.transition(SessionState::UserTakeover).unwrap();
         assert!(s.is_user_takeover());
@@ -314,14 +350,7 @@ mod tests {
 
     #[test]
     fn takeover_cancels_in_flight() {
-        let s = Arc::new(Session::new(
-            "s".into(),
-            "1".into(),
-            "test".into(),
-            None,
-            cu_core::SecretTokenHash::from_token(&cu_core::generate_control_token()),
-            None,
-        ));
+        let s = test_session();
         let batch = s.begin_batch();
         s.transition(SessionState::UserTakeover).unwrap();
         assert!(batch.is_cancelled());
@@ -329,5 +358,41 @@ mod tests {
         s.transition(SessionState::Active).unwrap();
         let next = s.begin_batch();
         assert!(!next.is_cancelled());
+    }
+
+    #[test]
+    fn read_token_accepts_observation_or_control_and_rejects_others() {
+        let control = cu_core::generate_control_token();
+        let observation = cu_core::generate_observation_token();
+        let s = Arc::new(Session::new(
+            "s".into(),
+            "1".into(),
+            "test".into(),
+            None,
+            cu_core::SecretTokenHash::from_token(&control),
+            cu_core::SecretTokenHash::from_token(&observation),
+            None,
+        ));
+        // No token → OBSERVATION_TOKEN_REQUIRED.
+        assert!(matches!(
+            s.verify_read_token(None),
+            Err(CuError::ObservationTokenRequired)
+        ));
+        // A wrong token → INVALID_OBSERVATION_TOKEN (never *which* was wrong).
+        assert!(matches!(
+            s.verify_read_token(Some("wrong")),
+            Err(CuError::InvalidObservationToken)
+        ));
+        // The observation token verifies.
+        assert!(s.verify_read_token(Some(observation.as_str())).is_ok());
+        // The control token verifies too — control includes observation. It
+        // proves itself in the control slot (a single-arg verify_read_token
+        // only ever presents an observation credential).
+        assert!(s.verify_read_tokens(None, Some(control.as_str())).is_ok());
+        // The observation token does NOT verify as a control token.
+        assert!(matches!(
+            s.verify_control_token(Some(observation.as_str())),
+            Err(CuError::InvalidControlToken)
+        ));
     }
 }

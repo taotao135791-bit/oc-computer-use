@@ -28,9 +28,54 @@ export function mkSession(id, over = {}) {
   };
 }
 
-// The daemon issues a control token exactly once, in the `start` response;
-// `status` and every other result never carry it. The fake models that.
+// The daemon issues both capability tokens exactly once, in the `start`
+// response; `status` and every other result never carry either. The fake
+// models that — and (like the real daemon) refuses tokenless sensitive reads
+// with OBSERVATION_TOKEN_REQUIRED.
 export const START_TOKEN = "fake-control-token-for-tests";
+export const START_OBSERVATION_TOKEN = "fake-observation-token-for-tests";
+
+// The daemon's admin token — held only by the daemon manager (CLI /
+// LaunchAgent); a session capability token never authorizes shutdown.
+export const ADMIN_TOKEN = "fake-daemon-admin-token-for-tests";
+
+export const ADMIN_REQUIRED_ERROR = {
+  code: -32026,
+  message: "DAEMON_ADMIN_TOKEN_REQUIRED",
+  data: {
+    code: "DAEMON_ADMIN_TOKEN_REQUIRED",
+    message: "runtime.shutdown requires the daemon admin token.",
+  },
+};
+
+export const INVALID_ADMIN_ERROR = {
+  code: -32027,
+  message: "INVALID_DAEMON_ADMIN_TOKEN",
+  data: {
+    code: "INVALID_DAEMON_ADMIN_TOKEN",
+    message: "The presented admin token does not match this daemon.",
+  },
+};
+
+export const OBSERVATION_REQUIRED_ERROR = {
+  code: -32024,
+  message: "OBSERVATION_TOKEN_REQUIRED",
+  data: {
+    code: "OBSERVATION_TOKEN_REQUIRED",
+    message:
+      "This operation requires the session observation token (or its control token). A session id alone grants no observation permission.",
+  },
+};
+
+export const INVALID_OBSERVATION_ERROR = {
+  code: -32025,
+  message: "INVALID_OBSERVATION_TOKEN",
+  data: {
+    code: "INVALID_OBSERVATION_TOKEN",
+    message:
+      "The presented observation token (or control token) does not match this session.",
+  },
+};
 
 export const NOT_FOUND_ERROR = {
   code: -32009,
@@ -78,7 +123,7 @@ export function startFakeDaemon({
           // verifies the protocol version before any request is issued.
           setTimeout(() => {
             if (req.method === "runtime.version") {
-              respond({ jsonrpc: "2.0", id: req.id, result: { name: "fake", version: "0.1.0", protocol_version: 2 } });
+              respond({ jsonrpc: "2.0", id: req.id, result: { name: "fake", version: "0.1.0", protocol_version: 3 } });
             } else {
               respond({ jsonrpc: "2.0", id: req.id, result: { echo: req.method, id: req.id } });
             }
@@ -165,8 +210,9 @@ export function startFakeDaemon({
               owner_client_name: req.params?.client_name,
               owner_instance_id: req.params?.client_instance_id,
               // Issued exactly once, in the start response, like the real
-              // daemon (which stores only a hash and never repeats it).
+              // daemon (which stores only a hash and never repeats either).
               control_token: START_TOKEN,
+              observation_token: START_OBSERVATION_TOKEN,
             });
             respond({ jsonrpc: "2.0", id: req.id, result: state.session });
           } else if (action === "status") {
@@ -174,8 +220,18 @@ export function startFakeDaemon({
               respond({ jsonrpc: "2.0", id: req.id, error: statusError });
             } else if (!state.session) {
               respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
+            } else if (!presentedToken(req.params)) {
+              // Status is a sensitive read in v3: a session id alone grants
+              // no observation permission.
+              respond({ jsonrpc: "2.0", id: req.id, error: OBSERVATION_REQUIRED_ERROR });
+            } else if (!hasToken(req.params)) {
+              // A token was presented but none verified — non-descriptive.
+              respond({ jsonrpc: "2.0", id: req.id, error: INVALID_OBSERVATION_ERROR });
             } else {
-              respond({ jsonrpc: "2.0", id: req.id, result: state.session });
+              const { control_token, observation_token, ...safe } = state.session;
+              void control_token;
+              void observation_token;
+              respond({ jsonrpc: "2.0", id: req.id, result: safe });
             }
           } else if (action === "stop") {
             if (!state.session) {
@@ -199,9 +255,43 @@ export function startFakeDaemon({
             }
           }
         } else if (req.method === "runtime.version") {
-          respond({ jsonrpc: "2.0", id: req.id, result: { name: "fake", version: "0.1.0", protocol_version: 2 } });
+          respond({ jsonrpc: "2.0", id: req.id, result: { name: "fake", version: "0.1.0", protocol_version: 3 } });
+        } else if (req.method === "session.summary") {
+          // The public coarse view: tokenless, never carries capability tokens.
+          // When `statusError` is configured it is honored here too — a daemon
+          // that cannot answer a read cannot answer *any* read, and the SDK
+          // must surface that instead of silently starting a new session.
+          if (statusError) {
+            respond({ jsonrpc: "2.0", id: req.id, error: statusError });
+            return;
+          }
+          const s = state.session;
+          respond({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: {
+              session_id: s?.session_id ?? null,
+              state: s?.state ?? null,
+              lock_held: s?.lock_held ?? false,
+              owner_client_id: s?.owner_client_id ?? null,
+              owner_client_name: s?.owner_client_name ?? null,
+              message: s ? "knowing its id grants no observation or control permission" : null,
+            },
+          });
         } else if (req.method === "runtime.health") {
           respond({ jsonrpc: "2.0", id: req.id, result: { version: "0.1.0", ready: true, permissions: { screen_recording: true, accessibility: true }, active_sessions: state.session ? 1 : 0, uptime_secs: 5, frame_cache: 2 } });
+        } else if (req.method === "runtime.shutdown") {
+          // Only the admin token may shut the daemon down — not a session
+          // capability token, not nothing.
+          const presented = req.params?.admin_token;
+          if (!presented) {
+            respond({ jsonrpc: "2.0", id: req.id, error: ADMIN_REQUIRED_ERROR });
+          } else if (presented !== ADMIN_TOKEN) {
+            respond({ jsonrpc: "2.0", id: req.id, error: INVALID_ADMIN_ERROR });
+          } else {
+            state.shutDown = true;
+            respond({ jsonrpc: "2.0", id: req.id, result: { status: "shutting_down" } });
+          }
         } else {
           respond({ jsonrpc: "2.0", id: req.id, result: null });
         }
@@ -214,6 +304,21 @@ export function startFakeDaemon({
   server.unref();
   return { socketPath, server, dir, conns, state, requests };
 }
+
+// A sensitive-read request (status / observe / inspect / trace) carries a
+// token when the caller holds one: either slot, either token.
+export const hasToken = (params) =>
+  Boolean(
+    params &&
+      (params.observation_token === START_OBSERVATION_TOKEN ||
+        params.control_token === START_TOKEN),
+  );
+
+// Whether *any* token was presented (valid or not) — the fake distinguishes
+// "no credential at all" (-32024) from "credential did not verify" (-32025),
+// exactly like the real daemon's verify_read_tokens.
+export const presentedToken = (params) =>
+  Boolean(params && (typeof params.observation_token === "string" || typeof params.control_token === "string"));
 
 export const stopFakeDaemon = (fake) => {
   for (const conn of fake.conns) conn.destroy();

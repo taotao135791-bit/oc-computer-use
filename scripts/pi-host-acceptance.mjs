@@ -47,6 +47,19 @@ const cuSessionStatus = () => {
   if (!r.ok || !r.json || !r.json.session_id) return null;
   return r.json;
 };
+// v3: `cu session status` reads only sessions the CLI itself owns — the CLI
+// persists only its own credentials, and the daemon refuses tokenless status
+// with OBSERVATION_TOKEN_REQUIRED. The Pi extension holds the tokens for the
+// session IT created, so its state is read through the extension's own
+// computer_session tool — the exact code path a real Pi host uses.
+const extSessionStatus = async (host) => {
+  try {
+    const r = await callTool(host.tools.get("computer_session"), { action: "status" });
+    return r.details;
+  } catch {
+    return null; // SESSION_NOT_FOUND (no session) — same "no session" signal
+  }
+};
 
 // --- Minimal Pi host --------------------------------------------------------
 
@@ -108,7 +121,7 @@ await callCommand(host, "computer-status");
 const statusNotify = notifyText(host);
 check(
   "/computer-status reports real daemon + no session",
-  /daemon: v0\.1\.0 ready/.test(statusNotify) && statusNotify.includes("session: none"),
+  /daemon: v\d+\.\d+\.\d+(?:[-+][\w.-]+)? ready/.test(statusNotify) && statusNotify.includes("session: none"),
   statusNotify.replace(/\n/g, " | "),
 );
 
@@ -124,7 +137,7 @@ const obsText = obs1.content.find((b) => b.type === "text").text;
 check("observe text carries real frame_id + size", /frame_id: frame_\d+/.test(obsText) && /size: \d+x\d+/.test(obsText));
 const sidPi = obs1.details.session_id;
 check("session auto-created on first observe", !!sidPi && /^s_/.test(sidPi), sidPi);
-const stPi = cuSessionStatus();
+const stPi = await extSessionStatus(host);
 check(
   "auto-created session is owned by pi-extension",
   stPi?.owner_client_id === "pi-extension" && stPi?.owner_client_name === "Pi",
@@ -170,8 +183,8 @@ check(
 
 section("Pi acceptance — 12..17. takeover / resume / release via commands");
 await callCommand(host, "computer-takeover");
-let st = cuSessionStatus();
-check("takeover → state user_takeover", st?.user_takeover === true);
+let st = await extSessionStatus(host);
+check("takeover → state user_takeover", st?.user_takeover === true, `state=${st?.state} takeover=${st?.user_takeover}`);
 let actErr = null;
 try {
   await callTool(host.tools.get("computer_act"), {
@@ -183,11 +196,11 @@ try {
 }
 check("act rejected under takeover (USER_TAKEOVER)", actErr?.code === "USER_TAKEOVER", actErr ? `${actErr.code}: ${actErr.message}` : "no error");
 await callCommand(host, "computer-resume");
-st = cuSessionStatus();
-check("resume cannot bypass takeover (USER_TAKEOVER_ACTIVE)", st?.user_takeover === true, `state=${st?.state}`);
+st = await extSessionStatus(host);
+check("resume cannot bypass takeover (USER_TAKEOVER_ACTIVE)", st?.user_takeover === true, `state=${st?.state} takeover=${st?.user_takeover}`);
 await callCommand(host, "computer-release");
-st = cuSessionStatus();
-check("release → state active again", st?.user_takeover === false && st?.state === "active");
+st = await extSessionStatus(host);
+check("release → state active again", st?.user_takeover === false && st?.state === "active", `state=${st?.state} takeover=${st?.user_takeover}`);
 // The frame advanced while the session was under takeover; re-observe so the
 // post-release act runs against a current frame (a stale one is correctly
 // rejected under the strict policy).
@@ -218,9 +231,8 @@ check("screenshot is a real JPEG (ffd8ff magic)", magic === "ffd8ff", magic);
 check("screenshot perms are 0600", savedStat && (savedStat.mode & 0o777) === 0o600, `mode=${(savedStat?.mode ?? 0).toString(8)}`);
 
 section("Pi acceptance — 18..19. session_shutdown stops only the session Pi created");
-const sidBefore = cuSessionStatus()?.session_id;
 for (const cb of host.shutdownHandlers) await cb();
-const stAfter = cuSessionStatus();
+const stAfter = await extSessionStatus(host);
 check(
   "Pi-created session stopped on shutdown",
   stAfter === null || stAfter.state === "stopped",
@@ -258,20 +270,44 @@ check(
   locked ? `${locked.code}: ${locked.message}` : "no error",
 );
 
-// Scenario B: attach policy — observe works, shutdown does not stop it.
+// Scenario B: read_only attach. v3: a session id alone grants no observation
+// permission, so a tokenless read_only attach is refused with INVALID_PARAMS
+// pointing at attachReadOnly — the extension must not silently observe a
+// session it has no token for. The legacy `attach` value maps to read_only
+// with a deprecation warning.
 const host2 = await loadExtension();
 process.env.COMPUTER_USE_EXISTING_SESSION_POLICY = "attach";
+const warnings = [];
+const origWarn = console.warn;
+console.warn = (m) => warnings.push(String(m));
+let attachErr = null;
 try {
-  const obsA = await callTool(host2.tools.get("computer_observe"), {});
-  check(
-    "attach policy: observe works on the foreign session",
-    obsA.details.session_id === foreignSid,
-    `session ${obsA.details.session_id}`,
-  );
+  try {
+    await callTool(host2.tools.get("computer_observe"), {});
+  } catch (e) {
+    attachErr = e;
+  }
+} finally {
+  console.warn = origWarn;
+}
+check(
+  "legacy COMPUTER_USE_EXISTING_SESSION_POLICY=attach → deprecation warning",
+  warnings.some((w) => w.includes("attach is deprecated")),
+  warnings.join(" | ") || "no warning",
+);
+check(
+  "read_only attach without the observation token → INVALID_PARAMS (attachReadOnly)",
+  attachErr?.code === "INVALID_PARAMS" && /attachReadOnly/.test(attachErr?.message ?? ""),
+  attachErr ? `${attachErr.code}: ${attachErr.message}` : "no error — silently attached",
+);
+delete process.env.COMPUTER_USE_EXISTING_SESSION_POLICY;
+process.env.COMPUTER_USE_EXISTING_SESSION_POLICY = "read_only";
+try {
   for (const cb of host2.shutdownHandlers) await cb();
+  // CLI owns the foreign session, so the CLI (with its own credential) reads it.
   const stF = cuSessionStatus();
   check(
-    "attach policy: shutdown does NOT stop the foreign session",
+    "read_only client shutdown does NOT stop the foreign session",
     stF?.session_id === foreignSid && stF?.state === "active",
     `session ${stF?.session_id} state=${stF?.state}`,
   );
@@ -283,6 +319,7 @@ try {
 cu(["session", "stop"]);
 
 console.log(`\n=== ${results.filter((r) => r.ok).length}/${results.length} PASS ===`);
-if (results.some((r) => !r.ok)) {
-  process.exit(1);
-}
+// Exit explicitly: the extension's SDK sockets keep the event loop alive after
+// the last check, and through a pipe (tail, CI) an unclosed handle hangs the
+// pipeline forever. All-PASS must exit just like all-FAIL does.
+process.exit(results.some((r) => !r.ok) ? 1 : 0);

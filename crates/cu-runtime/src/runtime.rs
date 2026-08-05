@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use chrono::Utc;
 use cu_core::{
-    generate_control_token, ActParams, ActResult, ClientInfo, CoordinateSpace, CuError, ErrorCode,
-    ImageGeometry, InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult,
-    Region, RequestKey, ScreenFrame, ScreenSnapshot, SecretTokenHash, SessionAction, SessionResult,
-    SessionState, StabilizationInfo, TraceReport, WaitPolicy,
+    generate_control_token, generate_observation_token, ActParams, ActResult, ClientInfo,
+    CoordinateSpace, CuError, ErrorCode, ImageGeometry, InspectMapping, InspectParams,
+    InspectResult, ObserveParams, ObserveResult, Region, RequestKey, ScreenFrame, ScreenSnapshot,
+    SecretTokenHash, SessionAction, SessionResult, SessionState, SessionSummary, StabilizationInfo,
+    TraceReport, WaitPolicy,
 };
 use cu_driver::{
     ApplicationInfo, CaptureRequest, ComputerDriver, DesktopLayout, DisplayInfo, PermissionStatus,
@@ -235,11 +236,15 @@ impl Runtime {
             None => self.driver.desktop_layout().await?.primary_id,
         };
 
-        // The control token is the capability for this session. Generated from
-        // the OS CSPRNG, issued exactly once (in the start response), stored
-        // only as a hash. It must never appear in logs, traces, or `status`.
+        // The two session capabilities, generated **independently** from the
+        // OS CSPRNG, issued exactly once (in the start response), stored only
+        // as hashes. Neither may ever appear in logs, traces, or `status`.
+        // The control token authorizes every mutating operation; the
+        // observation token authorizes sensitive reads only.
         let control_token = generate_control_token();
         let control_token_hash = SecretTokenHash::from_token(&control_token);
+        let observation_token = generate_observation_token();
+        let observation_token_hash = SecretTokenHash::from_token(&observation_token);
 
         let trace = match self.config.trace_mode {
             // Disabled: no recorder at all; trace RPCs simply find nothing.
@@ -273,6 +278,7 @@ impl Runtime {
             client.client_name.clone(),
             Some(client),
             control_token_hash,
+            observation_token_hash,
             trace,
         ));
 
@@ -308,15 +314,69 @@ impl Runtime {
         }
         tracing::info!(session = %id, "session started");
         let mut result = self.session_result(&session);
-        // The one and only disclosure of the control token: the response to
-        // the client that just created the session.
+        // The one and only disclosure of the session's capabilities: the
+        // response to the client that just created the session. The control
+        // token covers mutating operations; the observation token covers
+        // sensitive reads (and is what a read-only attach must hold).
         result.control_token = Some(control_token.as_str().to_string());
+        result.observation_token = Some(observation_token.as_str().to_string());
         Ok(result)
     }
 
-    pub async fn session_status(&self, session_id: &str) -> Result<SessionResult, CuError> {
-        // Read-only: status needs no control token and never returns one.
+    /// The **public** session view: coarse state + non-secret owner identity.
+    /// No token required — this never leaks display ids, frame ids, trace
+    /// paths, or any token. Full `status` is a sensitive read.
+    pub fn session_summary(&self) -> SessionSummary {
+        let holder = self.active_session_id();
+        let Some(id) = holder else {
+            return SessionSummary {
+                session_id: None,
+                state: None,
+                lock_held: false,
+                owner_client_id: None,
+                owner_client_name: None,
+                message: None,
+            };
+        };
+        let session = self.sessions.lock().unwrap().get(&id).cloned();
+        let mut summary = SessionSummary {
+            session_id: Some(id.clone()),
+            state: session.as_ref().map(|s| s.state()),
+            lock_held: true,
+            owner_client_id: session
+                .as_ref()
+                .and_then(|s| s.owner.as_ref())
+                .map(|o| o.client_id.clone()),
+            owner_client_name: session
+                .as_ref()
+                .and_then(|s| s.owner.as_ref())
+                .map(|o| o.client_name.clone()),
+            message: None,
+        };
+        let session = session.as_ref();
+        let owner_name = session
+            .and_then(|s| s.owner.as_ref())
+            .map(|o| o.client_name.as_str())
+            .unwrap_or("another client");
+        summary.message = Some(format!(
+            "Active session {id} is owned by {owner_name}; knowing its id grants no observation or control permission."
+        ));
+        summary
+    }
+
+    /// Full session status — a sensitive read. Requires the observation **or**
+    /// control token (the caller may pass either slot); it never returns a
+    /// token itself.
+    pub async fn session_status(
+        &self,
+        session_id: &str,
+        observation_token: Option<&str>,
+        control_token: Option<&str>,
+    ) -> Result<SessionResult, CuError> {
         let session = self.get_session(session_id)?;
+        // Verify *before* returning any field: display_id, frame_id, trace_dir
+        // and the rest are private until the capability is proven.
+        session.verify_read_tokens(observation_token, control_token)?;
         Ok(self.session_result(&session))
     }
 
@@ -462,8 +522,8 @@ impl Runtime {
     /// Dispatch a `computer.session` action.
     ///
     /// `control_token` is required for every mutating action except `start`
-    /// (which creates the session and issues the token) — `status` is
-    /// read-only and needs none.
+    /// (which creates the session and issues the tokens). `status` is a
+    /// sensitive read: it requires the observation **or** control token.
     pub async fn session(
         &self,
         action: SessionAction,
@@ -471,11 +531,15 @@ impl Runtime {
         display_id: Option<String>,
         client: ClientInfo,
         control_token: Option<&str>,
+        observation_token: Option<&str>,
     ) -> Result<SessionResult, CuError> {
         match action {
             SessionAction::Start => self.session_start(display_id, client).await,
             SessionAction::Status => match session_id {
-                Some(id) => self.session_status(id).await,
+                Some(id) => {
+                    self.session_status(id, observation_token, control_token)
+                        .await
+                }
                 None => {
                     // No active session is a *typed* error, not a malformed
                     // request: adapters auto-start on SESSION_NOT_FOUND and
@@ -483,7 +547,8 @@ impl Runtime {
                     let holder = self.active_session_id().ok_or_else(|| {
                         CuError::SessionNotFound("No active computer-use session exists.".into())
                     })?;
-                    self.session_status(&holder).await
+                    self.session_status(&holder, observation_token, control_token)
+                        .await
                 }
             },
             SessionAction::Pause => {
@@ -548,6 +613,14 @@ impl Runtime {
             .clone()
             .ok_or_else(|| CuError::InvalidParams("observe requires session_id".into()))?;
         let session = self.get_session(&session_id)?;
+        // Observing captures the desktop: a capability token (observation or
+        // control) is verified *before* the busy lock, the frame counter, or
+        // any capture — a tokenless or wrong-token observe has zero side
+        // effects (no frame written, no frame_id consumed, no trace entry).
+        session.verify_read_tokens(
+            params.observation_token.as_deref(),
+            params.control_token.as_deref(),
+        )?;
         self.gate_active(&session)?;
         let _busy = session.busy.lock().await;
         self.observe_inner(&session, params, request_id).await
@@ -899,6 +972,9 @@ impl Runtime {
                             session_id: Some(params.session_id.clone()),
                             display_id: Some(session.display_id.clone()),
                             include_image: Some(true),
+                            // Internal re-observe: the caller's token was
+                            // already verified for the mutating batch.
+                            control_token: params.control_token.clone(),
                             ..Default::default()
                         },
                         request_id,
@@ -938,7 +1014,13 @@ impl Runtime {
     // ------------------------------------------------------------------
 
     pub async fn inspect(&self, params: InspectParams) -> Result<InspectResult, CuError> {
-        let _session = self.get_session(&params.session_id)?;
+        let session = self.get_session(&params.session_id)?;
+        // Inspecting a stored frame exposes desktop pixels: capability token
+        // (observation or control) verified before any pixels are read.
+        session.verify_read_tokens(
+            params.observation_token.as_deref(),
+            params.control_token.as_deref(),
+        )?;
         let stored = {
             let store = self.frames.lock().unwrap();
             store.get(&params.frame_id).cloned()
@@ -1031,6 +1113,20 @@ impl Runtime {
             .ok_or_else(|| CuError::SessionNotFound(format!("session not found: {id}")))
     }
 
+    /// Verify a capability token for a sensitive read addressed by session id
+    /// (used by the daemon's trace methods, which read files off the session's
+    /// trace dir). Works for stopped sessions too — their traces remain
+    /// readable to the token holder after `stop`.
+    pub fn verify_session_read(
+        &self,
+        session_id: &str,
+        observation_token: Option<&str>,
+        control_token: Option<&str>,
+    ) -> Result<(), CuError> {
+        let session = self.get_session(session_id)?;
+        session.verify_read_tokens(observation_token, control_token)
+    }
+
     fn gate_active(&self, session: &Session) -> Result<(), CuError> {
         match session.state() {
             SessionState::Active => Ok(()),
@@ -1092,9 +1188,10 @@ impl Runtime {
                 .as_ref()
                 .map(|t| t.path().to_string_lossy().into_owned()),
             started_by: session.started_by.clone(),
-            // The control token is NEVER included in status results — it is
-            // issued exactly once, in the start response.
+            // Neither capability token is EVER included in status results —
+            // both are issued exactly once, in the start response.
             control_token: None,
+            observation_token: None,
             owner_client_id: session.owner.as_ref().map(|c| c.client_id.clone()),
             owner_client_name: session.owner.as_ref().map(|c| c.client_name.clone()),
             owner_instance_id: session.owner.as_ref().map(|c| c.client_instance_id.clone()),
@@ -1325,7 +1422,14 @@ mod tests {
         rt.session_stop(&started.session_id, Some(&token))
             .await
             .unwrap();
-        let status = rt.session_status(&started.session_id).await.unwrap();
+        let status = rt
+            .session_status(
+                &started.session_id,
+                started.observation_token.as_deref(),
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(status.state, SessionState::Stopped);
         assert!(!status.lock_held);
     }
@@ -1337,7 +1441,7 @@ mod tests {
     async fn status_without_session_returns_session_not_found() {
         let rt = runtime().await;
         let err = rt
-            .session(SessionAction::Status, None, None, test_client(), None)
+            .session(SessionAction::Status, None, None, test_client(), None, None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::SessionNotFound);
@@ -1360,7 +1464,14 @@ mod tests {
 
         // A second client starting (or querying) sees the same owner — it
         // never becomes the owner by observing.
-        let status = rt.session_status(&started.session_id).await.unwrap();
+        let status = rt
+            .session_status(
+                &started.session_id,
+                started.observation_token.as_deref(),
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(status.owner_client_id.as_deref(), Some("test"));
     }
 
@@ -1403,7 +1514,7 @@ mod tests {
 
         // 2. Pause → resume succeeds.
         rt.session_resume(&sid, Some(&token)).await.unwrap();
-        let st = rt.session_status(&sid).await.unwrap();
+        let st = rt.session_status(&sid, None, Some(&token)).await.unwrap();
         assert_eq!(st.state, SessionState::Active);
 
         // 3. Takeover → act rejected.
@@ -1421,7 +1532,7 @@ mod tests {
             err.to_string().contains("release"),
             "error must point at release: {err}"
         );
-        let st = rt.session_status(&sid).await.unwrap();
+        let st = rt.session_status(&sid, None, Some(&token)).await.unwrap();
         assert_eq!(st.state, SessionState::UserTakeover);
         assert!(st.user_takeover);
         assert!(!st.paused);
@@ -1437,6 +1548,7 @@ mod tests {
                 ObserveParams {
                     session_id: Some(sid.clone()),
                     include_image: Some(false),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1471,6 +1583,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(sid.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1566,6 +1679,7 @@ mod tests {
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
                     include_image: Some(false),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1597,6 +1711,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1607,6 +1722,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1648,6 +1764,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1658,6 +1775,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1708,6 +1826,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1740,6 +1859,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s2.session_id.clone()),
+                    control_token: Some(token2.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1771,6 +1891,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1811,6 +1932,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1851,6 +1973,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1869,6 +1992,8 @@ mod tests {
                     coordinate_space: CoordinateSpace::ImagePixels,
                 },
                 scale: None,
+                observation_token: None,
+                control_token: Some(token.clone()),
             })
             .await
             .unwrap();
@@ -1895,6 +2020,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -1972,6 +2098,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -2033,6 +2160,7 @@ mod tests {
             .observe(
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -2097,6 +2225,7 @@ mod tests {
                 ObserveParams {
                     session_id: Some(s.session_id.clone()),
                     include_image: Some(false),
+                    control_token: Some(token.to_string()),
                     ..Default::default()
                 },
                 None,
@@ -2153,7 +2282,7 @@ mod tests {
             ("stop", SessionAction::Stop),
         ] {
             let err = rt
-                .session(op.1, Some(&sid), None, test_client(), None)
+                .session(op.1, Some(&sid), None, test_client(), None, None)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -2186,7 +2315,7 @@ mod tests {
 
         // No side effects: session still Active, nothing reached the driver,
         // nothing was cancelled.
-        let st = rt.session_status(&sid).await.unwrap();
+        let st = rt.session_status(&sid, None, Some(&token)).await.unwrap();
         assert_eq!(st.state, SessionState::Active);
         assert_eq!(fake.executes.load(std::sync::atomic::Ordering::SeqCst), 0);
 
@@ -2214,7 +2343,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_token_is_refused_and_says_nothing_useful() {
         let rt = runtime().await;
-        let (sid, _token, _frame) = start_observed(&rt).await;
+        let (sid, token, _frame) = start_observed(&rt).await;
 
         // A wrong token fails with INVALID_CONTROL_TOKEN and the message must
         // not hint at why (length, hash, or session mismatch all look alike).
@@ -2238,7 +2367,7 @@ mod tests {
         );
 
         // Still Active: the refusals had no side effects.
-        let st = rt.session_status(&sid).await.unwrap();
+        let st = rt.session_status(&sid, None, Some(&token)).await.unwrap();
         assert_eq!(st.state, SessionState::Active);
         assert_eq!(
             st.control_token, None,
@@ -2264,7 +2393,7 @@ mod tests {
             SessionAction::Pause,
         ] {
             let err = rt
-                .session(action, Some(&sid), None, other.clone(), None)
+                .session(action, Some(&sid), None, other.clone(), None, None)
                 .await
                 .unwrap_err();
             assert_eq!(err.code(), ErrorCode::ControlTokenRequired);
@@ -2272,7 +2401,7 @@ mod tests {
         assert!(rt.cancel_in_flight(&sid, None).is_err());
 
         // The owner's session is untouched and still controllable.
-        let st = rt.session_status(&sid).await.unwrap();
+        let st = rt.session_status(&sid, None, Some(&token)).await.unwrap();
         assert_eq!(st.state, SessionState::Active);
         assert_eq!(st.owner_client_id.as_deref(), Some("test"));
         rt.session_stop(&sid, Some(&token)).await.unwrap();
@@ -2404,7 +2533,10 @@ mod tests {
 
         // Every other response form must never contain the token: status,
         // pause, resume, stop results are all tokenless.
-        let st = rt.session_status(&s.session_id).await.unwrap();
+        let st = rt
+            .session_status(&s.session_id, None, Some(&issued))
+            .await
+            .unwrap();
         assert_eq!(st.control_token, None);
         let p = rt
             .session_pause(&s.session_id, Some(&issued))
@@ -2468,7 +2600,7 @@ mod tests {
         let (sid, token, _frame) = start_observed(&rt).await;
         let rt2 = runtime().await;
 
-        let err = rt2.session_status(&sid).await.unwrap_err();
+        let err = rt2.session_status(&sid, None, None).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::SessionNotFound);
         let err = rt2
             .session(
@@ -2477,6 +2609,7 @@ mod tests {
                 None,
                 test_client(),
                 Some(&token),
+                None,
             )
             .await
             .unwrap_err();
@@ -2488,6 +2621,7 @@ mod tests {
                 None,
                 test_client(),
                 Some(&token),
+                None,
             )
             .await
             .unwrap_err();
@@ -2502,7 +2636,10 @@ mod tests {
         let err = rt.session_takeover(&sid, None).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ControlTokenRequired);
         assert_eq!(
-            rt.session_status(&sid).await.unwrap().state,
+            rt.session_status(&sid, None, Some(&token))
+                .await
+                .unwrap()
+                .state,
             SessionState::Active
         );
 
@@ -2510,7 +2647,10 @@ mod tests {
         let err = rt.session_release(&sid, None).await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ControlTokenRequired);
         assert_eq!(
-            rt.session_status(&sid).await.unwrap().state,
+            rt.session_status(&sid, None, Some(&token))
+                .await
+                .unwrap()
+                .state,
             SessionState::UserTakeover
         );
         rt.session_release(&sid, Some(&token)).await.unwrap();

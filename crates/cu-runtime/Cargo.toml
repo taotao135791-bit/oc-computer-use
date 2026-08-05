@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+schemars = { workspace = true }
 cu-core = { path = "../cu-core" }
 cu-driver = { path = "../cu-driver" }
 cu-policy = { path = "../cu-policy" }
