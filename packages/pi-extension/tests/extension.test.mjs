@@ -719,7 +719,10 @@ test("/computer-observe saves a PNG to the temp dir with 0600 and cleans it up",
     // MIME-derived extension, system temp dir (never the project/cwd).
     assert.ok(dest.endsWith("oc-computer-use-s_started-frame_1.png"), `got ${dest}`);
     assert.ok(dest.startsWith(tmpdir()), `must be in the system temp dir, got ${dest}`);
-    assert.equal(existsSync(join("/tmp", "oc-computer-use-s_started-frame_1.png")), false, "never written to the cwd");
+    // Never written to the cwd/project. (Platform-neutral: os.tmpdir() is
+    // /var/folders/... on macOS but /tmp on Linux CI runners — a hardcoded
+    // /tmp would collide with the real file on Linux.)
+    assert.equal(existsSync(join(process.cwd(), "oc-computer-use-s_started-frame_1.png")), false, "never written to the cwd");
     // Real PNG bytes, private to the current user.
     const buf = readFileSync(dest);
     assert.equal(buf.subarray(0, 8).toString("hex"), "89504e470d0a1a0a", "PNG magic bytes");
