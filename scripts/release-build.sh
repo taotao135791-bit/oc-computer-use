@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Build the release artifacts into dist/:
 #
-#   dist/macos-arm64/   cu, cubridge  (arm64; `cu daemon run` IS the daemon)
-#   dist/macos-x64/     cu, cubridge  (x86_64)
-#   dist/universal/     cu, cubridge  (lipo'd fat binaries)
-#   dist/npm/           tarballs of the TypeScript packages (pnpm pack)
-#   dist/checksums.txt  sha256 of every artifact (relative paths)
+#   dist/macos-arm64/                cu, cubridge  (arm64; `cu daemon run` IS the daemon)
+#   dist/macos-x64/                  cu, cubridge  (x86_64)
+#   dist/universal/                  cu, cubridge  (lipo'd fat binaries)
+#   dist/oc-computer-use-macos-universal.tar.gz  (tarball of universal/)
+#   dist/computer-use.schema.json    protocol schema (single source of truth)
+#   dist/npm/                        tarballs of the TypeScript packages (pnpm pack)
+#   dist/checksums.txt               sha256 of every artifact (relative paths)
 #
 # Prereqs: rustup targets aarch64-apple-darwin + x86_64-apple-darwin,
 # swiftc (macOS), pnpm. Idempotent: dist/ is rebuilt from scratch.
@@ -40,6 +42,12 @@ for bin in cu cubridge; do
   lipo -create -output "$DIST/universal/$bin" "$DIST/macos-arm64/$bin" "$DIST/macos-x64/$bin"
 done
 lipo -info "$DIST/universal"/*
+
+echo "== universal tarball"
+tar -czf "$DIST/oc-computer-use-macos-universal.tar.gz" -C "$DIST/universal" .
+
+echo "== protocol schema"
+cp protocol/computer-use.schema.json "$DIST/computer-use.schema.json"
 
 echo "== npm tarballs (packages must be built first)"
 pnpm -r build

@@ -1,0 +1,137 @@
+name: Release
+
+# Tag-triggered pre-release pipeline. Pushing a tag `v*` (e.g. `v0.2.0-alpha.1`)
+# rebuilds every artifact from a clean checkout, re-runs ALL release gates,
+# and publishes a GitHub pre-release with the artifacts attached.
+#
+# The 12-step release flow (round 7 spec §五):
+#   1. Checkout the tag                              → checkout step
+#   2. Install Rust, Node, pnpm, Swift               → toolchain steps (swiftc
+#                                                      ships on macos-latest)
+#   3. Run ALL release gates                         → scripts/smoke.sh (full:
+#                                                      cargo fmt/clippy/test,
+#                                                      protocol drift, TS
+#                                                      build/typecheck/lint/test,
+#                                                      Swift arm64+x86_64+universal,
+#                                                      npm tarball install +
+#                                                      .bin shim verification)
+#   4. Build arm64 / 5. Build x86_64 / 6. Universal  → scripts/release-build.sh
+#                                                      (covers steps 4–6; the
+#                                                      daemon runs in-process as
+#                                                      `cu daemon run`, so the
+#                                                      `cu` binary is the only
+#                                                      Rust artifact)
+#   7. npm tarballs                                  → release-build.sh
+#   8. Install + verify all tarballs                 → node scripts/verify-tarballs.mjs
+#                                                      (inside smoke.sh)
+#   9. SHA-256 checksums                             → release-build.sh +
+#                                                      `shasum -c`
+#  10. Release notes                                → scripts/release-notes.mjs
+#                                                      (template with honest
+#                                                      signing/host-verification
+#                                                      status; version numbers
+#                                                      come from the tag and the
+#                                                      schema, never hardcoded)
+#  11. Create GitHub pre-release                     → gh release create
+#  12. Upload all artifacts                          → gh release upload
+#                                                      (per-arch + universal cu
+#                                                      and cubridge, universal
+#                                                      tarball, 4 npm tarballs,
+#                                                      schema, checksums,
+#                                                      CHANGELOG.md)
+#
+# The release is always a *pre*-release; artifact names follow the real
+# package names (cu-daemon is a library crate, so there is no separate
+# daemon binary to upload).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # publish the pre-release and upload artifacts
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  pre-release:
+    name: Pre-release ${{ github.ref_name }}
+    runs-on: macos-latest
+    steps:
+      # 1. Checkout the tag (fetch-depth 0 so the changelog for the tag is
+      # the full history; gh uses the checkout's token).
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2. Toolchains: Rust with BOTH macOS targets (release-build.sh
+      # cross-compiles arm64 + x86_64), Node/pnpm for the TS packages.
+      # Swift: swiftc ships on macos-latest (used by release-build.sh).
+      - name: Install Rust (stable, both macOS targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: pnpm install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # 3. Every release gate, exit-code judged. Full smoke covers
+      # fmt/clippy/test, protocol generate + drift, TS build/typecheck/lint/
+      # test, Swift arm64+x86_64+universal, npm tarball install verification
+      # (including the .bin shim user path), release build, and checksum
+      # verification — steps 3–9 of the release flow.
+      - name: Release gates (full smoke)
+        run: bash scripts/smoke.sh
+
+      # 10. Release notes: version/protocol from the tag + schema (never
+      # hardcoded), honest status sections (unsigned, not notarized,
+      # NOT VERIFIED host acceptances, same-UID threat model) from the
+      # committed template, changelog section appended.
+      - name: Generate release notes
+        run: node scripts/release-notes.mjs "${{ github.ref_name }}" --out dist/release-notes.md
+
+      # 11. Create the pre-release (draft=false, prerelease=true). Notes are
+      # attached from the file so the body is exactly what was verified.
+      - name: Create GitHub pre-release
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "oc-computer-use ${{ github.ref_name }}" \
+            --notes-file dist/release-notes.md \
+            --prerelease
+
+      # 12. Upload every artifact. Glob expansion is done by the shell;
+      # fail loudly if any file is missing.
+      - name: Upload artifacts
+        run: |
+          shopt -s nullglob
+          files=(
+            dist/macos-arm64/cu dist/macos-arm64/cubridge
+            dist/macos-x64/cu dist/macos-x64/cubridge
+            dist/universal/cu dist/universal/cubridge
+            dist/oc-computer-use-macos-universal.tar.gz
+            dist/npm/*.tgz
+            dist/computer-use.schema.json
+            dist/checksums.txt
+            CHANGELOG.md
+          )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no release artifacts found under dist/" >&2
+            exit 1
+          fi
+          printf '%s\n' "${files[@]}" | xargs -n 1 gh release upload \
+            "${{ github.ref_name }}" --repo "${{ github.repository }}" --clobber
+          echo "uploaded ${#files[@]} artifacts"
