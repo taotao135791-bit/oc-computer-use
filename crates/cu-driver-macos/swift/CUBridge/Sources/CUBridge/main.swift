@@ -53,6 +53,33 @@ func waitForSemaphore(_ sem: DispatchSemaphore) {
     }
 }
 
+/// waitForSemaphore bounded by a deadline — returns false if the callback
+/// never fires. ScreenCaptureKit silently drops the completion callback in
+/// some states (e.g. a locked screen on recent macOS), and a bridge stuck
+/// here never returns to its readLine loop, so the Rust side would have to
+/// time it out and would orphan this process.
+func waitForSemaphore(_ sem: DispatchSemaphore, within timeout: TimeInterval) -> Bool {
+    let deadline = Date(timeIntervalSinceNow: timeout)
+    while sem.wait(timeout: .now() + 0.05) == .timedOut {
+        if Date() >= deadline { return false }
+        RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+    }
+    return true
+}
+
+// MARK: - Screen lock detection
+
+/// True when the console session's screen is locked. While locked, recent
+/// macOS (26.x) never completes ScreenCaptureKit captures — the bridge would
+/// hang until the Rust-side deadline and get orphaned. Detect it up front
+/// and fail fast with an actionable error instead.
+func screenIsLocked() -> Bool {
+    guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else {
+        return false
+    }
+    return (session["CGSSessionScreenIsLocked"] as? NSNumber)?.boolValue == true
+}
+
 func displayBounds(_ id: CGDirectDisplayID) -> [String: Any]? {
     let b = CGDisplayBounds(id)
     return ["x": Double(b.origin.x), "y": Double(b.origin.y),
@@ -129,6 +156,10 @@ func captureDisplay(displayId: CGDirectDisplayID, outputPath: String,
         throw NSError(domain: "CUBridge", code: 5,
                       userInfo: [NSLocalizedDescriptionKey: "Screen Recording permission is not granted for cubridge. Open System Settings > Privacy & Security > Screen Recording and enable cubridge (~/.computer-use/bin/cubridge). Rebuilding cubridge resets this permission — re-grant it after any rebuild."])
     }
+    if screenIsLocked() {
+        throw NSError(domain: "CUBridge", code: 6,
+                      userInfo: [NSLocalizedDescriptionKey: "The screen is locked — unlock the display before capturing"])
+    }
     let content = try getShareableContent()
     guard let display = content.displays.first(where: { $0.displayID == displayId }) else {
         throw NSError(domain: "CUBridge", code: 2,
@@ -154,7 +185,13 @@ func captureDisplay(displayId: CGDirectDisplayID, outputPath: String,
             bridge.semaphore.signal()
         }
     }
-    waitForSemaphore(bridge.semaphore)
+    // 15s < the Rust-side 30s bridge deadline: if ScreenCaptureKit drops the
+    // callback (e.g. a lock race or a wedged WindowServer) the bridge fails
+    // itself instead of being timed out and orphaned.
+    guard waitForSemaphore(bridge.semaphore, within: 15) else {
+        throw NSError(domain: "CUBridge", code: 7,
+                      userInfo: [NSLocalizedDescriptionKey: "screen capture did not complete within 15s (screen locked or WindowServer busy?)"])
+    }
 
     if let error = bridge.error {
         throw error

@@ -1,0 +1,23 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: cross-01-textedit-to-web
+name: 文本编辑器内容提交到网页
+category: cross-app
+difficulty: hard
+environment:
+  apps_required: [TextEdit, Safari]
+  fixture_required: true
+  scratch_required: true
+instruction: |
+  第一步：用 TextEdit 新建文档，输入 "from textedit" 并保存到 {{SCRATCH}}/cross-01.txt。
+  第二步：打开 Safari，访问 http://127.0.0.1:8931/page/form （页面标题 "Form Page"），
+  在输入框中输入你在 TextEdit 里输入的文本（"from textedit"），点击 "Submit"。
+success_criteria:
+  - type: file_contains
+    path: "{{SCRATCH}}/cross-01.txt"
+    contains: from textedit
+  - type: http_check
+    task_key: form
+max_steps: 50
+max_duration_seconds: 900
+risk_level: low
+notes: 跨应用（TextEdit → Safari）携带文本。

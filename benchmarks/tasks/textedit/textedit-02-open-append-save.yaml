@@ -1,0 +1,22 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: textedit-02-open-append-save
+name: 打开文件追加内容并保存
+category: textedit
+difficulty: medium
+environment:
+  apps_required: [TextEdit, Finder]
+  scratch_required: true
+  initial_state: scripts/seed-textedit.sh
+instruction: |
+  用 TextEdit 打开 {{SCRATCH}}/textedit-02.txt，在文件末尾追加一行文本 "delta epsilon"，然后保存（Cmd+S）。
+success_criteria:
+  - type: file_contains
+    path: "{{SCRATCH}}/textedit-02.txt"
+    contains: alpha beta gamma
+  - type: file_contains
+    path: "{{SCRATCH}}/textedit-02.txt"
+    contains: delta epsilon
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+notes: 打开已有文件（可通过 Finder 或 TextEdit 打开对话框）、追加输入、保存。

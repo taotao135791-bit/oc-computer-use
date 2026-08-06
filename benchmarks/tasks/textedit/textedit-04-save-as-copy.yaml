@@ -1,0 +1,22 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: textedit-04-save-as-copy
+name: 另存为副本
+category: textedit
+difficulty: medium
+environment:
+  apps_required: [TextEdit, Finder]
+  scratch_required: true
+  initial_state: scripts/seed-textedit.sh
+instruction: |
+  用 TextEdit 打开 {{SCRATCH}}/textedit-04.txt，然后使用"另存为"（File > Save As…，Cmd+Shift+S）
+  把它保存为 {{SCRATCH}}/textedit-04-copy.txt。原文件内容不变。
+success_criteria:
+  - type: file_exists
+    path: "{{SCRATCH}}/textedit-04-copy.txt"
+  - type: file_contains
+    path: "{{SCRATCH}}/textedit-04-copy.txt"
+    contains: alpha beta gamma
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+notes: Save As 对话框的目录导航与文件名输入。

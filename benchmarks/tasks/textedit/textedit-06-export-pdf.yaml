@@ -1,0 +1,18 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: textedit-06-export-pdf
+name: 导出 PDF
+category: textedit
+difficulty: hard
+environment:
+  apps_required: [TextEdit]
+  scratch_required: true
+instruction: |
+  使用 TextEdit 新建文档，输入一行文本 "PDF export test"，然后通过
+  File > Export as PDF… 导出为 {{SCRATCH}}/textedit-06.pdf。
+success_criteria:
+  - type: file_exists
+    path: "{{SCRATCH}}/textedit-06.pdf"
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+notes: Export as PDF 对话框（与保存对话框不同的 UI）。

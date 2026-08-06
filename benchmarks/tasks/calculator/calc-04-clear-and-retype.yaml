@@ -1,0 +1,20 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: calc-04-clear-and-retype
+name: 清除后重新输入
+category: calculator
+difficulty: medium
+environment:
+  apps_required: [Calculator]
+  scratch_required: false
+instruction: |
+  打开"计算器"应用，先输入 1111，然后按 C（清除），再输入 2222。
+  计算器显示应只剩 2222。保持显示状态，不要清除。
+success_criteria:
+  - type: app_running
+    app: Calculator
+  - type: human_review
+    reason: 计算器显示 2222 且 1111 已被清除（通过 trace 截图确认）
+max_steps: 30
+max_duration_seconds: 600
+risk_level: low
+notes: 清除键（C）与重新输入。

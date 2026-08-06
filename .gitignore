@@ -21,3 +21,6 @@ trace-export*.json
 
 # Logs
 *.log
+
+# Packed package tarballs (build artifacts, never committed)
+*.tgz

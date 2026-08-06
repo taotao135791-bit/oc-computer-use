@@ -307,7 +307,15 @@ token from another session is `INVALID_OBSERVATION_TOKEN`; no token is
 per-session access manifest (`traces/<session_id>.manifest.json`, written
 0600 through the shared private-file API) recording only **hashes** of the
 issued tokens — plaintext tokens never touch disk, and a missing, corrupt,
-or symlinked manifest never grants access.
+or symlinked manifest never grants access. The traces directory is forced
+`0700` at recorder open so the manifest writer (which refuses directories
+with any group/other bits) always succeeds; the recorder opening a session
+in a non-private traces directory repairs the permissions first.
+
+Per-session forensics: `cu trace analyze <session-id> [--json]` reads the
+trace through `trace.export` (the pure read) and derives the aggregate
+metrics, failure category, and a compact timeline — the same numbers the
+benchmark report computes.
 
 | Method | Params | Result |
 |---|---|---|

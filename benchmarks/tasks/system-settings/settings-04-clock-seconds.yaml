@@ -1,0 +1,21 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: settings-04-clock-seconds
+name: 菜单栏时钟显示秒
+category: system-settings
+difficulty: hard
+environment:
+  apps_required: [System Settings]
+  scratch_required: false
+instruction: |
+  打开"系统设置"，进入"控制中心"面板，找到"时钟"选项，
+  打开"显示秒"开关（菜单栏时钟将显示秒数）。
+success_criteria:
+  - type: defaults_matches
+    defaults_domain: com.apple.menuextra.clock
+    defaults_key: ShowSeconds
+    defaults_expected: true
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+cleanup_script: scripts/cleanup-settings.sh
+notes: 菜单栏时钟显示秒（defaults com.apple.menuextra.clock ShowSeconds），可逆。

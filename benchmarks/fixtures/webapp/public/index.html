@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>CU Benchmark Home</title></head>
+<body>
+<h1>Computer Use Benchmark Home</h1>
+<p>This is the local benchmark fixture page.</p>
+<script>
+  fetch("/state", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task: "visited", value: true }) });
+</script>
+</body>
+</html>

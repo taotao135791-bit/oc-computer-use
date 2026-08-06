@@ -1,0 +1,28 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: textedit-05-multiline-document
+name: 创建多段文档
+category: textedit
+difficulty: easy
+environment:
+  apps_required: [TextEdit]
+  scratch_required: true
+instruction: |
+  使用 TextEdit 新建文档，输入三段文本，段与段之间用空行隔开：
+  第一段：Introduction
+  第二段：Main body paragraph
+  第三段：Conclusion
+  保存到 {{SCRATCH}}/textedit-05.txt。
+success_criteria:
+  - type: file_contains
+    path: "{{SCRATCH}}/textedit-05.txt"
+    contains: Introduction
+  - type: file_contains
+    path: "{{SCRATCH}}/textedit-05.txt"
+    contains: Main body paragraph
+  - type: file_contains
+    path: "{{SCRATCH}}/textedit-05.txt"
+    contains: Conclusion
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+notes: 多行输入与换行。

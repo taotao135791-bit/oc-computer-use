@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/result.schema.json",
+  "title": "Computer Use Benchmark Result",
+  "description": "One task run's outcome, recorded by the runner from the real session trace plus the evaluator's independent success check. The runner never asks the model whether it succeeded; success comes only from the evaluator (or an explicit human review).",
+  "type": "object",
+  "required": [
+    "run_id", "task_id", "harness", "model", "started_at", "completed_at",
+    "success", "partial_success", "total_steps", "observe_calls", "inspect_calls",
+    "action_batches", "total_actions", "stale_frame_count", "cancelled_request_count",
+    "timeout_count", "recovery_count", "user_takeover_count", "duration_ms",
+    "screenshot_bytes", "trace_id", "failure_category", "failure_detail",
+    "human_review_required"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "description": "Benchmark run id (date + suffix)." },
+    "task_id": { "type": "string" },
+    "harness": { "type": "string", "enum": ["opencode", "pi", "sdk", "manual"] },
+    "model": { "type": "string", "description": "Model id that drove the run (e.g. zhipuai/glm-4.6). Empty for harness=manual." },
+    "started_at": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": "string", "format": "date-time" },
+    "success": { "type": "boolean" },
+    "partial_success": { "type": "boolean" },
+    "total_steps": { "type": "integer", "description": "Observe/Act turns in the session." },
+    "observe_calls": { "type": "integer" },
+    "inspect_calls": { "type": "integer" },
+    "action_batches": { "type": "integer" },
+    "total_actions": { "type": "integer", "description": "Total actions across all batches." },
+    "stale_frame_count": { "type": "integer" },
+    "cancelled_request_count": { "type": "integer" },
+    "timeout_count": { "type": "integer" },
+    "recovery_count": { "type": "integer" },
+    "user_takeover_count": { "type": "integer" },
+    "duration_ms": { "type": "integer" },
+    "screenshot_bytes": { "type": "integer", "description": "Total bytes of screenshots delivered to the model (0 if the host hides them)." },
+    "trace_id": { "type": "string", "description": "Session id used for the run's trace (trace read requires the observation token, which the runner holds in memory only)." },
+    "failure_category": {
+      "type": "string",
+      "enum": [
+        "GROUNDING_MISS", "SMALL_TARGET_MISS", "STALE_FRAME_RECOVERY_FAILED",
+        "INPUT_FOCUS_LOST", "TEXT_INPUT_FAILED", "UNICODE_INPUT_FAILED",
+        "SCROLL_DIRECTION_ERROR", "DRAG_FAILED", "WINDOW_SWITCH_ERROR",
+        "APPLICATION_NOT_FOUND", "STATE_DETECTION_ERROR", "STABILIZER_TIMEOUT",
+        "ACTION_TIMEOUT", "CANCEL_FAILED", "SESSION_ERROR", "PERMISSION_ERROR",
+        "MODEL_PLANNING_ERROR", "MODEL_STOPPED_EARLY", "SUCCESS_VALIDATION_ERROR",
+        "HARNESS_INTEGRATION_ERROR", "UNKNOWN", "SUCCESS"
+      ],
+      "description": "SUCCESS when success=true. Otherwise: RUNTIME failures (GROUNDING_* through CANCEL_FAILED, SESSION_ERROR, PERMISSION_ERROR, HARNESS_INTEGRATION_ERROR) vs MODEL failures (MODEL_PLANNING_ERROR, MODEL_STOPPED_EARLY) vs harness/validation failures (SUCCESS_VALIDATION_ERROR, STATE_DETECTION_ERROR, STABILIZER_TIMEOUT, ACTION_TIMEOUT, APPLICATION_NOT_FOUND, WINDOW_SWITCH_ERROR). Category assignment rules in benchmarks/README.md."
+    },
+    "failure_detail": { "type": "string", "description": "Short human-readable root-cause excerpt (from the trace, never invented)." },
+    "human_review_required": { "type": "boolean", "description": "true when the task's criteria include human_review — the result still needs a human verdict (report lists these separately)." }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,23 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: textedit-03-find-replace
+name: 查找替换并保存
+category: textedit
+difficulty: medium
+environment:
+  apps_required: [TextEdit, Finder]
+  scratch_required: true
+  initial_state: scripts/seed-textedit.sh
+instruction: |
+  用 TextEdit 打开 {{SCRATCH}}/textedit-03.txt（内容为 "alpha beta gamma"）。
+  使用查找与替换（Edit > Find > Find and Replace，Cmd+F / Cmd+Option+F），把 "beta" 全部替换为 "BRAVO"，然后保存（Cmd+S）。
+success_criteria:
+  - type: file_contains
+    path: "{{SCRATCH}}/textedit-03.txt"
+    contains: alpha BRAVO gamma
+  - type: file_not_contains
+    path: "{{SCRATCH}}/textedit-03.txt"
+    contains: beta
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+notes: 菜单驱动的查找替换，验证替换确实写回文件。

@@ -1,0 +1,20 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: settings-03-about-panel
+name: 打开关于面板
+category: system-settings
+difficulty: easy
+environment:
+  apps_required: [System Settings]
+  scratch_required: false
+instruction: |
+  打开"系统设置"，进入"通用" > "关于本机" 面板（显示本机名称、芯片等信息）。
+  停留在这个面板上。
+success_criteria:
+  - type: app_running
+    app: System Settings
+  - type: human_review
+    reason: 打开"通用 > 关于本机"面板（通过 trace 截图确认面板正确显示本机信息）
+max_steps: 30
+max_duration_seconds: 600
+risk_level: low
+notes: 关于面板无外部可验证状态，人工复核 trace 截图确认。

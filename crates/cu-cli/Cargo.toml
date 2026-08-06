@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 cu-core = { path = "../cu-core" }
+cu-trace = { path = "../cu-trace" }
 cu-daemon = { path = "../cu-daemon" }
 serde = { workspace = true }
 serde_json = { workspace = true }

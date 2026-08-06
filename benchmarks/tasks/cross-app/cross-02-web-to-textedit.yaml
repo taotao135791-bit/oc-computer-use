@@ -1,0 +1,21 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: cross-02-web-to-textedit
+name: 网页文本抄写到文档
+category: cross-app
+difficulty: hard
+environment:
+  apps_required: [Safari, TextEdit]
+  fixture_required: true
+  scratch_required: true
+instruction: |
+  第一步：打开 Safari，访问 http://127.0.0.1:8931/page/text （页面标题 "Text Page"）。
+  页面中 <p id="payload"> 里有一句英文句子。
+  第二步：用 TextEdit 新建文档，把这句话完整输入进去，保存到 {{SCRATCH}}/cross-02.txt。
+success_criteria:
+  - type: file_contains
+    path: "{{SCRATCH}}/cross-02.txt"
+    contains: The quick brown fox jumps over the lazy dog.
+max_steps: 50
+max_duration_seconds: 900
+risk_level: low
+notes: 从网页读取内容并完整誊写（跨应用传递信息）。

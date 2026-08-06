@@ -1,0 +1,20 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: calc-03-percentage
+name: 百分比计算
+category: calculator
+difficulty: medium
+environment:
+  apps_required: [Calculator]
+  scratch_required: false
+instruction: |
+  打开"计算器"应用，输入 200 + 10%，按等号。结果应为 220
+  （200 加上 10% 的 200）。保持显示状态，不要清除。
+success_criteria:
+  - type: app_running
+    app: Calculator
+  - type: human_review
+    reason: 计算器显示结果 220（通过 trace 截图确认）
+max_steps: 30
+max_duration_seconds: 600
+risk_level: low
+notes: 百分比键的使用（% 键在键盘布局中的位置）。

@@ -1,0 +1,21 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: finder-04-duplicate-file
+name: 复制文件
+category: finder
+difficulty: medium
+environment:
+  apps_required: [Finder]
+  scratch_required: true
+  initial_state: scripts/seed-finder.sh
+instruction: |
+  打开 Finder 并导航到 {{SCRATCH}}，选中 old.txt，使用"复制"（File > Duplicate，Cmd+D）
+  创建副本。副本文件名通常为 "old copy.txt" 或 "old.txt copy"，把副本重命名为 copy.txt。
+success_criteria:
+  - type: file_exists
+    path: "{{SCRATCH}}/copy.txt"
+  - type: file_exists
+    path: "{{SCRATCH}}/old.txt"
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+notes: Cmd+D 复制 + 识别 macOS 的副本命名并重命名。

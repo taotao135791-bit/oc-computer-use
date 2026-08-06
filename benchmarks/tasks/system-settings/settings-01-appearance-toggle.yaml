@@ -1,0 +1,21 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: settings-01-appearance-toggle
+name: 切换深浅色外观
+category: system-settings
+difficulty: medium
+environment:
+  apps_required: [System Settings]
+  scratch_required: false
+  initial_state: scripts/seed-settings.sh
+instruction: |
+  打开"系统设置"，进入"外观"面板，把外观从浅色切换为深色。
+success_criteria:
+  - type: defaults_matches
+    defaults_domain: -g
+    defaults_key: AppleInterfaceStyle
+    defaults_expected: Dark
+risk_level: low
+cleanup_script: scripts/cleanup-settings.sh
+max_steps: 40
+max_duration_seconds: 600
+notes: seed 脚本保证初始为浅色（-g AppleInterfaceStyle 不存在），切换后为 Dark。

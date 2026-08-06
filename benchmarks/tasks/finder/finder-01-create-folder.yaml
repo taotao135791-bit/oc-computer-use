@@ -1,0 +1,18 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: finder-01-create-folder
+name: 新建文件夹
+category: finder
+difficulty: easy
+environment:
+  apps_required: [Finder]
+  scratch_required: true
+instruction: |
+  打开 Finder 并导航到 {{SCRATCH}}，使用"新建文件夹"（File > New Folder，Cmd+Shift+N）
+  创建一个名为 reports 的文件夹。
+success_criteria:
+  - type: dir_exists
+    path: "{{SCRATCH}}/reports"
+max_steps: 30
+max_duration_seconds: 600
+risk_level: low
+notes: Finder 导航（Cmd+Shift+G 或 Cmd+K）+ 新建文件夹快捷键。

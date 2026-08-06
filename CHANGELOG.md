@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.2.0-alpha.2 (2026-08-06) — release hardening + desktop benchmark
+
+### Security
+
+- **`trace.export` is a pure read.** The runtime never accepts a destination
+  path: `trace.export` returns the content plus its SHA-256 over the wire and
+  performs **no filesystem writes** — an observation-capable caller can no
+  longer create directories, overwrite files, or follow symlinks anywhere
+  through the runtime. Saving an export to a user-chosen path is the CLI's
+  job (`cu trace export --output <path>`), which refuses to overwrite an
+  existing file unless `--force` is given.
+- **Trace access manifests now actually persist across restarts.** The
+  traces directory is forced `0700` when the recorder opens a session
+  (`create_dir_all` previously left the umask's world-readable bits, so the
+  manifest writer — which refuses directories with any group/other bits —
+  always failed silently and every historical trace was unreadable after a
+  daemon restart). Regression-tested.
+
+### Observability
+
+- **`cu trace analyze <session-id> [--json]`**: per-session metrics (events,
+  actions by type, observe/screenshot bytes, stale rejections, cancellations,
+  timeouts, failure category from the documented taxonomy) plus a compact
+  timeline — reads through the pure `trace.export` path with the observation
+  credential.
+- **Richer trace events**: `act.stale_rejected` records the rejected frame
+  id and change score; `cancel` records scope and request id; `observe`
+  records `screenshot_bytes`; failed actions record their error detail.
+- Failure classification matches the runtime's real timeout wording
+  ("request timed out: …") in both the CLI and the benchmark runner.
+
+### Release
+
+- **Tag-triggered GitHub pre-release workflow** (`v*` tags): full gates →
+  dual-arch release build → universal tarball → protocol schema → checksums
+  → `gh release create --prerelease` with generated notes. All gates run
+  inside the workflow (smoke, cargo fmt/clippy/test, pnpm gates), so a
+  release that fails any gate is never created.
+- **`benchmarks/`**: repeatable macOS desktop benchmark — 30 tasks
+  (TextEdit / Finder / System Settings / Calculator / Safari / cross-app),
+  declarative evaluators only (filesystem, `defaults`, HTTP fixture, app
+  running state, human review), `cu-bench` runner (list / run / report /
+  compare / replay), local fixture web app, deterministic seed/cleanup
+  scripts. See [benchmarks/README.md](benchmarks/README.md).
+
 ## 0.2.0-alpha.1 (2026-08-05) — protocol v3: capability tokens
 
 ### Breaking changes

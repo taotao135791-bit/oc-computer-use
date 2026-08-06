@@ -1,0 +1,19 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: safari-02-click-button
+name: 点击页面按钮
+category: safari
+difficulty: easy
+environment:
+  apps_required: [Safari]
+  fixture_required: true
+  scratch_required: false
+instruction: |
+  打开 Safari，访问 http://127.0.0.1:8931/page/button （页面标题 "Button Page"）。
+  页面上有一个较大的按钮，文字为 "Click me"，点击它。
+success_criteria:
+  - type: http_check
+    task_key: clicked
+max_steps: 30
+max_duration_seconds: 600
+risk_level: low
+notes: 页面元素点击。

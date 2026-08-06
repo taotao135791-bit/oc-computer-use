@@ -1,0 +1,22 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: finder-05-show-hidden-files
+name: 切换显示隐藏文件
+category: finder
+difficulty: medium
+environment:
+  apps_required: [Finder]
+  scratch_required: true
+instruction: |
+  打开一个 Finder 窗口（任意目录），然后按 Cmd+Shift+. 切换"显示隐藏文件"。
+  切换后请确认 Finder 窗口中出现了隐藏文件（如 .DS_Store）。
+  最终状态：隐藏文件应该处于显示状态。
+success_criteria:
+  - type: defaults_matches
+    defaults_domain: com.apple.finder
+    defaults_key: AppleShowAllFiles
+    defaults_expected: true
+max_steps: 30
+max_duration_seconds: 600
+risk_level: low
+cleanup_script: scripts/cleanup-settings.sh
+notes: 快捷键切换 Finder 显示隐藏文件，用 defaults 验证系统状态。

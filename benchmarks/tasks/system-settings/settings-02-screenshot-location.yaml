@@ -1,0 +1,21 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: settings-02-screenshot-location
+name: 修改截屏保存位置
+category: system-settings
+difficulty: hard
+environment:
+  apps_required: [System Settings]
+  scratch_required: true
+instruction: |
+  打开"系统设置"，进入"屏幕录制"相关的设置入口（截屏设置）。
+  把"保存到"位置修改为 {{SCRATCH}}/screenshots。
+success_criteria:
+  - type: defaults_matches
+    defaults_domain: com.apple.screencapture
+    defaults_key: location
+    defaults_expected: "{{SCRATCH}}/screenshots"
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+cleanup_script: scripts/cleanup-settings.sh
+notes: 修改截屏存储位置（defaults com.apple.screencapture location），可逆。

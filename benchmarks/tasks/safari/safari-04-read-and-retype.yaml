@@ -1,0 +1,20 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: safari-04-read-and-retype
+name: 读取页面值并输入
+category: safari
+difficulty: hard
+environment:
+  apps_required: [Safari]
+  fixture_required: true
+  scratch_required: false
+instruction: |
+  打开 Safari，访问 http://127.0.0.1:8931/answer?value=fixture-answer-2026
+  （页面标题 "Answer"）。页面上 <p id="answer"> 里显示一个字符串。
+  把它完整地输入到同一页面的输入框中，然后点击 "Submit"。
+success_criteria:
+  - type: http_check
+    task_key: answer
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+notes: 读取页面内容 → 输入 → 提交；服务端验证输入值与页面值一致。

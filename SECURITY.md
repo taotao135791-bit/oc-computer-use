@@ -90,7 +90,11 @@ live daemon (`cargo test -p cu-daemon --test integration -- --ignored`).
   (`traces/<session_id>.manifest.json`) written via the shared private-file
   API (0600, atomic, symlink-refusing) recording only **SHA-256 hashes** of
   the issued tokens — plaintext tokens never touch disk, and a missing,
-  corrupt, oversized, or symlinked manifest never grants access.
+  corrupt, oversized, or symlinked manifest never grants access. The traces
+  directory itself is forced `0700` by the recorder, so the manifest writer
+  (which refuses directories with any group/other bits) always has a
+  writable target — without that, every manifest write fails silently and
+  restart-persistence of trace access is lost.
 - **`trace.export` is a pure read (round 7).** The runtime never accepts a
   destination path: export returns the content plus its SHA-256 over the
   wire and performs **no filesystem writes**, so an observation-capable

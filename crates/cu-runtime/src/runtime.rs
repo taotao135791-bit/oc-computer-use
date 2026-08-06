@@ -199,13 +199,21 @@ impl Runtime {
     /// operation and must not be triggerable by a session-id-only caller —
     /// and refuses stopped sessions (`SESSION_STOPPED`): a stopped session's
     /// token no longer grants anything.
-    pub fn cancel_in_flight(
+    ///
+    /// Records a `cancel` trace event so reports can measure cancel latency
+    /// (the event timestamp vs. the cancelled batch's final action).
+    pub async fn cancel_in_flight(
         &self,
         session_id: &str,
         control_token: Option<&str>,
     ) -> Result<(), CuError> {
         let session = self.get_session(session_id)?;
         self.verify_mutating(&session, control_token)?;
+        if let Some(t) = session.trace.as_ref() {
+            let _ = t
+                .record_event("cancel", serde_json::json!({ "scope": "session" }))
+                .await;
+        }
         session.cancel_in_flight();
         Ok(())
     }
@@ -217,7 +225,7 @@ impl Runtime {
     /// Returns `Ok(true)` when a live request was cancelled, `Ok(false)` when
     /// no such request was registered (already finished, or it will be
     /// cancelled at registration via the tombstone path).
-    pub fn cancel_request(
+    pub async fn cancel_request(
         &self,
         key: &RequestKey,
         session_id: &str,
@@ -225,6 +233,14 @@ impl Runtime {
     ) -> Result<bool, CuError> {
         let session = self.get_session(session_id)?;
         self.verify_mutating(&session, control_token)?;
+        if let Some(t) = session.trace.as_ref() {
+            let _ = t
+                .record_event(
+                    "cancel",
+                    serde_json::json!({ "scope": "request", "request_id": key.request_id }),
+                )
+                .await;
+        }
         self.requests.cancel(key, session_id)
     }
 
@@ -745,6 +761,7 @@ impl Runtime {
                     captured.width,
                     captured.height,
                     &display_id,
+                    captured.image_bytes.len() as u64,
                 )
                 .await;
         }
@@ -888,6 +905,20 @@ impl Runtime {
             &current_frame_id,
         );
         if verdict.is_stale {
+            // Record the rejection so benchmark reports can count stale
+            // frames from the trace (the batch never runs, so no action
+            // event would otherwise exist).
+            if let Some(t) = session.trace.as_ref() {
+                let _ = t
+                    .record_event(
+                        "act.stale_rejected",
+                        serde_json::json!({
+                            "frame_id": params.frame_id,
+                            "change_score": verdict.change_score,
+                        }),
+                    )
+                    .await;
+            }
             return Err(self.stale.to_error(&verdict));
         }
 
@@ -1345,6 +1376,8 @@ mod tests {
     struct FakeDriver {
         pub pointer: std::sync::Mutex<Point>,
         pub executes: std::sync::atomic::AtomicUsize,
+        /// When set, the next execute() fails (failure-path trace tests).
+        pub fail_next: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -1419,6 +1452,12 @@ mod tests {
         ) -> Result<cu_driver::ActionResult, CuError> {
             self.executes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CuError::Driver("injected failure".into()));
+            }
             if let cu_driver::ResolvedAction::Move { to, .. } = action {
                 *self.pointer.lock().unwrap() = *to;
             }
@@ -1799,6 +1838,133 @@ mod tests {
         rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
     }
 
+    /// The trace must carry the data benchmark reports are built from: the
+    /// stale rejection event (which otherwise has no trace record at all),
+    /// the cancel event, and the observe screenshot byte count.
+    #[tokio::test]
+    async fn trace_records_stale_rejection_cancel_and_screenshot_bytes() {
+        let rt = runtime().await;
+        let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    include_image: Some(true),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Age the referenced snapshot so the backstop trips.
+        {
+            let mut store = rt.frames.lock().unwrap();
+            let sf = store.get_mut(&obs.frame_id).unwrap();
+            sf.snapshot.captured_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        }
+        let err = rt
+            .act(
+                wait_params(&s.session_id, &obs.frame_id, Some(token.clone())),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::StaleFrame);
+
+        // Cancel (no in-flight batch is fine — the event must still record).
+        rt.cancel_in_flight(&s.session_id, Some(&token))
+            .await
+            .unwrap();
+
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
+        let trace_path = rt.config.traces_dir.join(format!("{}.jsonl", s.session_id));
+        let content = std::fs::read_to_string(&trace_path).unwrap();
+        assert!(
+            content.contains("\"event\":\"act.stale_rejected\""),
+            "stale rejection must be recorded in the trace:\n{}",
+            content
+        );
+        assert!(
+            content.contains("\"event\":\"cancel\""),
+            "cancel must be recorded in the trace:\n{}",
+            content
+        );
+        assert!(
+            content.contains("\"screenshot_bytes\":"),
+            "observe must record the screenshot byte count:\n{}",
+            content
+        );
+    }
+
+    /// A failed action's detail string must ride into the trace (the
+    /// benchmark failure taxonomy is derived from these details).
+    #[tokio::test]
+    async fn action_failure_detail_is_recorded_in_trace() {
+        let (rt, driver) = runtime_with_driver().await;
+        let s = rt.session_start(None, test_client()).await.unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        driver
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let res = rt
+            .act(
+                ActParams {
+                    session_id: s.session_id.clone(),
+                    frame_id: obs.frame_id.clone(),
+                    actions: vec![ComputerAction::Click {
+                        x: 100.0,
+                        y: 100.0,
+                        button: cu_core::MouseButton::Left,
+                        coordinate_space: CoordinateSpace::Normalized1000,
+                    }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token.clone()),
+                },
+                None,
+            )
+            .await;
+        assert!(
+            res.is_ok(),
+            "per-action failures surface as batch reports, not errors"
+        );
+        let report = res.unwrap();
+        assert_eq!(report.action_results[0].status, "failed");
+
+        rt.session_stop(&s.session_id, Some(&token)).await.unwrap();
+        let trace_path = rt.config.traces_dir.join(format!("{}.jsonl", s.session_id));
+        let content = std::fs::read_to_string(&trace_path).unwrap();
+        assert!(
+            content.contains("\"status\":\"failed\"") && content.contains("injected failure"),
+            "action trace entry must carry status + failure detail:\n{}",
+            content
+        );
+    }
+
     #[tokio::test]
     async fn act_strict_policy_rejects_older_frames() {
         // Default policy is Strict: only the session's current frame is
@@ -2166,7 +2332,9 @@ mod tests {
         });
         // Let the first action run and the wait begin, then cancel.
         tokio::time::sleep(Duration::from_millis(120)).await;
-        rt.cancel_in_flight(&s.session_id, Some(&token)).unwrap();
+        rt.cancel_in_flight(&s.session_id, Some(&token))
+            .await
+            .unwrap();
         let started = Instant::now();
         let res = handle.await.unwrap().unwrap();
         let elapsed = started.elapsed();
@@ -2235,7 +2403,9 @@ mod tests {
             .await
         });
         tokio::time::sleep(Duration::from_millis(150)).await;
-        rt.cancel_in_flight(&s.session_id, Some(&token)).unwrap();
+        rt.cancel_in_flight(&s.session_id, Some(&token))
+            .await
+            .unwrap();
         let started = Instant::now();
         let err = handle.await.unwrap().unwrap_err();
         assert!(
@@ -2413,7 +2583,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ControlTokenRequired);
-        assert!(rt.cancel_in_flight(&sid, None).is_err());
+        assert!(rt.cancel_in_flight(&sid, None).await.is_err());
 
         // No side effects: session still Active, nothing reached the driver,
         // nothing was cancelled.
@@ -2500,7 +2670,7 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.code(), ErrorCode::ControlTokenRequired);
         }
-        assert!(rt.cancel_in_flight(&sid, None).is_err());
+        assert!(rt.cancel_in_flight(&sid, None).await.is_err());
 
         // The owner's session is untouched and still controllable.
         let st = rt.session_status(&sid, None, Some(&token)).await.unwrap();
@@ -2582,6 +2752,7 @@ mod tests {
                 &sid,
                 Some(&token),
             )
+            .await
             .unwrap());
         let started = Instant::now();
         let a_result = a.await.unwrap().unwrap();
@@ -2612,6 +2783,7 @@ mod tests {
                 &sid,
                 None
             )
+            .await
             .is_err());
         assert!(!rt
             .cancel_request(
@@ -2622,6 +2794,7 @@ mod tests {
                 &sid,
                 Some(&token),
             )
+            .await
             .unwrap());
         rt.session_stop(&sid, Some(&token)).await.unwrap();
     }
@@ -2687,7 +2860,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::SessionStopped);
-        assert!(rt.cancel_in_flight(&sid, Some(&token)).is_err());
+        assert!(rt.cancel_in_flight(&sid, Some(&token)).await.is_err());
 
         // Stop stays idempotent with the token.
         let again = rt.session_stop(&sid, Some(&token)).await.unwrap();

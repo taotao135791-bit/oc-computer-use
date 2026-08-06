@@ -167,10 +167,20 @@ impl<'a> ActionQueue<'a> {
             }
 
             if let Some(t) = trace {
-                let result_json = serde_json::json!({
+                // Failure detail rides along with the status so benchmark
+                // reports can classify failures from the trace alone (e.g.
+                // a driver "permission denied" vs a "window not found").
+                let error_detail = reports
+                    .last()
+                    .and_then(|r| r.error.clone())
+                    .filter(|e| !e.is_empty());
+                let mut result_json = serde_json::json!({
                     "status": reports.last().map(|r| &r.status).cloned().unwrap_or_else(|| "unknown".into()),
                     "duration_ms": duration_ms,
                 });
+                if let Some(detail) = error_detail {
+                    result_json["error"] = serde_json::json!(detail);
+                }
                 // Required mode propagates trace-write failures (the batch
                 // fails); best-effort mode degrades inside the recorder.
                 t.record_action(

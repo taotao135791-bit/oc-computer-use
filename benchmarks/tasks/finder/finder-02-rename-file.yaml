@@ -1,0 +1,21 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: finder-02-rename-file
+name: 重命名文件
+category: finder
+difficulty: medium
+environment:
+  apps_required: [Finder]
+  scratch_required: true
+  initial_state: scripts/seed-finder.sh
+instruction: |
+  打开 Finder 并导航到 {{SCRATCH}}，把文件 old.txt 重命名为 new.txt
+  （选中文件后按回车，或使用 File > Rename…）。
+success_criteria:
+  - type: file_exists
+    path: "{{SCRATCH}}/new.txt"
+  - type: file_absent
+    path: "{{SCRATCH}}/old.txt"
+max_steps: 30
+max_duration_seconds: 600
+risk_level: low
+notes: 行内重命名输入。

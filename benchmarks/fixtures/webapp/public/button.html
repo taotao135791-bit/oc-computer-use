@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Button</title></head>
+<body>
+<h1>Button Page</h1>
+<p id="hint">Click the button below.</p>
+<button id="target" style="padding: 12px 32px; font-size: 18px;">Click me</button>
+<script>
+  document.getElementById("target").addEventListener("click", () => {
+    fetch("/state", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "clicked", value: true }) });
+  });
+</script>
+</body>
+</html>

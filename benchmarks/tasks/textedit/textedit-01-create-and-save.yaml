@@ -1,0 +1,24 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: textedit-01-create-and-save
+name: 新建文档并保存
+category: textedit
+difficulty: easy
+environment:
+  apps_required: [TextEdit]
+  scratch_required: true
+instruction: |
+  请使用 TextEdit 新建一个文档，输入以下两行文本（不含引号）：
+  "The quick brown fox"
+  "jumps over the lazy dog"
+  然后保存到 {{SCRATCH}}/textedit-01.txt。
+success_criteria:
+  - type: file_contains
+    path: "{{SCRATCH}}/textedit-01.txt"
+    contains: The quick brown fox
+  - type: file_contains
+    path: "{{SCRATCH}}/textedit-01.txt"
+    contains: jumps over the lazy dog
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+notes: 基础的文档创建、文本输入、保存对话框导航。

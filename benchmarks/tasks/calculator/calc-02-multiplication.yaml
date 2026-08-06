@@ -1,0 +1,20 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: calc-02-multiplication
+name: 乘法
+category: calculator
+difficulty: easy
+environment:
+  apps_required: [Calculator]
+  scratch_required: false
+instruction: |
+  打开"计算器"应用，计算 123 × 45，按等号。把结果（应为 5535）显示在计算器上，
+  保持显示状态，不要清除。
+success_criteria:
+  - type: app_running
+    app: Calculator
+  - type: human_review
+    reason: 计算器显示结果 5535（通过 trace 截图确认）
+max_steps: 30
+max_duration_seconds: 600
+risk_level: low
+notes: 多位数乘法输入。

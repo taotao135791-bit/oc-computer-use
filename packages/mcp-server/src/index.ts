@@ -10,6 +10,10 @@
 // Config via environment:
 //   COMPUTER_USE_SOCKET   — daemon socket path (default ~/.computer-use/runtime.sock)
 
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -132,6 +136,44 @@ export function createComputerUseServer(
     return lazyClient;
   }
 
+  /**
+   * Persist the tokens issued by a `start` response to the same 0600
+   * credential store the CLI uses (`~/.local/state/oc-computer-use/credentials/<sid>.json`).
+   * The daemon issues the tokens exactly once; the benchmark runner and any
+   * later CLI read the session's trace through this record (same-UID, mode
+   * 0600, never printed). Without it, traces of MCP-driven sessions were
+   * unreadable — the runner could not tell which credential authorized the
+   * session. Failures are non-fatal: the session still works; trace reads
+   * just fall back to the CLI-created record.
+   */
+  function persistCredential(result: SessionResult, clientInstanceId: string): void {
+    try {
+      if (!result.session_id || !result.control_token) return;
+      const dir = join(homedir(), ".local", "state", "oc-computer-use", "credentials");
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      chmodSync(dir, 0o700);
+      const file = join(dir, `${result.session_id}.json`);
+      writeFileSync(
+        file,
+        JSON.stringify(
+          {
+            session_id: result.session_id,
+            control_token: result.control_token,
+            observation_token: result.observation_token ?? "",
+            client_instance_id: clientInstanceId,
+            created_at: result.created_at,
+            format_version: 1,
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      chmodSync(file, 0o600);
+    } catch {
+      /* non-fatal: see doc comment */
+    }
+  }
+
   if (stopOwnedSessionOnExit) {
     // Best-effort cleanup on termination: stop only the session this server
     // owns. `computer_cancel`/stop requests from other clients never touch
@@ -189,7 +231,10 @@ export function createComputerUseServer(
         const result = await c.session(action, { session_id, display_id });
         // Ownership follows the token: the daemon issued one in this response,
         // so this server is the owner and may (should) stop it on exit.
-        if (action === "start" && result.control_token) ownsSession = true;
+        if (action === "start" && result.control_token) {
+          ownsSession = true;
+          persistCredential(result, MCP_CLIENT_INFO.client_instance_id);
+        }
         if (action === "stop" && ownsSession) ownsSession = false;
         return { content: [textBlock(sessionSummary(result))] };
       } catch (err) {

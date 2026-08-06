@@ -1,0 +1,25 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: finder-03-move-file
+name: 移动文件到子文件夹
+category: finder
+difficulty: hard
+environment:
+  apps_required: [Finder]
+  scratch_required: true
+  initial_state: scripts/seed-finder.sh
+instruction: |
+  打开 Finder 并导航到 {{SCRATCH}}。先把 data 文件夹里的 item.txt 文件
+  移动到 {{SCRATCH}} 根目录下，再把 {{SCRATCH}} 下的 old.txt 移动到 data 文件夹里。
+success_criteria:
+  - type: file_exists
+    path: "{{SCRATCH}}/item.txt"
+  - type: file_absent
+    path: "{{SCRATCH}}/data/item.txt"
+  - type: file_exists
+    path: "{{SCRATCH}}/data/old.txt"
+  - type: file_absent
+    path: "{{SCRATCH}}/old.txt"
+max_steps: 40
+max_duration_seconds: 600
+risk_level: low
+notes: 拖拽移动 + 两个方向的移动，验证目标位置。

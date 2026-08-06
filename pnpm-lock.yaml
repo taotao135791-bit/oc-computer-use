@@ -18,6 +18,15 @@ importers:
         specifier: workspace:*
         version: link:../../packages/sdk-typescript
 
+  benchmarks/runner:
+    dependencies:
+      '@computer-use/sdk':
+        specifier: workspace:*
+        version: link:../../packages/sdk-typescript
+      yaml:
+        specifier: ^2.7.1
+        version: 2.9.0
+
   packages/mcp-server:
     dependencies:
       '@computer-use/sdk':

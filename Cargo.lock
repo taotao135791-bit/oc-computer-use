@@ -311,6 +311,7 @@ dependencies = [
  "clap",
  "cu-core",
  "cu-daemon",
+ "cu-trace",
  "dirs",
  "libc",
  "serde",

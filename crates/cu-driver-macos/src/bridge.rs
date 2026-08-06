@@ -92,6 +92,13 @@ impl Bridge {
         match result {
             Ok(v) => Ok(v),
             Err(e) if e.code() == ErrorCode::DriverError => {
+                // Kill and reap the old bridge before respawning: dropping the
+                // Child handle alone orphans it (a bridge wedged inside a
+                // capture never returns to its readLine loop, so it survives
+                // the daemon — real captures showed one orphan per timeout).
+                if let Some(mut old) = guard.take() {
+                    reap_bridge(&mut old);
+                }
                 *guard = Some(spawn(&binary)?);
                 try_request(guard.as_mut().unwrap(), &payload)
             }
@@ -234,6 +241,14 @@ fn extract_payload(value: &Value) -> Value {
         obj.remove("error");
     }
     payload
+}
+
+/// Kill and reap a bridge process. `Child` only kills on drop when
+/// `kill_on_drop` is set (it isn't here), so without this a wedged bridge
+/// becomes an orphan — one leaked process per timed-out request.
+fn reap_bridge(bp: &mut BridgeProcess) {
+    let _ = bp.child.kill();
+    let _ = bp.child.wait();
 }
 
 fn spawn(binary: &str) -> Result<BridgeProcess, CuError> {
@@ -435,6 +450,38 @@ mod tests {
                 "odd candidate: {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn reap_bridge_kills_and_waits() {
+        // Regression: the respawn path used to drop the wedged bridge's
+        // Child handle, orphaning it (one leaked cubridge per capture
+        // timeout). Reaping must kill and wait the process.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut bp = BridgeProcess {
+            child,
+            stdin,
+            stdout,
+        };
+        reap_bridge(&mut bp);
+        // The pid must be gone (kill -0 fails after the process was reaped).
+        let probe = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .unwrap();
+        assert!(!probe.success(), "reaped bridge pid {pid} is still alive");
+        // Idempotent.
+        reap_bridge(&mut bp);
     }
 
     #[test]

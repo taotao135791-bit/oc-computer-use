@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Form</title></head>
+<body>
+<h1>Form Page</h1>
+<p>Type the requested text and press Submit.</p>
+<input id="text" placeholder="text">
+<button id="submit">Submit</button>
+<script>
+  document.getElementById("submit").addEventListener("click", () => {
+    const v = document.getElementById("text").value;
+    fetch("/state", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "form", value: v }) });
+  });
+</script>
+</body>
+</html>

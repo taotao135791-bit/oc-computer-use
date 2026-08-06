@@ -11,6 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use std::os::unix::fs::PermissionsExt;
+
 use chrono::Utc;
 use cu_core::{actions::RedactedText, ComputerAction, CuError, TraceEntry};
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -77,6 +79,13 @@ impl TraceRecorder {
         tokio::fs::create_dir_all(traces_dir)
             .await
             .map_err(|e| CuError::Trace(format!("cannot create trace dir: {e}")))?;
+        // Traces must live under a private directory: the access manifest
+        // (`manifest::write_manifest`) refuses directories with any
+        // group/other bits, so force 0700 here too (create_dir_all applies
+        // the umask, which would otherwise leave the dir world-readable).
+        tokio::fs::set_permissions(traces_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| CuError::Trace(format!("cannot secure trace dir: {e}")))?;
         let path = traces_dir.join(format!("{session_id}.jsonl"));
         let file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -243,7 +252,9 @@ impl TraceRecorder {
         .await
     }
 
-    /// Record an observe call.
+    /// Record an observe call. `screenshot_bytes` is the size of the image
+    /// delivered to the caller, so benchmark reports can cost the
+    /// screenshot pipeline from the trace alone.
     pub async fn record_observe(
         &self,
         request_id: Option<String>,
@@ -251,6 +262,7 @@ impl TraceRecorder {
         width: u32,
         height: u32,
         display_id: &str,
+        screenshot_bytes: u64,
     ) -> Result<(), CuError> {
         self.append(TraceEntry {
             seq: 0,
@@ -260,9 +272,12 @@ impl TraceRecorder {
             request_id,
             frame_id: Some(frame_id.to_string()),
             action: None,
-            result: Some(
-                serde_json::json!({ "width": width, "height": height, "display_id": display_id }),
-            ),
+            result: Some(serde_json::json!({
+                "width": width,
+                "height": height,
+                "display_id": display_id,
+                "screenshot_bytes": screenshot_bytes,
+            })),
             duration_ms: None,
             error: None,
             change_score: None,
@@ -292,6 +307,36 @@ impl TraceRecorder {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn recorder_secures_traces_dir_0700() {
+        // Regression: the access manifest refuses directories with any
+        // group/other bits — if the recorder left the traces dir
+        // world-readable (umask), manifest writes would always fail and
+        // restart-persistence would be silently lost. Opening a recorder
+        // must force 0700 on the traces directory itself.
+        let dir = tempdir().unwrap();
+        let traces = dir.path().join("traces");
+        TraceRecorder::open("s_test", &traces, TraceConfig::default())
+            .await
+            .unwrap();
+        let meta = std::fs::metadata(&traces).unwrap();
+        let mode = meta.permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "traces dir must have no group/other bits (got {mode:o})"
+        );
+        // And the manifest writer must now succeed against that dir.
+        let ctl_hash = cu_core::security::SecretTokenHash::from_token(
+            &cu_core::security::generate_control_token(),
+        );
+        let obs_hash = cu_core::security::SecretTokenHash::from_token(
+            &cu_core::security::generate_observation_token(),
+        );
+        crate::manifest::write_manifest(&traces, "s_test", &ctl_hash, &obs_hash).unwrap();
+        assert!(crate::manifest::manifest_path(&traces, "s_test").exists());
+    }
 
     #[tokio::test]
     async fn recorder_writes_jsonl_and_redacts() {

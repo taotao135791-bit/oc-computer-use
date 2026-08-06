@@ -1,0 +1,14 @@
+{
+  "name": "cu-bench",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Computer Use Benchmark runner: list / run / replay / report / compare against the real macOS runtime",
+  "bin": {
+    "cu-bench": "cu-bench.mjs"
+  },
+  "dependencies": {
+    "@computer-use/sdk": "workspace:*",
+    "yaml": "^2.7.1"
+  }
+}

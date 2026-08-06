@@ -269,17 +269,22 @@ pub async fn dispatch(
             };
             let cancelled = match &p.request_id {
                 // Precise cancel: exactly one request on *this* connection.
-                Some(rid) => runtime.cancel_request(
-                    &RequestKey {
-                        connection_id,
-                        request_id: rid.clone(),
-                    },
-                    &p.session_id,
-                    p.control_token.as_deref(),
-                ),
+                Some(rid) => {
+                    runtime
+                        .cancel_request(
+                            &RequestKey {
+                                connection_id,
+                                request_id: rid.clone(),
+                            },
+                            &p.session_id,
+                            p.control_token.as_deref(),
+                        )
+                        .await
+                }
                 // Session-wide cancel (still token-verified).
                 None => runtime
                     .cancel_in_flight(&p.session_id, p.control_token.as_deref())
+                    .await
                     .map(|()| true),
             };
             match cancelled {

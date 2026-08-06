@@ -1,0 +1,24 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: cross-03-finder-open-in-textedit
+name: Finder 打开文件并在 TextEdit 追加
+category: cross-app
+difficulty: hard
+environment:
+  apps_required: [Finder, TextEdit]
+  scratch_required: true
+  initial_state: scripts/seed-cross.sh
+instruction: |
+  {{SCRATCH}}/cross-03-input.txt 是一个已存在的文件（内容为 "hello from the seed file"）。
+  请用 TextEdit 打开它（可以通过 Finder 找到文件并用"打开方式"，或直接在 TextEdit 中打开），
+  在末尾追加一行 "appended by agent"，然后保存。
+success_criteria:
+  - type: file_contains
+    path: "{{SCRATCH}}/cross-03-input.txt"
+    contains: hello from the seed file
+  - type: file_contains
+    path: "{{SCRATCH}}/cross-03-input.txt"
+    contains: appended by agent
+max_steps: 50
+max_duration_seconds: 900
+risk_level: low
+notes: 文件系统（Finder）→ 编辑器（TextEdit）的打开链路。

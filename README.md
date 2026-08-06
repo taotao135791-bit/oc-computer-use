@@ -54,7 +54,7 @@ cu observe --include-image --image-out /tmp/screen.jpg   # first observe auto-cr
 cu move 500 400
 cu click 500 400
 cu type "hello"            # text is redacted in traces
-cu session stop            # only the client that started the session may stop it
+cu session stop            # only a client holding the session's control token may stop it
 ```
 
 **Sessions are created on first use.** The first `observe`/`act` from any
@@ -62,10 +62,12 @@ client auto-starts a session when none is active (the CLI resolves the active
 session first and only starts when the daemon reports `SESSION_NOT_FOUND`).
 The daemon records **who** started it — every client sends its identity
 (`client_id` / `client_name` / `client_instance_id`) with `session start`, and
-`session status` returns the owner. Ownership matters: a session may be
-stopped by the client that created it (a second client trying to use it gets
-`CONTROL_LOCKED` under the default policy — see the Pi extension's
-`COMPUTER_USE_EXISTING_SESSION_POLICY`).
+`session status` returns the owner. Access control is capability-based, not
+identity-based: only a client holding the session's **control token** can
+stop or take over the session; mutating operations require the control token,
+and sensitive reads require the observation token (a second client trying to
+use the session without one gets `CONTROL_LOCKED` under the default policy —
+see the Pi extension's `COMPUTER_USE_EXISTING_SESSION_POLICY`).
 
 Type actions are **redacted by default**: traces record `text_redacted: true`
 and a character count, never the text itself. To log full text (e.g. a
@@ -97,10 +99,11 @@ not by the client, so every adapter gets the same guarantees.
   an *adapter* convenience (SDK/CLI/MCP/Pi resolve `status` first and start
   only on `SESSION_NOT_FOUND`) — the raw `computer.observe` / `computer.act`
   methods never create a session. The creator is recorded as the session's
-  **owner** and is the only client that stops it. A session owned by another
-  client is refused with `CONTROL_LOCKED`. Every observe/act carries a
-  `session_id`. Actions on a stale, paused, taken-over, or stopped session
-  are rejected with a specific error code.
+  **owner** for diagnostics; access is capability-based — only a client
+  holding the session's control token may stop or take it over, and a client
+  without a valid token is refused with `CONTROL_LOCKED`. Every observe/act
+  carries a `session_id`. Actions on a stale, paused, taken-over, or stopped
+  session are rejected with a specific error code.
 - **Capability tokens**: `session start` returns a session's **two tokens
   exactly once** (each 256-bit CSPRNG): an `observation_token` for sensitive
   reads and a `control_token` for mutating operations (which also opens
@@ -185,10 +188,32 @@ the trace cannot be recorded), or `disabled` (no recorder).
 └── daemon.log
 ```
 
+## Benchmark
+
+A repeatable macOS desktop task benchmark (`cu-bench`, 30 tasks across
+TextEdit / Finder / System Settings / Calculator / Safari / cross-app) runs a
+real model host against the real desktop and judges each task only through
+declarative evaluators — see [benchmarks/README.md](benchmarks/README.md).
+Results are never hand-edited; traces are read with the observation token
+and failure categories come from the trace events alone.
+
+```bash
+node benchmarks/runner/cu-bench.mjs list               # the 30 tasks
+node benchmarks/runner/cu-bench.mjs run --suite smoke  # 10-task smoke suite
+node benchmarks/runner/cu-bench.mjs report             # summary/failures/metrics
+```
+
+Per-session forensics without a browser:
+
+```bash
+cu trace analyze <session-id>            # metrics + failure category + timeline
+cu trace analyze <session-id> --json     # full structured analysis
+```
+
 ## Tests
 
 ```bash
-cargo test --workspace                    # 238 tests (Rust: core, driver, runtime, daemon protocol, ownership matrix)
+cargo test --workspace                    # Rust: core, driver, runtime, daemon protocol, ownership matrix, trace analysis
 cargo test -p cu-daemon --test integration -- --ignored   # live security-matrix test
 pnpm install && pnpm -r build && pnpm -r test             # SDK / Pi / OpenCode adapter / MCP suites
 pnpm run ci                               # the full TypeScript gate in one command:

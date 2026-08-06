@@ -57,16 +57,24 @@ pub struct PrivateFileMetadata {
     pub mode: u32,
 }
 
-/// The uid private files must belong to. A test-only seam lets the owner-mismatch
-/// path be exercised without root (see the module tests); production always
-/// returns the real effective uid.
+// The uid private files must belong to. A test-only seam lets the
+// owner-mismatch path be exercised without root (see the module tests);
+// production always returns the real effective uid.
+//
+// Thread-local, not process-global: the seam's only caller sets it and
+// exercises the checks on the same thread, and a process-wide override
+// leaked into concurrently-running tests in other modules (they serialize
+// on their own locks, not ours) — e.g. `security.rs` — making them refuse
+// their own freshly-created directories as "foreign-owned".
 #[cfg(test)]
-static UID_OVERRIDE: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+thread_local! {
+    static UID_OVERRIDE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
 
 fn current_uid() -> u32 {
     #[cfg(test)]
     {
-        if let Some(uid) = *UID_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) {
+        if let Some(uid) = UID_OVERRIDE.with(|c| c.get()) {
             return uid;
         }
     }
@@ -78,7 +86,7 @@ fn current_uid() -> u32 {
 /// testable. `None` restores the real effective uid.
 #[cfg(test)]
 fn set_test_uid(uid: u32) {
-    *UID_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) = Some(uid);
+    UID_OVERRIDE.with(|c| c.set(Some(uid)));
 }
 
 /// Create `path` (and its parents) as a private directory and validate it:

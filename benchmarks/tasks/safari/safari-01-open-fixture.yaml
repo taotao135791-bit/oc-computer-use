@@ -1,0 +1,19 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: safari-01-open-fixture
+name: 打开本地网页
+category: safari
+difficulty: easy
+environment:
+  apps_required: [Safari]
+  fixture_required: true
+  scratch_required: false
+instruction: |
+  打开 Safari，访问 http://127.0.0.1:8931/ （本机的一个测试网页，标题为
+  "CU Benchmark Home"）。停留在这个页面。
+success_criteria:
+  - type: http_check
+    task_key: visited
+max_steps: 30
+max_duration_seconds: 600
+risk_level: low
+notes: 地址栏输入 URL 并访问；页面加载即上报 visited 状态。

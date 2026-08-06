@@ -20,7 +20,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import assert from "node:assert/strict";
 
 const ROOT = join(import.meta.dirname ?? new URL(".", import.meta.url).pathname, "..");
-const DIST = join(ROOT, "packages", "pi-extension", "dist", "index.js");
+const DIST = process.env.PI_EXTENSION_INDEX ?? join(ROOT, "packages", "pi-extension", "dist", "index.js");
 const CU = join(ROOT, "target", "release", "cu");
 
 const results = [];

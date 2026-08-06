@@ -1,0 +1,24 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: cross-05-copy-paste-across-apps
+name: 跨应用复制粘贴
+category: cross-app
+difficulty: hard
+environment:
+  apps_required: [TextEdit, Safari]
+  fixture_required: true
+  scratch_required: true
+instruction: |
+  第一步：用 TextEdit 新建文档，输入 "pasted from textedit"。
+  全选（Cmd+A）并复制（Cmd+C）。
+  第二步：打开 Safari，访问 http://127.0.0.1:8931/page/form，在输入框中粘贴（Cmd+V），点击 "Submit"。
+  第三步：回到 TextEdit，把文档保存到 {{SCRATCH}}/cross-05.txt。
+success_criteria:
+  - type: file_contains
+    path: "{{SCRATCH}}/cross-05.txt"
+    contains: pasted from textedit
+  - type: http_check
+    task_key: form
+max_steps: 60
+max_duration_seconds: 900
+risk_level: low
+notes: 剪贴板跨应用传递（Cmd+C / Cmd+V）。

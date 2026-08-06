@@ -6,6 +6,7 @@
 //! machine-readable output.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
@@ -326,6 +327,15 @@ enum TraceAction {
     },
     /// Re-run the actions recorded in a trace on the live desktop.
     Replay { session_id: String },
+    /// Derive per-session metrics and a failure category from a trace
+    /// (timeline, aggregates, classification — the same numbers the
+    /// benchmark report computes). Reads via trace.export (a pure read).
+    Analyze {
+        session_id: String,
+        /// Print the full analysis as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +344,29 @@ enum TraceAction {
 
 #[tokio::main]
 async fn main() {
+    // Signal-driven cleanup: a one-shot command that auto-started its session
+    // stops it before exit, so it never leaves a control-locked session
+    // behind (observed in the wild: a `cu observe` left the daemon's control
+    // lock held, and every later `session start` failed with CONTROL_LOCKED —
+    // the MCP server already had this behavior; the CLI matched it).
+    // `cu daemon run` is excluded: it owns no session, and it must keep its
+    // own SIGTERM handling (a competing watcher would race its shutdown).
     let cli = Cli::parse();
+    let is_daemon_cmd = matches!(&cli.command, Command::Daemon(_));
+    if !is_daemon_cmd {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("cannot install SIGTERM handler");
+        tokio::spawn(async move {
+            let sigterm = tokio::select! {
+                _ = tokio::signal::ctrl_c() => false,
+                _ = terminate.recv() => true,
+            };
+            stop_auto_started().await;
+            // Conventional "terminated by signal" statuses.
+            std::process::exit(if sigterm { 143 } else { 130 });
+        });
+    }
     match run(cli).await {
         Ok(()) => {}
         Err(e) => {
@@ -367,9 +399,11 @@ async fn main() {
                 }
                 other => eprintln!("cu: {other}"),
             }
+            stop_auto_started().await;
             std::process::exit(e.exit_code());
         }
     }
+    stop_auto_started().await;
 }
 
 async fn run(cli: Cli) -> Result<(), ClientError> {
@@ -382,11 +416,11 @@ async fn run(cli: Cli) -> Result<(), ClientError> {
         // (observation or control token required): present any capability
         // credential this CLI holds.
         Command::Pointer => {
-            let params = token_params();
+            let params = token_params().await;
             print_json(request("runtime.pointer", params).await?)
         }
         Command::ActiveApp => {
-            let params = token_params();
+            let params = token_params().await;
             print_json(request("runtime.active_application", params).await?)
         }
         Command::Session(args) => run_session(args).await,
@@ -440,21 +474,41 @@ fn print_json(value: Value) -> Result<(), ClientError> {
 /// any capability credential this CLI holds. No credentials → the params stay
 /// empty and the daemon refuses with OBSERVATION_TOKEN_REQUIRED.
 ///
+/// The credential of the session this CLI resolves (active, or auto-started
+/// like `cu observe`) is used: tokens live only while the daemon session is
+/// in memory, so after a daemon restart an arbitrary stored credential (e.g.
+/// from a stopped session) is rejected with INVALID_OBSERVATION_TOKEN.
+///
 /// Note: the trace reads are **not** cross-session since round 6 — they take
 /// an explicit `session_id` plus that session's token (`trace.get` reads the
 /// session credential; the cross-session `trace.admin_list` uses the daemon
 /// admin token).
-fn token_params() -> Value {
-    let token = credentials::all()
-        .into_iter()
-        .map(|cred| {
-            if !cred.observation_token.is_empty() {
-                cred.observation_token
+async fn token_params() -> Value {
+    let token = match resolve_session(&None).await {
+        Ok(sid) => {
+            if let Some(cred) = credentials::load(&sid) {
+                if !cred.observation_token.is_empty() {
+                    Some(cred.observation_token)
+                } else if !cred.control_token.is_empty() {
+                    Some(cred.control_token)
+                } else {
+                    None
+                }
             } else {
-                cred.control_token
+                None
             }
-        })
-        .next();
+        }
+        Err(_) => credentials::all()
+            .into_iter()
+            .map(|cred| {
+                if !cred.observation_token.is_empty() {
+                    cred.observation_token
+                } else {
+                    cred.control_token
+                }
+            })
+            .next(),
+    };
     match token {
         Some(t) => json!({ "observation_token": t }),
         None => json!({}),
@@ -497,6 +551,40 @@ fn rpc_code_is(data: &Option<Value>, code: &str) -> bool {
     )
 }
 
+/// The session this process auto-started via `resolve_session` (implicit
+/// first use of `cu observe` / `cu pointer` / …), if any. Stopped on exit so
+/// a one-shot CLI never leaves a control-locked session behind. Sessions
+/// started explicitly via `cu session start` are **not** recorded here —
+/// that verb is the persistent-session mechanism and outlives the process.
+static AUTO_STARTED_SESSION: Mutex<Option<String>> = Mutex::new(None);
+
+fn remember_auto_started(session_id: &str) {
+    *AUTO_STARTED_SESSION.lock().unwrap() = Some(session_id.to_string());
+}
+
+/// Best-effort stop of the session this process auto-started (with its
+/// control token from the credential store — the daemon refuses a stop
+/// without it). Never fatal and never prints anything: the process is about
+/// to exit, and a stuck daemon must not turn a clean `cu observe` into an
+/// error.
+async fn stop_auto_started() {
+    let sid = AUTO_STARTED_SESSION.lock().unwrap().take();
+    let Some(sid) = sid else { return };
+    let Some(cred) = credentials::load(&sid) else {
+        return;
+    };
+    let _ = request(
+        "computer.session",
+        json!({
+            "action": "stop",
+            "session_id": sid,
+            "control_token": cred.control_token,
+        }),
+    )
+    .await;
+    credentials::delete(&sid);
+}
+
 /// Resolve a session: the one named by `session_id`, or the currently active
 /// one when the caller left it unspecified. First use auto-creates: when the
 /// daemon has no active session, one is started with this CLI's identity, so
@@ -520,7 +608,7 @@ async fn resolve_session(session_id: &Option<String>) -> Result<String, ClientEr
         None => request("computer.session", session_start_params(Value::Null)).await?,
     };
     save_started_credential(&started);
-    started
+    let sid = started
         .get("session_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -528,7 +616,9 @@ async fn resolve_session(session_id: &Option<String>) -> Result<String, ClientEr
             code: -32602,
             message: "daemon did not return a session_id".into(),
             data: None,
-        })
+        })?;
+    remember_auto_started(&sid);
+    Ok(sid)
 }
 
 /// Persist the tokens from a `start` response (issued exactly once) to the
@@ -1602,6 +1692,79 @@ async fn run_trace(args: TraceArgs) -> Result<(), ClientError> {
             let resp = request("trace.replay", p).await?;
             println!("replay: {}", serde_json::to_string_pretty(&resp).unwrap());
             Ok(())
+        }
+        TraceAction::Analyze { session_id, json } => {
+            // The analysis reads the trace through trace.export — the pure
+            // read path — with the observation credential, never a bare
+            // session id.
+            let mut p = json!({ "session_id": session_id });
+            if let Some(t) = credentials::read_token(&session_id) {
+                p["observation_token"] = json!(t);
+            }
+            let resp = request("trace.export", p).await?;
+            let content = resp
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ClientError::BadResponse("trace.export returned no content".into())
+                })?;
+            let entries = cu_trace::parse_jsonl(content)
+                .map_err(|e| ClientError::Message(format!("cannot parse trace: {e}")))?;
+            let analysis = cu_trace::analyze(&entries, 15);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&analysis).unwrap());
+            } else {
+                print_analysis(&analysis);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Render a trace analysis for humans (the `--json` variant prints the
+/// structured analysis as-is).
+fn print_analysis(a: &cu_trace::TraceAnalysis) {
+    println!("session: {}", a.session_id);
+    println!(
+        "events: {}  actions: {}  observes: {}  screenshot bytes: {}",
+        a.event_count, a.total_actions, a.observe_calls, a.screenshot_bytes
+    );
+    let duration = a
+        .duration_ms
+        .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
+        .unwrap_or_else(|| "?".into());
+    let span = match (a.started_at, a.stopped_at) {
+        (Some(s), Some(t)) => format!(" ({s} → {t})"),
+        _ => String::new(),
+    };
+    println!("duration: {duration}{span}");
+    if !a.actions_by_type.is_empty() {
+        let by_type: Vec<String> = a
+            .actions_by_type
+            .iter()
+            .map(|(k, v)| format!("{k} {v}"))
+            .collect();
+        println!("actions by type: {}", by_type.join(", "));
+    }
+    println!(
+        "results: success {}, failed {}, cancelled {} | stale rejected: {} | timeouts: {} | takeovers: {} | cancel events: {}",
+        a.total_actions.saturating_sub(a.failed_action_count),
+        a.failed_action_count,
+        a.cancelled_request_count,
+        a.stale_frame_count,
+        a.timeout_count,
+        a.user_takeover_count,
+        a.cancel_event_count
+    );
+    match (&a.failure_category, &a.failure_detail) {
+        (Some(cat), Some(detail)) => println!("failure: {cat} — {detail}"),
+        (Some(cat), None) => println!("failure: {cat}"),
+        (None, _) => println!("failure: (no failure signal in trace)"),
+    }
+    if !a.timeline.is_empty() {
+        println!("timeline (last {}):", a.timeline.len());
+        for t in &a.timeline {
+            println!("  +{:>7}ms  {:<18} {}", t.offset_ms, t.event, t.detail);
         }
     }
 }

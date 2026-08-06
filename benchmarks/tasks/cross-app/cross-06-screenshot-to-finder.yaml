@@ -1,0 +1,23 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: cross-06-screenshot-to-finder
+name: 截图移动到文件夹
+category: cross-app
+difficulty: hard
+environment:
+  apps_required: [Finder]
+  scratch_required: true
+instruction: |
+  第一步：按 Cmd+Shift+3 截取整个屏幕。截图会保存到桌面（文件名类似
+  "Screenshot 2026-xx-xx at xx.xx.xx.png"）。
+  第二步：打开 Finder，把桌面上刚生成的截图文件移动到 {{SCRATCH}}/shots/ 文件夹
+  （如果没有该文件夹就先创建），然后删除桌面上的原截图文件（按 Cmd+Delete）。
+success_criteria:
+  - type: dir_exists
+    path: "{{SCRATCH}}/shots"
+  - type: dir_contains
+    path: "{{SCRATCH}}/shots"
+    pattern: "Screenshot*"
+max_steps: 50
+max_duration_seconds: 900
+risk_level: low
+notes: 截图产生真实桌面文件 → Finder 移动 → 删除原文件（任务自身清理产生的文件）。

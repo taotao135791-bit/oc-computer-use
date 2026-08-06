@@ -1,0 +1,19 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: safari-03-fill-form
+name: 填写并提交表单
+category: safari
+difficulty: medium
+environment:
+  apps_required: [Safari]
+  fixture_required: true
+  scratch_required: false
+instruction: |
+  打开 Safari，访问 http://127.0.0.1:8931/page/form （页面标题 "Form Page"）。
+  在输入框中输入文本 "hello bench"，然后点击 "Submit" 按钮提交。
+success_criteria:
+  - type: http_check
+    task_key: form
+max_steps: 30
+max_duration_seconds: 600
+risk_level: low
+notes: 输入框聚焦、键入、点击提交。

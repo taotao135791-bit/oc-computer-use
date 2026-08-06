@@ -1,0 +1,24 @@
+$schema: https://github.com/taotao135791-bit/oc-computer-use/blob/main/benchmarks/schema/task.schema.json
+id: cross-04-window-switch
+name: 双窗口交替操作
+category: cross-app
+difficulty: hard
+environment:
+  apps_required: [TextEdit, Safari]
+  fixture_required: true
+  scratch_required: true
+instruction: |
+  第一步：打开 TextEdit 新建文档，输入 "window A" 并保存到 {{SCRATCH}}/cross-04.txt。
+  第二步：打开 Safari，访问 http://127.0.0.1:8931/page/form，在输入框输入 "window B"，点击 Submit。
+  第三步：切回 TextEdit，确认文档仍在（内容为 "window A"）。
+  两步操作在两个应用的窗口之间来回切换完成。
+success_criteria:
+  - type: file_contains
+    path: "{{SCRATCH}}/cross-04.txt"
+    contains: window A
+  - type: http_check
+    task_key: form
+max_steps: 60
+max_duration_seconds: 900
+risk_level: low
+notes: 窗口/应用切换（Cmd+Tab / Cmd+`），交替完成两个应用内的操作。
