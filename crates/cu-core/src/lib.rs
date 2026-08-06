@@ -26,7 +26,7 @@ pub use protocol::{
     ClientInfo, InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult,
     RequestKey, RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams, SessionResult,
     SessionSummary, ShutdownParams, StabilizationInfo, TraceAdminListParams, TraceEntry,
-    TraceExport, TraceExportParams, TraceGetParams, TraceListParams, TraceReplayParams,
+    TraceExportParams, TraceExportResult, TraceGetParams, TraceListParams, TraceReplayParams,
     TraceReport, TraceSummariesParams, TraceSummary,
 };
 pub use security::{

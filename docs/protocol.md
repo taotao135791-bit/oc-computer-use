@@ -315,7 +315,7 @@ or symlinked manifest never grants access.
 | `trace.summaries` | `{session_id, observation_token?, control_token?, limit?}` | `[{session_id, trace_id, event_count, size_bytes, created_at}]` — same scoping, bare array |
 | `trace.admin_list` | `{admin_token, limit?}` | `{traces: [...]}` — **daemon-manager only**: lists every session's trace; authorized by the daemon admin token alone (missing → `DAEMON_ADMIN_TOKEN_REQUIRED`, wrong → `INVALID_DAEMON_ADMIN_TOKEN`) — a session capability must never reveal which other sessions ran |
 | `trace.get` | `{session_id, observation_token?, control_token?}` | `{entries: [...]}` (parsed JSONL) |
-| `trace.export` | `{session_id, dest, observation_token?, control_token?}` | `{path, format, exported_at}` |
+| `trace.export` | `{session_id, observation_token?, control_token?}` | `{trace_id, session_id, format, mime_type, file_name, content, size_bytes, sha256}` — **pure read since round 7**: the daemon never accepts a destination path and performs no filesystem writes; the content (redaction applied at record time) plus its SHA-256 come back over the wire. `file_name` is a server-suggested name (`s_<session_id>.jsonl`), never a path. Saving the content to a user-chosen location is the client's job (`cu trace export --output <path>` refuses to overwrite unless `--force` is given) |
 | `trace.replay` | `{session_id, observation_token?, control_token?}` | replay summary |
 
 ## Reference clients

@@ -384,7 +384,14 @@ test("sensitive reads carry the observation token from the credential", async ()
       region: { x: 0, y: 0, width: 1, height: 1, coordinate_space: "image_pixels" },
     });
     await client.traceGet(started.session_id);
-    await client.traceExport(started.session_id, "/tmp/trace.jsonl");
+    // Round 7: trace.export is a pure read — no destination path in the
+    // request, content + sha256 in the result.
+    const exportResult = await client.traceExport(started.session_id);
+    assert.equal(exportResult.format, "jsonl");
+    assert.equal(exportResult.session_id, started.session_id);
+    assert.ok(exportResult.content.includes('"event"'), "inline content");
+    assert.equal(exportResult.sha256, "abc123def456", "fake sha256 echoed");
+    assert.ok(!("path" in exportResult), "no filesystem path in the result");
     await client.traceReplay(started.session_id);
     for (const method of [
       "computer.observe",

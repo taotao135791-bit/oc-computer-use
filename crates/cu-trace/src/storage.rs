@@ -1,8 +1,9 @@
 //! Trace storage: scanning, reading, exporting, and pruning trace files.
 //!
-//! Traces live under `<runtime_dir>/traces/<session_id>.jsonl`. Export copies
-//! the raw JSONL to a caller-chosen file so a session can be shared or
-//! inspected without touching the live file.
+//! Traces live under `<runtime_dir>/traces/<session_id>.jsonl`. Export is a
+//! **pure read** since round 7: the daemon returns the raw JSONL content
+//! (plus its SHA-256) over the wire and never writes a caller-chosen path —
+//! saving the content to a user location is the client's job.
 
 use std::path::{Path, PathBuf};
 
@@ -119,12 +120,32 @@ pub fn read_trace(path: &Path) -> Result<Vec<TraceEntry>, CuError> {
 }
 
 /// Copy a trace to a new location (for export). Returns the destination path.
-pub fn export_trace(src: &Path, dest: &Path) -> Result<PathBuf, CuError> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| CuError::Trace(e.to_string()))?;
-    }
-    std::fs::copy(src, dest).map_err(|e| CuError::Trace(format!("export failed: {e}")))?;
-    Ok(dest.to_path_buf())
+/// Read a trace's raw JSONL content for export, with its size and hex
+/// SHA-256. **Read-only**: exporting never writes anywhere — the daemon
+/// returns this over the wire, and any user-chosen destination file is
+/// written by the client process itself (round 7, P0: `trace.export` no
+/// longer accepts a destination path, so an observation-capable caller
+/// cannot write files through the runtime).
+pub fn read_trace_export(src: &Path) -> Result<TraceExportBytes, CuError> {
+    use sha2::{Digest, Sha256};
+    let bytes =
+        std::fs::read(src).map_err(|e| CuError::Trace(format!("export read failed: {e}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let sha256 = format!("{:x}", hasher.finalize());
+    Ok(TraceExportBytes {
+        content: String::from_utf8_lossy(&bytes).into_owned(),
+        size_bytes: bytes.len() as u64,
+        sha256,
+    })
+}
+
+/// The read-only export payload (`read_trace_export`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceExportBytes {
+    pub content: String,
+    pub size_bytes: u64,
+    pub sha256: String,
 }
 
 /// Delete trace files older than `retention_days`. Returns the number removed.
@@ -184,17 +205,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_copies_file() {
+    async fn export_is_a_pure_read_with_sha256() {
         let dir = tempdir().unwrap();
         let rec = crate::recorder::TraceRecorder::open("s_exp", dir.path(), Default::default())
             .await
             .unwrap();
         rec.record_event("x", serde_json::json!({})).await.unwrap();
         rec.close().await.unwrap();
-        let dest = dir.path().join("out").join("export.jsonl");
-        let out = export_trace(&dir.path().join("s_exp.jsonl"), &dest).unwrap();
-        assert!(out.exists());
-        let entries = read_trace(&out).unwrap();
+        let src = dir.path().join("s_exp.jsonl");
+
+        // Round 7: exporting never writes a destination — it returns the
+        // content + size + sha256. No other file may appear anywhere.
+        let before: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let out = read_trace_export(&src).unwrap();
+        let after: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after, "export must not create or remove any file");
+
+        let bytes = std::fs::read(&src).unwrap();
+        assert_eq!(out.size_bytes, bytes.len() as u64);
+        assert_eq!(out.content, String::from_utf8(bytes.clone()).unwrap());
+
+        // sha256 is the real SHA-256 of the content.
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        assert_eq!(out.sha256, format!("{:x}", h.finalize()));
+
+        // The exported content still reads back as entries (round trip).
+        let entries = read_trace(&src).unwrap();
         assert_eq!(entries.len(), 1);
     }
 

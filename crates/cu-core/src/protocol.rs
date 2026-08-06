@@ -459,12 +459,14 @@ pub struct TraceGetParams {
     pub control_token: Option<SecretToken>,
 }
 
-/// `trace.export` request — exporting a trace requires an observation or
-/// control token.
+/// `trace.export` request (round 7) — a **pure read**. The daemon never
+/// accepts a destination path: exporting a trace requires an observation or
+/// control token and returns the content inline (plus its SHA-256), so an
+/// observation-capable caller cannot write anywhere through the runtime.
+/// Saving the content to a user-chosen location is the client's job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraceExportParams {
     pub session_id: String,
-    pub dest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation_token: Option<SecretToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -598,13 +600,25 @@ pub struct TraceEntry {
     pub runtime_version: Option<String>,
 }
 
-/// `trace.export` result.
+/// `trace.export` result (round 7) — content, never a filesystem path.
+/// The daemon performs no filesystem writes for an export; `file_name` is a
+/// server-suggested name for a client-side save.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct TraceExport {
+pub struct TraceExportResult {
+    /// Stable id of this trace (one per session — the trace-file stem).
+    pub trace_id: String,
     pub session_id: String,
-    pub path: String,
+    /// Wire format of `content`, currently always `"jsonl"`.
     pub format: String,
-    pub exported_at: DateTime<Utc>,
+    /// MIME type of `content`, e.g. `application/x-ndjson`.
+    pub mime_type: String,
+    /// Server-suggested file name (`s_<session_id>.jsonl`) — never a path.
+    pub file_name: String,
+    /// The trace content itself (redaction applied at record time).
+    pub content: String,
+    pub size_bytes: u64,
+    /// Hex SHA-256 of `content`, so a saved copy can be verified locally.
+    pub sha256: String,
 }
 
 #[cfg(test)]

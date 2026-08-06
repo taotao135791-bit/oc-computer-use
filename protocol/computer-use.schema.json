@@ -1701,39 +1701,11 @@
       ],
       "type": "object"
     },
-    "TraceExport": {
-      "description": "`trace.export` result.",
-      "properties": {
-        "exported_at": {
-          "format": "date-time",
-          "type": "string"
-        },
-        "format": {
-          "type": "string"
-        },
-        "path": {
-          "type": "string"
-        },
-        "session_id": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "exported_at",
-        "format",
-        "path",
-        "session_id"
-      ],
-      "type": "object"
-    },
     "TraceExportParams": {
       "anyOf": [
         {
           "properties": {
             "control_token": {
-              "type": "string"
-            },
-            "dest": {
               "type": "string"
             },
             "observation_token": {
@@ -1752,9 +1724,6 @@
             "control_token": {
               "type": "string"
             },
-            "dest": {
-              "type": "string"
-            },
             "observation_token": {
               "type": "string"
             },
@@ -1767,12 +1736,9 @@
           ]
         }
       ],
-      "description": "`trace.export` request — exporting a trace requires an observation or control token.",
+      "description": "`trace.export` request (round 7) — a **pure read**. The daemon never accepts a destination path: exporting a trace requires an observation or control token and returns the content inline (plus its SHA-256), so an observation-capable caller cannot write anywhere through the runtime. Saving the content to a user-chosen location is the client's job.",
       "properties": {
         "control_token": {
-          "type": "string"
-        },
-        "dest": {
           "type": "string"
         },
         "observation_token": {
@@ -1783,8 +1749,55 @@
         }
       },
       "required": [
-        "dest",
         "session_id"
+      ],
+      "type": "object"
+    },
+    "TraceExportResult": {
+      "description": "`trace.export` result (round 7) — content, never a filesystem path. The daemon performs no filesystem writes for an export; `file_name` is a server-suggested name for a client-side save.",
+      "properties": {
+        "content": {
+          "description": "The trace content itself (redaction applied at record time).",
+          "type": "string"
+        },
+        "file_name": {
+          "description": "Server-suggested file name (`s_<session_id>.jsonl`) — never a path.",
+          "type": "string"
+        },
+        "format": {
+          "description": "Wire format of `content`, currently always `\"jsonl\"`.",
+          "type": "string"
+        },
+        "mime_type": {
+          "description": "MIME type of `content`, e.g. `application/x-ndjson`.",
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Hex SHA-256 of `content`, so a saved copy can be verified locally.",
+          "type": "string"
+        },
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "trace_id": {
+          "description": "Stable id of this trace (one per session — the trace-file stem).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "file_name",
+        "format",
+        "mime_type",
+        "session_id",
+        "sha256",
+        "size_bytes",
+        "trace_id"
       ],
       "type": "object"
     },

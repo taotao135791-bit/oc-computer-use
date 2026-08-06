@@ -220,6 +220,149 @@ async fn daemon_refuses_to_start_when_the_admin_token_cannot_be_persisted() {
     dir.close().unwrap();
 }
 
+/// §三 (round 7): an observation token is purely read-only, end to end over
+/// the wire. `trace.export` returns content + sha256 (never a filesystem
+/// path) and performs no writes; a stale client's `dest` field is ignored,
+/// never honored; and the observation token authorizes no mutation.
+#[tokio::test]
+async fn observation_token_is_pure_read_only_end_to_end() {
+    // Fabricate a stopped session's trace + access manifest before the daemon
+    // starts (the same shape as a daemon restart), so the observation path is
+    // exercised without a live session.
+    let dir = tempfile::tempdir().unwrap();
+    let traces = dir.path().join("traces");
+    std::fs::create_dir_all(&traces).unwrap();
+    let sid = "s_pure_read";
+    let obs = cu_core::security::generate_observation_token();
+    let ctl = cu_core::security::generate_control_token();
+    std::fs::write(
+        traces.join(format!("{sid}.jsonl")),
+        "{\"seq\":1,\"event\":\"session.start\"}\n{\"seq\":2,\"event\":\"observe\"}\n",
+    )
+    .unwrap();
+    cu_trace::manifest::write_manifest(
+        &traces,
+        sid,
+        &cu_core::security::SecretTokenHash::from_token(&ctl),
+        &cu_core::security::SecretTokenHash::from_token(&obs),
+    )
+    .unwrap();
+
+    let socket = dir.path().join("runtime.sock");
+    let admin_path = dir.path().join("daemon-admin.json");
+    let config = cu_daemon::DaemonConfig {
+        socket_path: socket.clone(),
+        admin_token_path: admin_path.clone(),
+        request_timeout_secs: 60,
+        shutdown_grace_secs: 5,
+        runtime_config: cu_runtime::RuntimeConfig {
+            traces_dir: traces.clone(),
+            ..cu_runtime::RuntimeConfig::default()
+        },
+    };
+    let handle = tokio::spawn(cu_daemon::run(config));
+    for _ in 0..200 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(socket.exists());
+
+    // 1. Export with the observation token: content + sha256, no path, and
+    //    the runtime directory tree is byte-for-byte unchanged afterwards.
+    let before: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let export = request(
+        &socket,
+        "trace.export",
+        json!({ "session_id": sid, "observation_token": obs.as_str() }),
+    )
+    .await;
+    assert_eq!(export["session_id"], json!(sid));
+    assert_eq!(export["trace_id"], json!(sid));
+    assert_eq!(export["format"], "jsonl");
+    assert_eq!(export["file_name"], json!(format!("s_{sid}.jsonl")));
+    assert!(
+        export.get("path").is_none(),
+        "trace.export must never return a filesystem path"
+    );
+    let content = export["content"].as_str().expect("inline content");
+    assert!(content.contains("session.start"));
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(content.as_bytes());
+    assert_eq!(export["sha256"], json!(format!("{:x}", h.finalize())));
+    assert_eq!(export["size_bytes"].as_u64(), Some(content.len() as u64));
+    let after: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        before, after,
+        "trace.export must not create or remove any file"
+    );
+
+    // 2. A stale client's `dest` is ignored, never honored — no file appears
+    //    at the caller-supplied path.
+    let attack = dir.path().join("attacker.jsonl");
+    let export2 = request(
+        &socket,
+        "trace.export",
+        json!({
+            "session_id": sid,
+            "observation_token": obs.as_str(),
+            "dest": attack.to_string_lossy(),
+        }),
+    )
+    .await;
+    assert!(
+        export2.get("content").is_some(),
+        "a `dest` field must be ignored, never honored"
+    );
+    assert!(!attack.exists(), "no write at a caller-supplied path");
+
+    // 3. The observation token authorizes no mutation: cross-session listing,
+    //    shutdown, and session-stop are all refused with it.
+    let err = request(
+        &socket,
+        "trace.admin_list",
+        json!({ "observation_token": obs.as_str() }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32026), "DAEMON_ADMIN_TOKEN_REQUIRED");
+    let err = request(
+        &socket,
+        "runtime.shutdown",
+        json!({ "observation_token": obs.as_str() }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32026), "DAEMON_ADMIN_TOKEN_REQUIRED");
+    let err = request(
+        &socket,
+        "computer.session",
+        json!({ "action": "stop", "session_id": sid, "observation_token": obs.as_str() }),
+    )
+    .await;
+    assert!(
+        err.get("result").is_none(),
+        "an observation token must never stop a session"
+    );
+
+    // 4. Only the persisted admin token shuts the daemon down.
+    let token = daemon_admin_token(&admin_path);
+    let _ = request(
+        &socket,
+        "runtime.shutdown",
+        json!({ "admin_token": token.as_str() }),
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    dir.close().unwrap();
+}
+
 #[tokio::test]
 async fn trace_list_is_empty_on_fresh_home() {
     let d = spawn_daemon().await;

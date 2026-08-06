@@ -91,6 +91,13 @@ live daemon (`cargo test -p cu-daemon --test integration -- --ignored`).
   API (0600, atomic, symlink-refusing) recording only **SHA-256 hashes** of
   the issued tokens — plaintext tokens never touch disk, and a missing,
   corrupt, oversized, or symlinked manifest never grants access.
+- **`trace.export` is a pure read (round 7).** The runtime never accepts a
+  destination path: export returns the content plus its SHA-256 over the
+  wire and performs **no filesystem writes**, so an observation-capable
+  caller cannot create directories, overwrite files, or follow symlinks
+  anywhere through the runtime. Saving an export to a user-chosen path is
+  the client's job — the CLI's `cu trace export --output <path>` refuses to
+  overwrite an existing file unless `--force` is given.
 
 ## Reporting a vulnerability
 

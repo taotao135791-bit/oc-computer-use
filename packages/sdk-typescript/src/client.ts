@@ -49,7 +49,7 @@ import {
   type SessionResult,
   type SessionSummary,
   type TraceEntry,
-  type TraceExport,
+  type TraceExportResult,
   type TraceList,
   type TraceSummary,
 } from "./types.js";
@@ -861,10 +861,21 @@ export class ComputerUseClient {
     );
   }
 
-  traceExport(sessionId: string, dest: string): Promise<TraceExport> {
-    return this.request<TraceExport>(
+  /** Round 7: a pure read. The daemon never accepts a destination path —
+   *  the content (plus SHA-256) comes back over the wire and the caller
+   *  decides where (if anywhere) to save it. */
+  traceExport(
+    sessionId: string,
+    opts?: { observationToken?: string; controlToken?: string },
+  ): Promise<TraceExportResult> {
+    const { ...tokens } = opts ?? {};
+    return this.request<TraceExportResult>(
       "trace.export",
-      this.withObservationTokens({ session_id: sessionId, dest }),
+      this.withObservationTokens({
+        session_id: sessionId,
+        observation_token: tokens.observationToken,
+        control_token: tokens.controlToken,
+      }),
     );
   }
 

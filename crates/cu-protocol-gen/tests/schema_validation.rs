@@ -327,14 +327,24 @@ fn capability_token_requirements_are_in_the_schema() {
         &json!({ "session_id": "s1", "control_token": "fake-ctl-token" }),
     )
     .unwrap();
-    assert!(validate(
-        "TraceExportParams",
-        &json!({ "session_id": "s1", "dest": "/tmp/x.jsonl" })
-    )
-    .is_err());
+    // Round 7: trace.export never accepts a destination path — `dest` is not
+    // part of the schema (a stale client's `dest` is ignored, never honored),
+    // so a path can never be part of the request.
+    let schema = build_protocol_schema();
+    let export_props = schema["$defs"]["TraceExportParams"]["properties"]
+        .as_object()
+        .unwrap();
+    assert!(
+        !export_props.contains_key("dest"),
+        "trace.export must not accept a destination path"
+    );
+    assert!(
+        !export_props.contains_key("path"),
+        "trace.export must not accept a path in any spelling"
+    );
     validate(
         "TraceExportParams",
-        &json!({ "session_id": "s1", "dest": "/tmp/x.jsonl", "observation_token": "fake-obs-token" }),
+        &json!({ "session_id": "s1", "observation_token": "fake-obs-token" }),
     )
     .unwrap();
     assert!(validate("TraceReplayParams", &json!({ "session_id": "s1" })).is_err());

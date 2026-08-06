@@ -26,6 +26,10 @@ pub enum ClientError {
     ConnectionClosed,
     #[error("malformed response from daemon: {0}")]
     BadResponse(String),
+    /// A client-side operation failed (e.g. writing an exported trace to a
+    /// user-chosen path). Never used for daemon errors.
+    #[error("{0}")]
+    Message(String),
     /// The daemon answered with a JSON-RPC error.
     #[error("error [{code}] {message}")]
     Rpc {

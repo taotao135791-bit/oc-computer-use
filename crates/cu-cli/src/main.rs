@@ -5,7 +5,7 @@
 //! Every subcommand exits non-zero on failure and supports `--json` for
 //! machine-readable output.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
@@ -311,8 +311,19 @@ enum TraceAction {
     List,
     /// Print a trace's JSONL entries.
     Get { session_id: String },
-    /// Copy a trace to an external path.
-    Export { session_id: String, dest: PathBuf },
+    /// Export a trace's content (round 7: a pure read — the daemon never
+    /// writes a path). Without --output the content goes to stdout; with
+    /// --output this CLI writes the file and refuses to overwrite an
+    /// existing one unless --force is given.
+    Export {
+        session_id: String,
+        /// Write the exported content to this file (stdout when absent).
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Overwrite --output even though it already exists.
+        #[arg(long)]
+        force: bool,
+    },
     /// Re-run the actions recorded in a trace on the live desktop.
     Replay { session_id: String },
 }
@@ -1127,7 +1138,7 @@ async fn run_observe(args: ObserveArgs) -> Result<(), ClientError> {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64)
-                .map_err(|e| ClientError::BadResponse(format!("bad image data: {e}")))?;
+                .map_err(|e| ClientError::Message(format!("bad image data: {e}")))?;
             std::fs::write(path, &bytes).map_err(|e| ClientError::Rpc {
                 code: -32000,
                 message: format!("cannot write {path:?}: {e}"),
@@ -1218,7 +1229,7 @@ async fn run_inspect(args: InspectArgs) -> Result<(), ClientError> {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64)
-                .map_err(|e| ClientError::BadResponse(format!("bad image data: {e}")))?;
+                .map_err(|e| ClientError::Message(format!("bad image data: {e}")))?;
             std::fs::write(path, &bytes).map_err(|e| ClientError::Rpc {
                 code: -32000,
                 message: format!("cannot write {path:?}: {e}"),
@@ -1541,19 +1552,45 @@ async fn run_trace(args: TraceArgs) -> Result<(), ClientError> {
             println!("{}", serde_json::to_string_pretty(&resp).unwrap());
             Ok(())
         }
-        TraceAction::Export { session_id, dest } => {
-            let mut p = json!({ "session_id": session_id, "dest": dest.to_string_lossy() });
+        TraceAction::Export {
+            session_id,
+            output,
+            force,
+        } => {
+            // Round 7: trace.export is a pure read. The daemon returns the
+            // content inline (no destination path is accepted); writing a
+            // user-chosen file is this CLI's job, with overwrite protection.
+            let mut p = json!({ "session_id": session_id });
             if let Some(t) = credentials::read_token(&session_id) {
                 p["observation_token"] = json!(t);
             }
             let resp = request("trace.export", p).await?;
-            if let Some(path) = resp.get("path").and_then(|v| v.as_str()) {
-                println!(
-                    "exported {} → {path}",
-                    resp.get("format")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("jsonl")
-                );
+            let content = resp
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ClientError::BadResponse("trace.export returned no content".into())
+                })?;
+            let sha256 = resp.get("sha256").and_then(|v| v.as_str()).unwrap_or("?");
+            let file_name = resp
+                .get("file_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("trace.jsonl");
+            match &output {
+                Some(dest) => {
+                    write_export_file(dest, content, force)?;
+                    println!(
+                        "exported {file_name} → {} ({} bytes, sha256 {sha256})",
+                        dest.display(),
+                        content.len()
+                    );
+                }
+                None => {
+                    print!("{content}");
+                    if !content.ends_with('\n') {
+                        println!();
+                    }
+                }
             }
             Ok(())
         }
@@ -1566,5 +1603,75 @@ async fn run_trace(args: TraceArgs) -> Result<(), ClientError> {
             println!("replay: {}", serde_json::to_string_pretty(&resp).unwrap());
             Ok(())
         }
+    }
+}
+
+/// Write an exported trace to a user-chosen path (round 7). The daemon never
+/// writes a destination — saving the content is the CLI's job, and it must
+/// refuse to overwrite an existing file unless `force` is set.
+fn write_export_file(dest: &Path, content: &str, force: bool) -> Result<(), ClientError> {
+    if dest.exists() && !force {
+        return Err(ClientError::Message(format!(
+            "{} already exists — refusing to overwrite (use --force)",
+            dest.display()
+        )));
+    }
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ClientError::Message(format!("cannot create {}: {e}", parent.display()))
+            })?;
+        }
+    }
+    std::fs::write(dest, content)
+        .map_err(|e| ClientError::Message(format!("cannot write {}: {e}", dest.display())))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_write_protects_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("trace.jsonl");
+
+        // Missing file → saved.
+        write_export_file(&dest, "line1\n", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "line1\n");
+
+        // Existing file, no --force → refused, content untouched.
+        let err = write_export_file(&dest, "line2\n", false).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "line1\n",
+            "the existing file must be untouched"
+        );
+
+        // --force → overwritten.
+        write_export_file(&dest, "line2\n", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "line2\n");
+    }
+
+    #[test]
+    fn export_write_creates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a").join("b").join("trace.jsonl");
+        write_export_file(&dest, "x\n", false).unwrap();
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn export_write_refuses_directory_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        // An existing directory is refused out of the box…
+        let err = write_export_file(dest, "x\n", false).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"));
+        // …and even with --force the OS refuses to write a directory.
+        let err = write_export_file(dest, "x\n", true).unwrap_err();
+        assert!(err.to_string().contains("cannot write"));
     }
 }

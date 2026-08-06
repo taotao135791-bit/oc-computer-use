@@ -25,7 +25,7 @@ use cu_core::protocol::{
     ClientInfo, InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult,
     RpcError, RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams, SessionResult,
     SessionSummary, ShutdownParams, StabilizationInfo, TraceAdminListParams, TraceEntry,
-    TraceExport, TraceExportParams, TraceGetParams, TraceListParams, TraceReplayParams,
+    TraceExportParams, TraceExportResult, TraceGetParams, TraceListParams, TraceReplayParams,
     TraceReport, TraceSummariesParams, TraceSummary, JSONRPC_VERSION,
 };
 use cu_core::security::{
@@ -384,7 +384,7 @@ pub fn build_protocol_schema() -> Value {
     register!(gen, TraceReplayParams);
     register!(gen, TraceSummary);
     register!(gen, TraceEntry);
-    register!(gen, TraceExport);
+    register!(gen, TraceExportResult);
     register!(gen, TraceMode);
     // Runtime.
     register!(gen, RuntimeVersionResult);

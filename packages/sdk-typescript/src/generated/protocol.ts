@@ -342,7 +342,7 @@ export type StaleFramePolicy = "Strict" | "VisualMatch";
  */
 export type TextInputMethod = "keyboard" | "clipboard";
 /**
- * `trace.export` request — exporting a trace requires an observation or control token.
+ * `trace.export` request (round 7) — a **pure read**. The daemon never accepts a destination path: exporting a trace requires an observation or control token and returns the content inline (plus its SHA-256), so an observation-capable caller cannot write anywhere through the runtime. Saving the content to a user-chosen location is the client's job.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
  * via the `definition` "TraceExportParams".
@@ -350,14 +350,12 @@ export type TextInputMethod = "keyboard" | "clipboard";
 export type TraceExportParams =
   | {
       control_token?: string;
-      dest?: string;
       observation_token: string;
       session_id?: string;
       [k: string]: unknown;
     }
   | {
       control_token: string;
-      dest?: string;
       observation_token?: string;
       session_id?: string;
       [k: string]: unknown;
@@ -939,16 +937,38 @@ export interface TraceEntry {
   [k: string]: unknown;
 }
 /**
- * `trace.export` result.
+ * `trace.export` result (round 7) — content, never a filesystem path. The daemon performs no filesystem writes for an export; `file_name` is a server-suggested name for a client-side save.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
- * via the `definition` "TraceExport".
+ * via the `definition` "TraceExportResult".
  */
-export interface TraceExport {
-  exported_at: string;
+export interface TraceExportResult {
+  /**
+   * The trace content itself (redaction applied at record time).
+   */
+  content: string;
+  /**
+   * Server-suggested file name (`s_<session_id>.jsonl`) — never a path.
+   */
+  file_name: string;
+  /**
+   * Wire format of `content`, currently always `"jsonl"`.
+   */
   format: string;
-  path: string;
+  /**
+   * MIME type of `content`, e.g. `application/x-ndjson`.
+   */
+  mime_type: string;
   session_id: string;
+  /**
+   * Hex SHA-256 of `content`, so a saved copy can be verified locally.
+   */
+  sha256: string;
+  size_bytes: number;
+  /**
+   * Stable id of this trace (one per session — the trace-file stem).
+   */
+  trace_id: string;
   [k: string]: unknown;
 }
 /**

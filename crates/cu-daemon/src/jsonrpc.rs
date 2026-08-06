@@ -5,14 +5,12 @@
 //! structured detail (stale-frame scores, permission guidance, …) so upper
 //! layers can react instead of parsing prose.
 
-use std::path::Path;
-
 use cu_core::security::SecretTokenHash;
 use cu_core::{
     ActParams, CancelParams, CancelResult, CapabilityTokenParams, CuError, InspectParams,
     ObserveParams, RequestKey, RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams,
-    SessionSummary, ShutdownParams, TraceAdminListParams, TraceExportParams, TraceGetParams,
-    TraceListParams, TraceReplayParams, TraceSummariesParams, TraceSummary,
+    SessionSummary, ShutdownParams, TraceAdminListParams, TraceExportParams, TraceExportResult,
+    TraceGetParams, TraceListParams, TraceReplayParams, TraceSummariesParams, TraceSummary,
 };
 use cu_runtime::Runtime;
 use serde::de::DeserializeOwned;
@@ -387,18 +385,25 @@ pub async fn dispatch(
             ) {
                 return error_response(id, e);
             }
+            // Round 7: pure read — no destination path is accepted, nothing
+            // is written by the runtime. The content (plus SHA-256) goes back
+            // over the wire; saving it to a user-chosen file is the client's
+            // job, so an observation-capable caller cannot write anywhere.
             let src = runtime.traces_dir().join(format!("{}.jsonl", p.session_id));
-            let dest = Path::new(&p.dest);
-            cu_trace::export_trace(&src, dest)
-                .map_err(|e| CuError::Trace(e.to_string()))
-                .and_then(|exported| {
-                    to_result(serde_json::json!({
-                        "session_id": p.session_id,
-                        "path": exported.to_string_lossy(),
-                        "format": "jsonl",
-                        "exported_at": chrono::Utc::now(),
-                    }))
-                })
+            let exported = match cu_trace::read_trace_export(&src) {
+                Ok(exported) => exported,
+                Err(e) => return error_response(id, CuError::Trace(e.to_string())),
+            };
+            to_result(serde_json::json!(TraceExportResult {
+                trace_id: p.session_id.clone(),
+                session_id: p.session_id.clone(),
+                format: "jsonl".into(),
+                mime_type: "application/x-ndjson".into(),
+                file_name: format!("s_{}.jsonl", p.session_id),
+                content: exported.content,
+                size_bytes: exported.size_bytes,
+                sha256: exported.sha256,
+            }))
         }
         "trace.replay" => {
             let p: TraceReplayParams = match parse_params(&params) {
@@ -1330,8 +1335,10 @@ mod tests {
             Some(("INVALID_OBSERVATION_TOKEN", -32025))
         );
 
-        // export with a wrong token → INVALID_OBSERVATION_TOKEN.
-        let dest = std::env::temp_dir().join(format!("cu-trace-export-{sid}.jsonl"));
+        // export with a wrong token → INVALID_OBSERVATION_TOKEN. Round 7:
+        // the request has no `dest` at all — the runtime never accepts a
+        // destination path (a stale client sending one is ignored, never
+        // honored).
         let resp = call(
             &rt,
             1,
@@ -1340,7 +1347,6 @@ mod tests {
             serde_json::json!({
                 "session_id": sid,
                 "observation_token": "wrong",
-                "dest": dest.to_string_lossy(),
             }),
         )
         .await;
@@ -1361,6 +1367,80 @@ mod tests {
         assert!(
             resp.result.is_some(),
             "observation token must read a stopped session's trace"
+        );
+
+        // Round 7: trace.export is a pure read — content + sha256 over the
+        // wire, never a filesystem path, and no file is created anywhere by
+        // the runtime (the response is the only side effect).
+        let traces_before = std::fs::read_dir(rt.traces_dir()).unwrap().count();
+        let resp = call(
+            &rt,
+            1,
+            "trace.export",
+            24,
+            serde_json::json!({ "session_id": sid, "observation_token": observation }),
+        )
+        .await;
+        let export = resp
+            .result
+            .expect("observation token must export a stopped session's trace");
+        assert_eq!(export["session_id"], serde_json::json!(sid));
+        assert_eq!(export["trace_id"], serde_json::json!(sid));
+        assert_eq!(export["format"], "jsonl");
+        assert_eq!(export["mime_type"], "application/x-ndjson");
+        assert_eq!(
+            export["file_name"],
+            serde_json::json!(format!("s_{sid}.jsonl")),
+            "server-suggested name only — never a path"
+        );
+        assert!(
+            export.get("path").is_none(),
+            "trace.export must never return a filesystem path"
+        );
+        let content = export["content"].as_str().expect("inline content");
+        assert!(content.contains("\"event\""), "exported JSONL content");
+        assert_eq!(
+            export["size_bytes"].as_u64(),
+            Some(content.len() as u64),
+            "size_bytes must match the content"
+        );
+        // sha256 must be the real SHA-256 of the content.
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(content.as_bytes());
+        assert_eq!(
+            export["sha256"],
+            serde_json::json!(format!("{:x}", h.finalize()))
+        );
+        // And the runtime wrote nothing: the traces dir is unchanged.
+        assert_eq!(
+            std::fs::read_dir(rt.traces_dir()).unwrap().count(),
+            traces_before,
+            "export must not create or remove any file"
+        );
+
+        // A stale client sending a `dest` field is not honored — the field is
+        // not part of the protocol (see the schema test), and even if one
+        // arrives it cannot name a write target.
+        let resp = call(
+            &rt,
+            1,
+            "trace.export",
+            24,
+            serde_json::json!({
+                "session_id": sid,
+                "observation_token": observation,
+                "dest": std::env::temp_dir().join("cu-attack-export.jsonl").to_string_lossy(),
+            }),
+        )
+        .await;
+        assert!(
+            resp.result.is_some(),
+            "a `dest` field must be ignored, never honored"
+        );
+        assert!(
+            !std::env::temp_dir().join("cu-attack-export.jsonl").exists(),
+            "a `dest` field must never cause a runtime write"
         );
 
         // The list is token-gated and session-scoped (round 6): a session

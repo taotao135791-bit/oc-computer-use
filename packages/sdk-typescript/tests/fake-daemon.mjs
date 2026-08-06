@@ -292,6 +292,42 @@ export function startFakeDaemon({
             state.shutDown = true;
             respond({ jsonrpc: "2.0", id: req.id, result: { status: "shutting_down" } });
           }
+        } else if (req.method === "trace.export") {
+          // Round 7: pure read — no destination path is accepted. The fake
+          // mirrors the real daemon: content + sha256 over the wire, and a
+          // `dest` field (from a stale client) is ignored, never honored.
+          const sid = req.params?.session_id;
+          if (typeof sid !== "string" || !sid) {
+            respond({
+              jsonrpc: "2.0",
+              id: req.id,
+              error: {
+                code: -32602,
+                message: "INVALID_PARAMS",
+                data: { code: "INVALID_PARAMS", message: "Missing required parameter: session_id" },
+              },
+            });
+          } else if (state.session?.session_id !== sid) {
+            respond({ jsonrpc: "2.0", id: req.id, error: NOT_FOUND_ERROR });
+          } else if (!hasToken(req.params)) {
+            respond({ jsonrpc: "2.0", id: req.id, error: OBSERVATION_REQUIRED_ERROR });
+          } else {
+            const content = `{"seq":1,"event":"session.start"}\n{"seq":2,"event":"observe"}\n`;
+            respond({
+              jsonrpc: "2.0",
+              id: req.id,
+              result: {
+                trace_id: sid,
+                session_id: sid,
+                format: "jsonl",
+                mime_type: "application/x-ndjson",
+                file_name: `s_${sid}.jsonl`,
+                content,
+                size_bytes: Buffer.byteLength(content),
+                sha256: "abc123def456",
+              },
+            });
+          }
         } else if (req.method === "trace.list" || req.method === "trace.summaries") {
           // Session-scoped since round 6: the request must address exactly one
           // session with that session's observation/control token. The fake
