@@ -17,7 +17,7 @@
 // installed into its own temp dir with a plain `npm install`. No workspace
 // path is reachable at runtime. Failures print diagnostics and exit 1.
 import { spawnSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -174,10 +174,35 @@ try {
         continue;
       }
       ok("MCP bin --help (exit 0, usage printed)");
+
+      // Round 7: the USER path, not the node-dist path. After a plain
+      // `npm install`, `./node_modules/.bin/computer-use-mcp` must work
+      // directly — shim present, executable (no manual chmod), resolving to
+      // the packaged entry, shebang honored.
+      const shim = join(installDir, "node_modules", ".bin", "computer-use-mcp");
+      if (!existsSync(shim)) { fail("MCP .bin shim", `missing ${shim}`); continue; }
+      ok("MCP .bin/computer-use-mcp shim present");
+      const shimMode = statSync(shim).mode & 0o111;
+      if (shimMode === 0) { fail("MCP .bin shim executable", `${shim} mode 0${statSync(shim).mode.toString(8).slice(-3)} — a manual chmod must not be needed`); continue; }
+      ok(`MCP .bin shim executable (0${statSync(shim).mode.toString(8).slice(-3)})`);
+      // realpath both sides: macOS /var is a symlink to /private/var, so the
+      // spelling must not be compared verbatim.
+      const shimTarget = realpathSync(shim);
+      if (shimTarget !== realpathSync(binPath)) {
+        fail("MCP .bin shim target", `${shimTarget} !== ${binPath}`);
+        continue;
+      }
+      ok("MCP .bin shim resolves to the packaged bin");
+      const shimHelp = run(shim, ["--help"]);
+      if (shimHelp.status !== 0 || !shimHelp.stdout.includes("computer-use-mcp")) {
+        fail("MCP .bin --help (user path)", `exit ${shimHelp.status}${shimHelp.stderr ? `; stderr: ${shimHelp.stderr.slice(0, 300)}` : ""}`);
+        continue;
+      }
+      ok(".bin/computer-use-mcp --help (direct execution, shebang honored)");
       try {
-        const { lines, toolsResult } = await mcpInitializeAndToolsList(binPath);
+        const { lines, toolsResult } = await mcpInitializeAndToolsList(shim);
         const tools = toolsResult.tools.map((t) => t.name);
-        for (const line of lines) ok(`MCP stdio: ${line}`);
+        for (const line of lines) ok(`MCP stdio (via .bin shim): ${line}`);
         const core = ["computer_observe", "computer_act", "computer_inspect", "computer_session"];
         const missing = core.filter((t) => !tools.includes(t));
         if (missing.length) { fail("MCP tools/list core tools", `missing: ${missing.join(", ")}`); continue; }
@@ -186,10 +211,6 @@ try {
       } catch (err) {
         fail("MCP initialize + tools/list", err.message);
       }
-      // The .bin shim must also resolve (npm creates it from `bin`).
-      const shim = join(installDir, "node_modules", ".bin", "computer-use-mcp");
-      if (!existsSync(shim)) { fail("MCP .bin shim", `missing ${shim}`); continue; }
-      ok("MCP .bin/computer-use-mcp shim present");
     }
 
     if (pkg === "pi-extension") {

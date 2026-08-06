@@ -145,7 +145,7 @@ run_check "cu session --help" ./target/debug/cu session --help
 # ---------------------------------------------------------------------------
 if [ "$MODE" = "full" ]; then
   step "npm tarballs: install + executable + stdio + imports (verify-tarballs.mjs)"
-  run_check "verify-tarballs.mjs (22 assertions)" node scripts/verify-tarballs.mjs
+  run_check "verify-tarballs.mjs (25 assertions: fresh npm install, .bin shim direct --help + stdio initialize/tools-list)" node scripts/verify-tarballs.mjs
 else
   echo "== npm tarball gates skipped (--fast)"
 fi
