@@ -550,7 +550,7 @@ func resolveTarget(_ params: [String: Any]) -> [String: Any] {
                         return ["found": false, "reason": "pid_mismatch"]
                     }
                     if let b = bundleID {
-                        if let app = NSRunningApplication(processIdentifier: e["pid"] as! Int),
+                        if let app = NSRunningApplication(processIdentifier: pid_t(e["pid"] as! Int)),
                            app.bundleIdentifier != b {
                             return ["found": false, "reason": "bundle_mismatch"]
                         }
@@ -578,7 +578,7 @@ func resolveTarget(_ params: [String: Any]) -> [String: Any] {
     if let b = bundleID {
         for w in windows {
             let ownerPID = (w[kCGWindowOwnerPID as String] as? Int) ?? 0
-            if let app = NSRunningApplication(processIdentifier: ownerPID),
+            if let app = NSRunningApplication(processIdentifier: pid_t(ownerPID)),
                app.bundleIdentifier == b {
                 if let e = windowEntry(w) {
                     return ["found": true, "window": e]
