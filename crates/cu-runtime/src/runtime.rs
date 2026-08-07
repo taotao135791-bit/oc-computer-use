@@ -569,6 +569,17 @@ impl Runtime {
             )));
         }
         session.transition(SessionState::Active)?;
+        // Round 9 / P0-12: on release the agent is back in control — the
+        // ghost cursor must re-appear so the user can see where the agent
+        // points (takeover hid it). Drive it from the session's virtual
+        // pointer position.
+        {
+            let vp = session.virtual_pointer.lock().unwrap();
+            let _ = self
+                .driver
+                .pointer_visualized(vp.x, vp.y, &session.display_id)
+                .await;
+        }
         if let Some(t) = session.trace.as_ref() {
             let _ = t
                 .record_event("session.release", serde_json::json!({}))
