@@ -262,7 +262,17 @@ impl Runtime {
         &self,
         display_id: Option<String>,
         client: ClientInfo,
+        target: Option<cu_core::SessionTarget>,
+        pointer_policy: Option<cu_core::PointerPolicy>,
+        focus_policy: Option<cu_core::FocusPolicy>,
     ) -> Result<SessionResult, CuError> {
+        // Round 8: the start-time isolation options. The SANE DEFAULTS are
+        // `isolated_preferred` (never silently borrow the user's cursor) and
+        // `strict` (never steal foreground). An explicit target scopes the
+        // session to that app/window; bounds are resolved by the caller's
+        // adapter (true window resolution needs a live desktop, so default
+        // bounds are None and a strict target without resolved bounds still
+        // enforces the Focus Guard in `act`).
         let id = format!("s_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
         let display_id = match display_id {
             Some(d) => d,
@@ -329,6 +339,19 @@ impl Runtime {
             observation_token_hash,
             trace,
         ));
+
+        // Apply the start-time isolation options. `act` reads these from the
+        // session: pointer policy gates physical fallback, target + focus
+        // policy gate the keyboard focus guard.
+        if let Some(t) = target {
+            session.set_target(Some(t));
+        }
+        if let Some(pp) = pointer_policy {
+            session.set_pointer_policy(pp);
+        }
+        if let Some(fp) = focus_policy {
+            session.set_focus_policy(fp);
+        }
 
         // Acquire the global control lock. Held for the session's lifetime.
         // A lock held by another session fails with CONTROL_LOCKED carrying
@@ -596,6 +619,7 @@ impl Runtime {
     /// `control_token` is required for every mutating action except `start`
     /// (which creates the session and issues the tokens). `status` is a
     /// sensitive read: it requires the observation **or** control token.
+    #[allow(clippy::too_many_arguments)] // action boundary: every arg is a distinct execution context
     pub async fn session(
         &self,
         action: SessionAction,
@@ -604,9 +628,19 @@ impl Runtime {
         client: ClientInfo,
         control_token: Option<&str>,
         observation_token: Option<&str>,
+        start_options: SessionStartOptions,
     ) -> Result<SessionResult, CuError> {
         match action {
-            SessionAction::Start => self.session_start(display_id, client).await,
+            SessionAction::Start => {
+                self.session_start(
+                    display_id,
+                    client,
+                    start_options.target,
+                    start_options.pointer_policy,
+                    start_options.focus_policy,
+                )
+                .await
+            }
             SessionAction::Status => match session_id {
                 Some(id) => {
                     self.session_status(id, observation_token, control_token)
@@ -1387,6 +1421,18 @@ pub fn error_code(e: &CuError) -> ErrorCode {
     e.code()
 }
 
+/// Start-time isolation options for a new session (round 8). All fields are
+/// optional; the runtime applies sane defaults when absent.
+#[derive(Debug, Clone, Default)]
+pub struct SessionStartOptions {
+    /// Optional app/window target the session is scoped to.
+    pub target: Option<cu_core::SessionTarget>,
+    /// Pointer isolation policy (default `isolated_preferred`).
+    pub pointer_policy: Option<cu_core::PointerPolicy>,
+    /// Keyboard focus policy (default `strict`).
+    pub focus_policy: Option<cu_core::FocusPolicy>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1564,7 +1610,10 @@ mod tests {
     #[tokio::test]
     async fn session_lifecycle_and_lock() {
         let rt = runtime().await;
-        let started = rt.session_start(None, test_client()).await.unwrap();
+        let started = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = started
             .control_token
             .clone()
@@ -1573,7 +1622,10 @@ mod tests {
         assert!(started.lock_held);
 
         // A second session must be rejected by the control lock.
-        let err = rt.session_start(None, test_client()).await.unwrap_err();
+        let err = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ControlLocked);
 
         // Pause gates act.
@@ -1622,7 +1674,15 @@ mod tests {
     async fn status_without_session_returns_session_not_found() {
         let rt = runtime().await;
         let err = rt
-            .session(SessionAction::Status, None, None, test_client(), None, None)
+            .session(
+                SessionAction::Status,
+                None,
+                None,
+                test_client(),
+                None,
+                None,
+                SessionStartOptions::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::SessionNotFound);
@@ -1637,7 +1697,10 @@ mod tests {
     #[tokio::test]
     async fn session_records_owner_identity() {
         let rt = runtime().await;
-        let started = rt.session_start(None, test_client()).await.unwrap();
+        let started = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(started.owner_client_id.as_deref(), Some("test"));
         assert_eq!(started.owner_client_name.as_deref(), Some("Test client"));
         assert_eq!(started.owner_instance_id.as_deref(), Some("test-1"));
@@ -1682,7 +1745,10 @@ mod tests {
     #[tokio::test]
     async fn takeover_cannot_be_bypassed_by_resume() {
         let rt = runtime().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -1758,7 +1824,10 @@ mod tests {
     #[tokio::test]
     async fn takeover_cancels_in_flight_actions() {
         let (rt, fake) = runtime_with_driver().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -1836,7 +1905,10 @@ mod tests {
     #[tokio::test]
     async fn act_rejects_unknown_frame_and_stale() {
         let rt = runtime().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -1889,7 +1961,10 @@ mod tests {
     #[tokio::test]
     async fn trace_records_stale_rejection_cancel_and_screenshot_bytes() {
         let rt = runtime().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -1952,7 +2027,10 @@ mod tests {
     #[tokio::test]
     async fn action_failure_detail_is_recorded_in_trace() {
         let (rt, driver) = runtime_with_driver().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2015,7 +2093,10 @@ mod tests {
         // Default policy is Strict: only the session's current frame is
         // actionable, even when the older frame's pixels still match.
         let rt = runtime().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2068,7 +2149,10 @@ mod tests {
         let mut cfg = test_config();
         cfg.stale.policy = crate::stale_frame::StaleFramePolicy::VisualMatch;
         let rt = runtime_with_config(cfg).await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2121,7 +2205,10 @@ mod tests {
         cfg.trace_mode = cu_trace::TraceMode::Required;
         cfg.traces_dir = file.clone();
         let rt = runtime_with_config(cfg).await;
-        let err = rt.session_start(None, test_client()).await.unwrap_err();
+        let err = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), ErrorCode::TraceError);
         std::fs::remove_file(&file).unwrap();
     }
@@ -2130,7 +2217,10 @@ mod tests {
     async fn act_reports_trace_mode_and_degradation() {
         // Best-effort (default): act carries a trace report, mode best_effort.
         let rt = runtime().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2163,7 +2253,10 @@ mod tests {
         let mut cfg = test_config();
         cfg.trace_mode = cu_trace::TraceMode::Disabled;
         let rt2 = runtime_with_config(cfg).await;
-        let s2 = rt2.session_start(None, test_client()).await.unwrap();
+        let s2 = rt2
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token2 = s2
             .control_token
             .clone()
@@ -2195,7 +2288,10 @@ mod tests {
     #[tokio::test]
     async fn act_out_of_bounds_rejected() {
         let rt = runtime().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2236,7 +2332,10 @@ mod tests {
     #[tokio::test]
     async fn confirmation_required_is_enforced() {
         let rt = runtime().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2277,7 +2376,10 @@ mod tests {
     #[tokio::test]
     async fn inspect_crops_and_maps() {
         let rt = runtime().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2324,7 +2426,10 @@ mod tests {
         // and the report marks the interrupted wait (and everything after it)
         // `cancelled` — not `failed`, and not an internal error.
         let (rt, _driver) = runtime_with_driver().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2404,7 +2509,10 @@ mod tests {
         // wait_policy=fixed with a long duration must also stop quickly on
         // cancel, surfacing CANCELLED (not ACTION_TIMEOUT / internal error).
         let (rt, _driver) = runtime_with_driver().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2468,7 +2576,10 @@ mod tests {
         // until_stable must abort the wait (session.stop cancels the batch
         // token). The act call errors with CANCELLED rather than hanging.
         let (rt, _driver) = runtime_with_driver().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2532,7 +2643,10 @@ mod tests {
 
     /// Helper: start a session and observe a fresh frame for act calls.
     async fn start_observed(rt: &Arc<Runtime>) -> (String, cu_core::SecretToken, String) {
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let token = s
             .control_token
             .clone()
@@ -2619,7 +2733,15 @@ mod tests {
             ("stop", SessionAction::Stop),
         ] {
             let err = rt
-                .session(op.1, Some(&sid), None, test_client(), None, None)
+                .session(
+                    op.1,
+                    Some(&sid),
+                    None,
+                    test_client(),
+                    None,
+                    None,
+                    SessionStartOptions::default(),
+                )
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -2730,7 +2852,15 @@ mod tests {
             SessionAction::Pause,
         ] {
             let err = rt
-                .session(action, Some(&sid), None, other.clone(), None, None)
+                .session(
+                    action,
+                    Some(&sid),
+                    None,
+                    other.clone(),
+                    None,
+                    None,
+                    SessionStartOptions::default(),
+                )
                 .await
                 .unwrap_err();
             assert_eq!(err.code(), ErrorCode::ControlTokenRequired);
@@ -2867,7 +2997,10 @@ mod tests {
     #[tokio::test]
     async fn token_is_issued_exactly_once() {
         let rt = runtime().await;
-        let s = rt.session_start(None, test_client()).await.unwrap();
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let issued = s.control_token.clone().expect("start must issue the token");
         assert_eq!(issued.len(), 43, "256-bit base64url token");
 
@@ -2950,6 +3083,7 @@ mod tests {
                 test_client(),
                 Some(&token),
                 None,
+                SessionStartOptions::default(),
             )
             .await
             .unwrap_err();
@@ -2962,6 +3096,7 @@ mod tests {
                 test_client(),
                 Some(&token),
                 None,
+                SessionStartOptions::default(),
             )
             .await
             .unwrap_err();
@@ -3004,7 +3139,10 @@ mod tests {
         let rt = runtime().await;
         let (sid, token, _frame) = start_observed(&rt).await;
 
-        let err = rt.session_start(None, test_client()).await.unwrap_err();
+        let err = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ControlLocked);
         let data = err.to_error_data();
         assert_eq!(data["holder"], sid, "rejected client learns the holder id");
@@ -3204,7 +3342,10 @@ mod tests {
 
         // First daemon: start a session and stop it (the trace file stays).
         let rt = runtime_with_config(cfg.clone()).await;
-        let started = rt.session_start(None, test_client()).await.unwrap();
+        let started = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
         let sid = started.session_id.clone();
         let control = started.control_token.clone().unwrap();
         let observation = started.observation_token.clone().unwrap();

@@ -335,6 +335,19 @@ pub struct SessionParams {
     pub client_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_instance_id: Option<String>,
+    /// Optional app/window target for `action: start`. When set, the session
+    /// is scoped to that target: observe defaults to it, act rejects
+    /// coordinates outside it, and keyboard focus is validated against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<crate::sessions::SessionTarget>,
+    /// Pointer isolation policy for `action: start`. Default
+    /// `isolated_preferred` (never silently borrow the user's cursor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_policy: Option<crate::pointer::PointerPolicy>,
+    /// Keyboard focus policy for `action: start`. Default `strict` (never
+    /// steal foreground; Type/Key fail with INPUT_FOCUS_MISMATCH).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_policy: Option<crate::sessions::FocusPolicy>,
 }
 
 /// `session.summary` — the **public** view of the active session. No token

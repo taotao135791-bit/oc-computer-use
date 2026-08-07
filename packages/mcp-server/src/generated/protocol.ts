@@ -158,6 +158,13 @@ export type ErrorCode =
   | "ISOLATED_DRAG_UNAVAILABLE"
   | "PHYSICAL_FALLBACK_NOT_ALLOWED";
 /**
+ * How strictly keyboard focus is validated before `type`/`key`/`shortcut`.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "FocusPolicy".
+ */
+export type FocusPolicy = "strict" | "activate_target";
+/**
  * `computer.inspect` request.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
@@ -247,6 +254,13 @@ export type ObserveParams =
  */
 export type PermissionKind = "screen_recording" | "accessibility";
 /**
+ * Deterministic policy deciding when the runtime may borrow the real cursor.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "PointerPolicy".
+ */
+export type PointerPolicy = "isolated_only" | "isolated_preferred" | "physical_allowed";
+/**
  * Actions a caller may issue against a session via `computer.session`.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
@@ -279,10 +293,19 @@ export type SessionParams =
           control_token?: string;
           display_id?: string;
           /**
+           * Keyboard focus policy for `action: start`. Default `strict` (never steal foreground; Type/Key fail with INPUT_FOCUS_MISMATCH).
+           */
+          focus_policy?: "strict" | "activate_target";
+          /**
            * The session's observation token — accepted for `status` in place of the control token.
            */
           observation_token: string;
+          /**
+           * Pointer isolation policy for `action: start`. Default `isolated_preferred` (never silently borrow the user's cursor).
+           */
+          pointer_policy?: "isolated_only" | "isolated_preferred" | "physical_allowed";
           session_id?: string;
+          target?: SessionTarget;
           [k: string]: unknown;
         }
       | {
@@ -299,10 +322,19 @@ export type SessionParams =
           control_token: string;
           display_id?: string;
           /**
+           * Keyboard focus policy for `action: start`. Default `strict` (never steal foreground; Type/Key fail with INPUT_FOCUS_MISMATCH).
+           */
+          focus_policy?: "strict" | "activate_target";
+          /**
            * The session's observation token — accepted for `status` in place of the control token.
            */
           observation_token?: string;
+          /**
+           * Pointer isolation policy for `action: start`. Default `isolated_preferred` (never silently borrow the user's cursor).
+           */
+          pointer_policy?: "isolated_only" | "isolated_preferred" | "physical_allowed";
           session_id?: string;
+          target?: SessionTarget1;
           [k: string]: unknown;
         }
     )
@@ -320,10 +352,19 @@ export type SessionParams =
       control_token: string;
       display_id?: string;
       /**
+       * Keyboard focus policy for `action: start`. Default `strict` (never steal foreground; Type/Key fail with INPUT_FOCUS_MISMATCH).
+       */
+      focus_policy?: "strict" | "activate_target";
+      /**
        * The session's observation token — accepted for `status` in place of the control token.
        */
       observation_token?: string;
+      /**
+       * Pointer isolation policy for `action: start`. Default `isolated_preferred` (never silently borrow the user's cursor).
+       */
+      pointer_policy?: "isolated_only" | "isolated_preferred" | "physical_allowed";
       session_id?: string;
+      target?: SessionTarget2;
       [k: string]: unknown;
     };
 /**
@@ -813,6 +854,33 @@ export interface RuntimeVersionResult {
   [k: string]: unknown;
 }
 /**
+ * Optional app/window target for `action: start`. When set, the session is scoped to that target: observe defaults to it, act rejects coordinates outside it, and keyboard focus is validated against it.
+ */
+export interface SessionTarget {
+  bundle_id?: string;
+  pid?: number;
+  window_id?: number;
+  [k: string]: unknown;
+}
+/**
+ * Optional app/window target for `action: start`. When set, the session is scoped to that target: observe defaults to it, act rejects coordinates outside it, and keyboard focus is validated against it.
+ */
+export interface SessionTarget1 {
+  bundle_id?: string;
+  pid?: number;
+  window_id?: number;
+  [k: string]: unknown;
+}
+/**
+ * Optional app/window target for `action: start`. When set, the session is scoped to that target: observe defaults to it, act rejects coordinates outside it, and keyboard focus is validated against it.
+ */
+export interface SessionTarget2 {
+  bundle_id?: string;
+  pid?: number;
+  window_id?: number;
+  [k: string]: unknown;
+}
+/**
  * `computer.session` result (shape depends on `action`).
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
@@ -872,6 +940,18 @@ export interface SessionSummary {
    */
   session_id: string | null;
   state: SessionState | null;
+  [k: string]: unknown;
+}
+/**
+ * Optional app/window target for a session. When set, `computer_observe` is scoped to the target window and `computer_act` rejects coordinates outside its bounds. The runtime never auto-clicks other apps.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "SessionTarget".
+ */
+export interface SessionTarget3 {
+  bundle_id?: string;
+  pid?: number;
+  window_id?: number;
   [k: string]: unknown;
 }
 /**

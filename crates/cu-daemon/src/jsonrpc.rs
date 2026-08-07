@@ -220,6 +220,11 @@ pub async fn dispatch(
                     client,
                     p.control_token.as_deref(),
                     p.observation_token.as_deref(),
+                    cu_runtime::SessionStartOptions {
+                        target: p.target,
+                        pointer_policy: p.pointer_policy,
+                        focus_policy: p.focus_policy,
+                    },
                 )
                 .await
                 .and_then(to_result)

@@ -18,7 +18,7 @@ pub mod stale_frame;
 pub use frames::{FrameStore, StoredFrame};
 pub use human_input::{HumanInputMonitor, HumanInputSink, SYNTHETIC_WINDOW};
 pub use requests::{RequestHandle, RequestRegistry};
-pub use runtime::{error_code, Runtime, RuntimeConfig};
+pub use runtime::{error_code, Runtime, RuntimeConfig, SessionStartOptions};
 pub use sessions::{ControlLock, Session, SharedSession};
 pub use stabilizer::{StabilizeOutcome, Stabilizer, StabilizerConfig};
 pub use stale_frame::{StaleFrameChecker, StaleFrameConfig};

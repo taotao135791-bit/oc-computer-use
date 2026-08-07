@@ -692,6 +692,25 @@
         }
       ]
     },
+    "FocusPolicy": {
+      "description": "How strictly keyboard focus is validated before `type`/`key`/`shortcut`.",
+      "oneOf": [
+        {
+          "description": "Never steal foreground/key focus. If focus is not on the target, reject with `INPUT_FOCUS_MISMATCH`.",
+          "enum": [
+            "strict"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Activate the target app/window before keyboard input (explicit opt-in).",
+          "enum": [
+            "activate_target"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "InspectMapping": {
       "description": "Mapping info that lets a model safely translate an inspect-relative coordinate back into global desktop coordinates.",
       "properties": {
@@ -1120,6 +1139,32 @@
       ],
       "type": "object"
     },
+    "PointerPolicy": {
+      "description": "Deterministic policy deciding when the runtime may borrow the real cursor.",
+      "oneOf": [
+        {
+          "description": "Never touch the real system cursor. Isolated actions that cannot be realized are rejected (`ISOLATED_POINTER_UNAVAILABLE` / `ISOLATED_DRAG_UNAVAILABLE`).",
+          "enum": [
+            "isolated_only"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Prefer isolation; allow physical fallback **only when the caller explicitly permits it** for the action (e.g. `physical_fallback: true` on a drag). The default for Pi/OpenCode.",
+          "enum": [
+            "isolated_preferred"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Automatically fall back to the physical cursor when isolation is unavailable. Human input can always interrupt.",
+          "enum": [
+            "physical_allowed"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "RedactedText": {
       "description": "Redacted description of a `type` action used in traces and logs by default.",
       "properties": {
@@ -1309,12 +1354,24 @@
                 "display_id": {
                   "type": "string"
                 },
+                "focus_policy": {
+                  "$ref": "#/$defs/FocusPolicy",
+                  "description": "Keyboard focus policy for `action: start`. Default `strict` (never steal foreground; Type/Key fail with INPUT_FOCUS_MISMATCH)."
+                },
                 "observation_token": {
                   "description": "The session's observation token — accepted for `status` in place of the control token.",
                   "type": "string"
                 },
+                "pointer_policy": {
+                  "$ref": "#/$defs/PointerPolicy",
+                  "description": "Pointer isolation policy for `action: start`. Default `isolated_preferred` (never silently borrow the user's cursor)."
+                },
                 "session_id": {
                   "type": "string"
+                },
+                "target": {
+                  "$ref": "#/$defs/SessionTarget",
+                  "description": "Optional app/window target for `action: start`. When set, the session is scoped to that target: observe defaults to it, act rejects coordinates outside it, and keyboard focus is validated against it."
                 }
               },
               "required": [
@@ -1343,12 +1400,24 @@
                 "display_id": {
                   "type": "string"
                 },
+                "focus_policy": {
+                  "$ref": "#/$defs/FocusPolicy",
+                  "description": "Keyboard focus policy for `action: start`. Default `strict` (never steal foreground; Type/Key fail with INPUT_FOCUS_MISMATCH)."
+                },
                 "observation_token": {
                   "description": "The session's observation token — accepted for `status` in place of the control token.",
                   "type": "string"
                 },
+                "pointer_policy": {
+                  "$ref": "#/$defs/PointerPolicy",
+                  "description": "Pointer isolation policy for `action: start`. Default `isolated_preferred` (never silently borrow the user's cursor)."
+                },
                 "session_id": {
                   "type": "string"
+                },
+                "target": {
+                  "$ref": "#/$defs/SessionTarget",
+                  "description": "Optional app/window target for `action: start`. When set, the session is scoped to that target: observe defaults to it, act rejects coordinates outside it, and keyboard focus is validated against it."
                 }
               },
               "required": [
@@ -1384,12 +1453,24 @@
             "display_id": {
               "type": "string"
             },
+            "focus_policy": {
+              "$ref": "#/$defs/FocusPolicy",
+              "description": "Keyboard focus policy for `action: start`. Default `strict` (never steal foreground; Type/Key fail with INPUT_FOCUS_MISMATCH)."
+            },
             "observation_token": {
               "description": "The session's observation token — accepted for `status` in place of the control token.",
               "type": "string"
             },
+            "pointer_policy": {
+              "$ref": "#/$defs/PointerPolicy",
+              "description": "Pointer isolation policy for `action: start`. Default `isolated_preferred` (never silently borrow the user's cursor)."
+            },
             "session_id": {
               "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/SessionTarget",
+              "description": "Optional app/window target for `action: start`. When set, the session is scoped to that target: observe defaults to it, act rejects coordinates outside it, and keyboard focus is validated against it."
             }
           },
           "required": [
@@ -1419,12 +1500,24 @@
         "display_id": {
           "type": "string"
         },
+        "focus_policy": {
+          "$ref": "#/$defs/FocusPolicy",
+          "description": "Keyboard focus policy for `action: start`. Default `strict` (never steal foreground; Type/Key fail with INPUT_FOCUS_MISMATCH)."
+        },
         "observation_token": {
           "description": "The session's observation token — accepted for `status` in place of the control token.",
           "type": "string"
         },
+        "pointer_policy": {
+          "$ref": "#/$defs/PointerPolicy",
+          "description": "Pointer isolation policy for `action: start`. Default `isolated_preferred` (never silently borrow the user's cursor)."
+        },
         "session_id": {
           "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/SessionTarget",
+          "description": "Optional app/window target for `action: start`. When set, the session is scoped to that target: observe defaults to it, act rejects coordinates outside it, and keyboard focus is validated against it."
         }
       },
       "required": [
@@ -1570,6 +1663,23 @@
         "session_id",
         "state"
       ],
+      "type": "object"
+    },
+    "SessionTarget": {
+      "description": "Optional app/window target for a session. When set, `computer_observe` is scoped to the target window and `computer_act` rejects coordinates outside its bounds. The runtime never auto-clicks other apps.",
+      "properties": {
+        "bundle_id": {
+          "type": "string"
+        },
+        "pid": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "window_id": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
       "type": "object"
     },
     "ShutdownParams": {
