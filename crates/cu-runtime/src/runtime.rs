@@ -349,6 +349,19 @@ impl Runtime {
             .unwrap()
             .insert(id.clone(), session.clone());
 
+        // Round 8 / Phase 4: seed the session's VIRTUAL POINTER from the live
+        // system cursor position. This is a pure READ — we only borrow the
+        // position once as the agent's starting coordinate; the system cursor
+        // still belongs to the user. Then show the ghost cursor overlay so the
+        // user can see where the agent points without the real cursor moving.
+        if let Ok(pi) = self.driver.pointer_location().await {
+            session.init_virtual_pointer(pi.location, session.display_id.clone());
+            let _ = self
+                .driver
+                .pointer_visualized(pi.location.x, pi.location.y, &session.display_id)
+                .await;
+        }
+
         if let Some(t) = session.trace.as_ref() {
             let _ = t
                 .record_event(
@@ -558,6 +571,9 @@ impl Runtime {
             _ => {}
         }
         session.transition(SessionState::Stopping)?; // cancels in-flight
+                                                     // Round 8 / Phase 4: session stop must destroy the ghost cursor
+                                                     // overlay — never leave a window, timer, or run-loop source behind.
+        let _ = self.driver.pointer_hidden().await;
         if let Some(t) = session.trace.as_ref() {
             let _ = t
                 .record_event("session.stop", serde_json::json!({ "reason": "requested" }))
@@ -941,6 +957,16 @@ impl Runtime {
             ..Default::default()
         };
         let queue = ActionQueue::new(self.driver.as_ref());
+        // The live frontmost bundle id feeds the keyboard focus guard
+        // (Phase 16): a real `active_application` read, not the frame's
+        // possibly-stale snapshot.
+        let live_bundle_id = self
+            .driver
+            .active_application()
+            .await
+            .ok()
+            .flatten()
+            .map(|app| app.bundle_id);
         let runs = queue
             .run(
                 &session,
@@ -954,6 +980,7 @@ impl Runtime {
                 &params.frame_id,
                 &session.display_id,
                 before_screen.active_application.as_deref(),
+                live_bundle_id.as_deref(),
             )
             .await?;
         *session.last_action_at.lock().unwrap() = Some(Utc::now());
@@ -1384,6 +1411,8 @@ mod tests {
         pub executes: std::sync::atomic::AtomicUsize,
         /// When set, the next execute() fails (failure-path trace tests).
         pub fail_next: std::sync::atomic::AtomicBool,
+        /// Frontmost bundle id for the keyboard focus guard (None = unknown).
+        pub active_bundle: std::sync::Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
@@ -1484,7 +1513,16 @@ mod tests {
             })
         }
         async fn active_application(&self) -> Result<Option<ApplicationInfo>, CuError> {
-            Ok(None)
+            Ok(self
+                .active_bundle
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|b| ApplicationInfo {
+                    bundle_id: b,
+                    name: "fake".into(),
+                    window_title: None,
+                }))
         }
         async fn pointer_location(&self) -> Result<PointerInfo, CuError> {
             Ok(PointerInfo {
@@ -1743,12 +1781,13 @@ mod tests {
             frame_id: obs.frame_id.clone(),
             actions: vec![
                 // The first action completes before the takeover: it must be
-                // reported as done. The waits are what the takeover interrupts.
-                ComputerAction::Move {
+                // reported as done. A Click reaches the physical driver; the
+                // waits are what the takeover interrupts.
+                ComputerAction::Click {
                     x: 400.0,
                     y: 400.0,
+                    button: cu_core::MouseButton::Left,
                     coordinate_space: cu_core::CoordinateSpace::Normalized1000,
-                    duration_ms: None,
                 },
                 ComputerAction::Wait { duration_ms: 200 },
                 ComputerAction::Wait { duration_ms: 200 },
@@ -2520,14 +2559,16 @@ mod tests {
 
         rt.session_pause(&sid, Some(&token)).await.unwrap();
         rt.session_resume(&sid, Some(&token)).await.unwrap();
+        // Round 8: a Move is virtual-only — it updates the session's virtual
+        // pointer and drives the ghost cursor, never the physical driver.
         let res = rt
             .act(
                 ActParams {
                     session_id: sid.clone(),
                     frame_id: frame,
                     actions: vec![ComputerAction::Move {
-                        x: 100.0,
-                        y: 100.0,
+                        x: 500.0,
+                        y: 500.0,
                         coordinate_space: CoordinateSpace::Normalized1000,
                         duration_ms: None,
                     }],
@@ -2544,7 +2585,25 @@ mod tests {
             .await
             .unwrap();
         assert!(res.executed);
-        assert_eq!(fake.executes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a Move must never reach the physical driver (virtual-only)"
+        );
+        // The virtual pointer actually moved. normalized_1000 (500,500) on
+        // the fake 4x4 image → pixel (2,2) → global (2.0, 2.0), distinct from
+        // the seeded (0,0).
+        let vp = rt
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&sid)
+            .unwrap()
+            .virtual_pointer
+            .lock()
+            .unwrap()
+            .location();
+        assert!(vp.x > 0.0 && vp.y > 0.0, "virtual pointer must move");
         rt.session_stop(&sid, Some(&token)).await.unwrap();
     }
 
@@ -2961,6 +3020,175 @@ mod tests {
                 .contains(token.as_str()),
             "the error must never contain the control token"
         );
+    }
+
+    /// Round 8 / Phase 16 — Keyboard Focus Guard: when the session has a
+    /// bundle-id target and the frontmost app is something else, a Type action
+    /// is rejected with INPUT_FOCUS_MISMATCH and NO keyboard event reaches the
+    /// driver. The runtime never steals focus.
+    #[tokio::test]
+    async fn type_rejected_when_focus_is_not_on_target() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_observed(&rt).await;
+
+        // Scope the session to Chrome; the fake frontmost app is TextEdit.
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_target(Some(cu_core::SessionTarget {
+                bundle_id: Some("com.google.Chrome".into()),
+                pid: None,
+                window_id: None,
+            }));
+        }
+        *fake.active_bundle.lock().unwrap() = Some("com.apple.TextEdit".into());
+
+        let res = rt
+            .act(
+                ActParams {
+                    session_id: sid.clone(),
+                    frame_id: frame.clone(),
+                    actions: vec![ComputerAction::TypeText {
+                        text: "hi".into(),
+                        method: cu_core::TextInputMethod::Keyboard,
+                    }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.action_results[0].status, "failed");
+        assert_eq!(
+            res.action_results[0].error.as_deref(),
+            Some("INPUT_FOCUS_MISMATCH")
+        );
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no keyboard event may reach the driver on focus mismatch"
+        );
+
+        // With focus correctly on Chrome, Type succeeds.
+        *fake.active_bundle.lock().unwrap() = Some("com.google.Chrome".into());
+        let ok = rt
+            .act(
+                ActParams {
+                    session_id: sid.clone(),
+                    frame_id: frame.clone(),
+                    actions: vec![ComputerAction::TypeText {
+                        text: "hi".into(),
+                        method: cu_core::TextInputMethod::Keyboard,
+                    }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.action_results[0].status, "success");
+        assert_eq!(fake.executes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// Round 8 / Phase 9 — PointerPolicy `isolated_only`: physical-required
+    /// actions (Drag, located Scroll) are refused before any driver call, and
+    /// the rest of the batch is marked cancelled. The real cursor is never
+    /// moved.
+    #[tokio::test]
+    async fn isolated_only_rejects_physical_drag_and_scroll() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_observed(&rt).await;
+
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_pointer_policy(cu_core::PointerPolicy::IsolatedOnly);
+        }
+
+        // Drag under isolated_only → ISOLATED_DRAG_UNAVAILABLE, no driver call.
+        let res = rt
+            .act(
+                ActParams {
+                    session_id: sid.clone(),
+                    frame_id: frame.clone(),
+                    actions: vec![ComputerAction::Drag {
+                        from: cu_core::Point::new(100.0, 100.0),
+                        to: cu_core::Point::new(200.0, 200.0),
+                        coordinate_space: CoordinateSpace::Normalized1000,
+                        duration_ms: None,
+                    }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.action_results[0].status, "failed");
+        assert_eq!(
+            res.action_results[0].error.as_deref(),
+            Some("ISOLATED_DRAG_UNAVAILABLE")
+        );
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "isolated_only must never move the physical cursor"
+        );
+
+        // Located Scroll under isolated_only → PHYSICAL_FALLBACK_NOT_ALLOWED.
+        let res = rt
+            .act(
+                ActParams {
+                    session_id: sid.clone(),
+                    frame_id: frame,
+                    actions: vec![ComputerAction::Scroll {
+                        x: Some(100.0),
+                        y: Some(100.0),
+                        delta_x: 0.0,
+                        delta_y: -30.0,
+                        coordinate_space: CoordinateSpace::Normalized1000,
+                    }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.action_results[0].status, "failed");
+        assert_eq!(
+            res.action_results[0].error.as_deref(),
+            Some("PHYSICAL_FALLBACK_NOT_ALLOWED")
+        );
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "isolated_only must never move the physical cursor for scroll"
+        );
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
     }
 
     /// Round 6: trace access survives a daemon restart through the persisted

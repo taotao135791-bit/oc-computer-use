@@ -64,6 +64,10 @@ pub struct MacosDriver {
     bridge: Bridge,
     /// Cached desktop layout, refreshed when displays change.
     layout: Mutex<Option<DesktopLayout>>,
+    /// Round 8 / Phase 11: the live human-input event tap. Created when the
+    /// daemon calls [`MacosDriver::start_human_input_monitor`]; stopped on
+    /// [`MacosDriver::shutdown`] so no thread or run-loop source leaks.
+    event_tap: Mutex<Option<std::sync::Arc<event_tap::EventTapHandle>>>,
 }
 
 impl Default for MacosDriver {
@@ -77,6 +81,7 @@ impl MacosDriver {
         Self {
             bridge: Bridge::new(),
             layout: Mutex::new(None),
+            event_tap: Mutex::new(None),
         }
     }
 
@@ -88,6 +93,7 @@ impl MacosDriver {
         Self {
             bridge: b,
             layout: Mutex::new(None),
+            event_tap: Mutex::new(None),
         }
     }
 
@@ -389,8 +395,26 @@ impl ComputerDriver for MacosDriver {
     }
 
     async fn shutdown(&self) -> Result<(), CuError> {
+        // Round 8 / Phase 11: stop the human-input event tap first — the
+        // bridge shutdown must never outlive a live event tap thread.
+        if let Some(tap) = self.event_tap.lock().unwrap().take() {
+            tap.stop();
+        }
         self.bridge.shutdown();
         Ok(())
+    }
+
+    fn start_human_input_monitor(&self, sink: Box<dyn Fn(u64) + Send + Sync>) -> bool {
+        // Adapt the raw closure to the tap's Sink trait, then start the
+        // monitor on its own native thread with its own CFRunLoop.
+        let tap_sink = event_tap::ClosureSink::new(sink);
+        match event_tap::start_monitor_with_sink(std::sync::Arc::new(tap_sink), true) {
+            Some(handle) => {
+                *self.event_tap.lock().unwrap() = Some(handle);
+                true
+            }
+            None => false,
+        }
     }
 }
 

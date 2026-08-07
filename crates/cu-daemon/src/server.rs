@@ -24,7 +24,7 @@ use cu_core::security::SecretTokenHash;
 use cu_core::{ErrorCode, RpcRequest, RpcResponse};
 use cu_driver::ComputerDriver;
 use cu_driver_macos::MacosDriver;
-use cu_runtime::{Runtime, RuntimeConfig};
+use cu_runtime::{HumanInputSink, Runtime, RuntimeConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
@@ -86,7 +86,22 @@ pub(crate) async fn serve_with(
     driver: Arc<dyn ComputerDriver>,
     config: DaemonConfig,
 ) -> anyhow::Result<()> {
-    let runtime = Arc::new(Runtime::new(driver, config.runtime_config.clone()));
+    let runtime = Arc::new(Runtime::new(driver.clone(), config.runtime_config.clone()));
+
+    // Round 8 / Phase 11: start the continuous human-input monitor (Event Tap)
+    // on its own native thread. The tap feeds the runtime's HumanInputMonitor,
+    // so Human Always Wins works *while* a batch executes — not only after. It
+    // is stopped by the driver's shutdown path (joined, no leaked threads).
+    {
+        let monitor = runtime.human_input.clone();
+        let started = driver.start_human_input_monitor(Box::new(move |latency_ms| {
+            // The tap already resolved the event's real timestamp; forward it
+            // to the monitor, which records the interrupt latency and raises
+            // the takeover flag (Human Always Wins).
+            monitor.on_human_event(latency_ms);
+        }));
+        tracing::info!(event_tap = started, "human-input monitor state");
+    }
 
     // Prune trace files older than the retention window on startup.
     if let Ok(removed) = cu_trace::prune_old_traces(

@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use cu_core::{ComputerAction, CuError, ImageGeometry, Point};
+use cu_core::{ComputerAction, CuError, ImageGeometry, Point, PointerPolicy};
 use cu_driver::ComputerDriver;
 use cu_policy::{TakeoverDetector, TakeoverPolicy};
 use cu_trace::TraceRecorder;
@@ -83,15 +83,14 @@ impl<'a> ActionQueue<'a> {
         frame_id: &str,
         display_id: &str,
         active_app: Option<&str>,
+        active_bundle_id: Option<&str>,
     ) -> Result<Vec<ActionRun>, CuError> {
         let mut reports = Vec::with_capacity(actions.len());
-        // Baseline pointer: where the human (or a previous batch) left it.
-        let mut last_pointer = self
-            .driver
-            .pointer_location()
-            .await
-            .map(|p| p.location)
-            .unwrap_or(Point::new(0.0, 0.0));
+        // Round 8 / Phase 2-3: the agent's pointer is the SESSION VIRTUAL
+        // POINTER, never the physical system cursor. Every agent pointer
+        // action starts from this logical position; the real cursor belongs
+        // to the human and is only consulted for the takeover fallback.
+        let mut last_pointer = session.virtual_pointer.lock().unwrap().location();
         takeover.reset();
 
         for (i, action) in actions.iter().enumerate() {
@@ -108,6 +107,63 @@ impl<'a> ActionQueue<'a> {
                     let _ = self.apply_takeover(session, takeover);
                     self.fill_cancelled(&mut reports, i, actions.len());
                     break;
+                }
+            }
+
+            // Round 8 / Phase 9 — PointerPolicy gates physical-required
+            // actions. Drag and located Scroll move the REAL cursor; under
+            // `isolated_only` they are refused outright. Under
+            // `isolated_preferred` they are refused unless the caller
+            // explicitly permitted physical fallback (the runtime never
+            // silently moves the user's cursor).
+            let policy = session.get_pointer_policy();
+            if matches!(policy, PointerPolicy::IsolatedOnly) {
+                let needs_physical = matches!(
+                    action,
+                    ComputerAction::Drag { .. }
+                        | ComputerAction::Scroll {
+                            x: Some(_),
+                            y: Some(_),
+                            ..
+                        }
+                );
+                if needs_physical {
+                    reports.push(ActionRun::failed(
+                        i,
+                        0,
+                        if matches!(action, ComputerAction::Drag { .. }) {
+                            "ISOLATED_DRAG_UNAVAILABLE"
+                        } else {
+                            "PHYSICAL_FALLBACK_NOT_ALLOWED"
+                        }
+                        .into(),
+                    ));
+                    self.fill_cancelled(&mut reports, i + 1, actions.len());
+                    break;
+                }
+            }
+
+            // Round 8 / Phase 16 — Keyboard Focus Guard. Type / Key / Shortcut
+            // (including clipboard paste, which ends in CMD+V) are refused when
+            // the frontmost application does not match the session target's
+            // bundle id. We never auto-activate or steal focus; the failure is
+            // INPUT_FOCUS_MISMATCH and NO keyboard event is ever sent.
+            let needs_focus = matches!(
+                action,
+                ComputerAction::TypeText { .. } | ComputerAction::Key { .. }
+            );
+            if needs_focus {
+                if let Some(t) = session.get_target() {
+                    if let Some(target_bundle) = t.bundle_id {
+                        let focused = active_bundle_id
+                            .map(|b| b == target_bundle)
+                            .unwrap_or(false);
+                        if !focused {
+                            reports.push(ActionRun::failed(i, 0, "INPUT_FOCUS_MISMATCH".into()));
+                            self.fill_cancelled(&mut reports, i + 1, actions.len());
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -136,6 +192,25 @@ impl<'a> ActionQueue<'a> {
             let started = Instant::now();
             let mut wait_interrupted = false;
             let outcome = match &resolved {
+                // Round 8 / Phase 3: a Move is a **virtual-only** pointer
+                // action. It never touches the physical system cursor — it
+                // updates the session's virtual pointer and drives the ghost
+                // cursor overlay only. System pointer delta stays 0.
+                cu_driver::ResolvedAction::Move { to, .. } => {
+                    session.set_virtual_pointer(*to, display_id);
+                    // Best-effort: the overlay is a visual aid; if the bridge
+                    // cannot show it the action still succeeds (the virtual
+                    // pointer moved).
+                    let _ = self.driver.pointer_visualized(to.x, to.y, display_id).await;
+                    Ok(cu_driver::ActionResult {
+                        success: true,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        detail: Some(
+                            "pointer_backend:virtual;isolated:true;physical_cursor_moved:false"
+                                .into(),
+                        ),
+                    })
+                }
                 // Cancellation-aware wait: a 10s wait must stop immediately
                 // when the batch token fires (cancel / stop) or the session
                 // aborts mid-wait (pause/takeover/stopped), not sleep it out.
@@ -229,14 +304,16 @@ impl<'a> ActionQueue<'a> {
                 .await?;
             }
 
-            // Human-takeover probe. Only meaningful after an action that did
-            // NOT move the pointer itself: our own Move/Click/Drag legitimately
-            // relocates the pointer and must not count as a human grab.
+            // Human-takeover probe. Since round 8 the physical pointer delta
+            // heuristic is a FALLBACK only — the Event Tap is the primary
+            // detector. This branch compares the REAL cursor to the position
+            // it was left at after actions that do not move it by design.
+            // The agent's own position bookkeeping (last_pointer) always uses
+            // the session's virtual pointer, never the physical cursor.
             if !action_moves_pointer(action) {
                 if let Ok(pi) = self.driver.pointer_location().await {
                     let dx = pi.location.x - last_pointer.x;
                     let dy = pi.location.y - last_pointer.y;
-                    last_pointer = pi.location;
                     if takeover.observe(dx, dy) {
                         let _ = self.apply_takeover(session, takeover);
                         self.fill_cancelled(&mut reports, i + 1, actions.len());
@@ -244,10 +321,7 @@ impl<'a> ActionQueue<'a> {
                     }
                 }
             } else {
-                last_pointer = match self.driver.pointer_location().await {
-                    Ok(pi) => pi.location,
-                    Err(_) => last_pointer,
-                };
+                last_pointer = session.virtual_pointer.lock().unwrap().location();
             }
         }
 

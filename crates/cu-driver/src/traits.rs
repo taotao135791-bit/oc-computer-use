@@ -93,6 +93,14 @@ pub trait ComputerDriver: Send + Sync {
 
     /// Release any OS-level resources (CGEvent sources, the bridge process).
     async fn shutdown(&self) -> Result<(), CuError>;
+
+    /// Round 8 / Phase 11: start the driver's continuous human-input monitor
+    /// (macOS Event Tap). `sink` receives the real `event_to_tap_ms` latency
+    /// for every non-synthetic human event. Returns `true` when a monitor is
+    /// running. Default is a no-op so test/fake drivers need not implement it.
+    fn start_human_input_monitor(&self, _sink: Box<dyn Fn(u64) + Send + Sync>) -> bool {
+        false
+    }
 }
 
 pub use crate::types::ActionResult;

@@ -823,10 +823,10 @@ mod tests {
                     "session_id": sid2,
                     "frame_id": frame2,
                     "control_token": act_token,
-                    "actions": [
-                        { "type": "move", "x": 100.0, "y": 100.0, "coordinate_space": "normalized_1000" },
-                        { "type": "wait", "duration_ms": 10_000 }
-                    ],
+                "actions": [
+                    { "type": "click", "x": 100.0, "y": 100.0, "button": "left", "coordinate_space": "normalized_1000" },
+                    { "type": "wait", "duration_ms": 10_000 }
+                ],
                 }),
             )
             .await
@@ -999,7 +999,7 @@ mod tests {
                 "session_id": sid,
                 "frame_id": frame,
                 "control_token": token,
-                "actions": [{ "type": "move", "x": 100.0, "y": 100.0, "coordinate_space": "normalized_1000" }],
+                "actions": [{ "type": "click", "x": 100.0, "y": 100.0, "button": "left", "coordinate_space": "normalized_1000" }],
             }),
         )
         .await;
@@ -1961,12 +1961,25 @@ mod tests {
         let (rt, fake) = test_runtime_with_driver().await;
         let (_sid, _token, observation) = start_and_observe(&rt, 1).await;
 
-        let driver_calls = |fake: &FakeDriver| {
+        // Round 8: `session_start` reads the physical pointer once to seed the
+        // session's VIRTUAL POINTER (a legitimate, token-gated driver call).
+        // The no-token refusals below must add ZERO further driver calls, so
+        // compare against the post-start baseline rather than (0,0).
+        let baseline_driver_calls = |fake: &FakeDriver| {
             (
                 fake.pointer_calls.load(std::sync::atomic::Ordering::SeqCst),
                 fake.active_app_calls
                     .load(std::sync::atomic::Ordering::SeqCst),
             )
+        };
+        let baseline = baseline_driver_calls(&fake);
+        let driver_calls = |fake: &FakeDriver| {
+            let now = (
+                fake.pointer_calls.load(std::sync::atomic::Ordering::SeqCst),
+                fake.active_app_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            );
+            (now.0 - baseline.0, now.1 - baseline.1)
         };
 
         // 1) No token → OBSERVATION_TOKEN_REQUIRED, zero driver calls.
