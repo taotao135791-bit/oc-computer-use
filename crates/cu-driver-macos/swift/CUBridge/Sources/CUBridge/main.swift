@@ -18,6 +18,7 @@ import ScreenCaptureKit
 import AppKit
 import ApplicationServices
 import CoreImage
+import QuartzCore
 
 // MARK: - Sendable-safe capture delegate holder
 
@@ -120,6 +121,225 @@ func listDisplays() -> [[String: Any]] {
     return result
 }
 
+// MARK: - Ghost Cursor Overlay (round 8: Pointer Isolation + Visual Cursor)
+
+final class GhostCursorOverlay {
+    static let shared = GhostCursorOverlay()
+
+    private var window: NSPanel?
+    private var ringLayer: CAShapeLayer?
+    private var centerDot: CALayer?
+    private var ring2: CAShapeLayer?
+    private let windowSize: CGFloat = 56
+
+    private var visible = false
+
+    private func ensureNSApp() {
+        if NSApp == nil {
+            _ = NSApplication.shared
+            NSApp?.setActivationPolicy(.accessory)
+        }
+    }
+
+    var currentWindowID: CGWindowID? {
+        guard let w = window, w.isVisible else { return nil }
+        return CGWindowID(w.windowNumber)
+    }
+
+    func show(x: Double, y: Double, displayId: String, mode: String) {
+        ensureNSApp()
+        visible = true
+        DispatchQueue.main.async {
+            guard let screen = GhostCursorOverlay.screen(forCG: CGPoint(x: x, y: y),
+                                                         displayId: displayId) else { return }
+            self.configureWindowIfNeeded()
+            guard let w = self.window else { return }
+            let nsPoint = NSPoint(x: x - self.windowSize / 2,
+                                  y: NSMaxY(screen.frame) - y - self.windowSize / 2)
+            var frame = NSRect(origin: nsPoint, size: NSSize(width: self.windowSize, height: self.windowSize))
+            frame = frame.intersection(screen.frame)
+            w.setFrame(frame, display: true)
+            self.applyMode(mode, on: screen)
+            if !w.isVisible {
+                w.orderFrontRegardless()
+            }
+        }
+    }
+
+    func hide() {
+        ensureNSApp()
+        visible = false
+        DispatchQueue.main.async {
+            self.window?.orderOut(nil)
+        }
+    }
+
+    func clickRipple(x: Double, y: Double) {
+        ensureNSApp()
+        guard visible else { return }
+        DispatchQueue.main.async {
+            guard let screen = GhostCursorOverlay.screen(forCG: CGPoint(x: x, y: y),
+                                                         displayId: nil) else { return }
+            self.configureWindowIfNeeded()
+            guard let w = self.window else { return }
+            let nsPoint = NSPoint(x: x - self.windowSize / 2,
+                                  y: NSMaxY(screen.frame) - y - self.windowSize / 2)
+            let frame = NSRect(origin: nsPoint, size: NSSize(width: self.windowSize, height: self.windowSize))
+            w.setFrame(frame, display: true)
+            w.orderFrontRegardless()
+            self.playRipple(on: screen)
+        }
+    }
+
+    private func configureWindowIfNeeded() {
+        if window != nil { return }
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: windowSize, height: windowSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.ignoresMouseEvents = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.isMovable = false
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        panel.isReleasedWhenClosed = false
+
+        let layer = CALayer()
+        layer.backgroundColor = NSColor.clear.cgColor
+        panel.contentView?.wantsLayer = true
+        panel.contentView?.layer = layer
+        panel.contentView?.layer?.masksToBounds = false
+
+        let ring = CAShapeLayer()
+        ring.fillColor = NSColor.clear.cgColor
+        ring.lineWidth = 2.2
+        panel.contentView?.layer?.addSublayer(ring)
+        ringLayer = ring
+
+        ring2 = CAShapeLayer()
+        ring2?.fillColor = NSColor.clear.cgColor
+        ring2?.lineWidth = 1.6
+        ring2?.opacity = 0
+        panel.contentView?.layer?.addSublayer(ring2!)
+
+        let dot = CALayer()
+        dot.bounds = CGRect(x: 0, y: 0, width: 5, height: 5)
+        dot.cornerRadius = 2.5
+        panel.contentView?.layer?.addSublayer(dot)
+        centerDot = dot
+
+        window = panel
+    }
+
+    private func applyMode(_ mode: String, on screen: NSScreen) {
+        let scale = screen.backingScaleFactor
+        window?.contentView?.layer?.contentsScale = scale
+        guard let contentLayer = window?.contentView?.layer,
+              let ring = ringLayer, let dot = centerDot else { return }
+
+        let color: NSColor
+        switch mode {
+        case "physical_fallback":
+            color = NSColor(calibratedRed: 1.0, green: 0.55, blue: 0.0, alpha: 1.0)
+        case "paused":
+            color = NSColor(calibratedWhite: 0.62, alpha: 0.95)
+        case "user_takeover":
+            color = NSColor(calibratedRed: 1.0, green: 0.22, blue: 0.2, alpha: 1.0)
+        default:
+            color = NSColor(calibratedRed: 0.0, green: 0.78, blue: 1.0, alpha: 1.0)
+        }
+        dot.backgroundColor = color.cgColor
+
+        let center = CGPoint(x: contentLayer.bounds.midX, y: contentLayer.bounds.midY)
+        ring.path = CGPath(ellipseIn: CGRect(x: center.x - 10, y: center.y - 10,
+                                             width: 20, height: 20), transform: nil)
+        ring.strokeColor = color.cgColor
+        dot.position = center
+
+        contentLayer.sublayers?.removeAll { $0 is CATextLayer }
+        let label = CATextLayer()
+        label.string = "AI"
+        label.fontSize = 10
+        label.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        label.foregroundColor = color.cgColor
+        label.alignmentMode = .center
+        label.contentsScale = scale
+        let labelW: CGFloat = 24
+        label.frame = CGRect(x: contentLayer.bounds.midX - labelW / 2,
+                             y: center.y - 26, width: labelW, height: 12)
+        contentLayer.addSublayer(label)
+    }
+
+    private func playRipple(on screen: NSScreen) {
+        guard let contentLayer = window?.contentView?.layer, let ring2 = ring2 else { return }
+        let center = CGPoint(x: contentLayer.bounds.midX, y: contentLayer.bounds.midY)
+        ring2.strokeColor = NSColor(calibratedRed: 0.0, green: 0.78, blue: 1.0, alpha: 0.9).cgColor
+        ring2.removeAllAnimations()
+        ring2.opacity = 0.9
+        ring2.path = CGPath(ellipseIn: CGRect(x: center.x - 2, y: center.y - 2, width: 4, height: 4),
+                            transform: nil)
+        let anim = CABasicAnimation(keyPath: "path")
+        anim.fromValue = CGPath(ellipseIn: CGRect(x: center.x - 2, y: center.y - 2, width: 4, height: 4), transform: nil)
+        anim.toValue = CGPath(ellipseIn: CGRect(x: center.x - 18, y: center.y - 18, width: 36, height: 36), transform: nil)
+        anim.duration = 0.22
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.9
+        fade.toValue = 0.0
+        fade.duration = 0.22
+        let group = CAAnimationGroup()
+        group.animations = [anim, fade]
+        group.duration = 0.22
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        ring2.add(group, forKey: "ripple")
+    }
+
+    static func screen(forCG point: CGPoint, displayId: String?) -> NSScreen? {
+        let onScreen: (NSScreen) -> Bool = { sc in
+            guard let id = (sc.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32) else { return false }
+            let b = CGDisplayBounds(id)
+            return point.x >= b.origin.x && point.x < b.origin.x + b.size.width &&
+                   point.y >= b.origin.y && point.y < b.origin.y + b.size.height
+        }
+        if let s = NSScreen.screens.first(where: onScreen) { return s }
+        if let d = displayId, let id = UInt64(d),
+           let s = NSScreen.screens.first(where: {
+               ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32).map(UInt64.init) == id
+           }) {
+            return s
+        }
+        return NSScreen.main
+    }
+}
+
+func handleOverlay(_ params: [String: Any], id: Any) -> String {
+    let action = params["action"] as? String ?? ""
+    switch action {
+    case "show":
+        let x = params["x"] as? Double ?? 0
+        let y = params["y"] as? Double ?? 0
+        let displayId = params["display"] as? String ?? ""
+        let mode = params["mode"] as? String ?? "isolated"
+        GhostCursorOverlay.shared.show(x: x, y: y, displayId: displayId, mode: mode)
+        return ok(id, ["shown": true, "window_id": GhostCursorOverlay.shared.currentWindowID.map(String.init) ?? ""])
+    case "hide":
+        GhostCursorOverlay.shared.hide()
+        return ok(id, ["shown": false])
+    case "click_ripple":
+        let x = params["x"] as? Double ?? 0
+        let y = params["y"] as? Double ?? 0
+        GhostCursorOverlay.shared.clickRipple(x: x, y: y)
+        return ok(id, ["ripple": true])
+    default:
+        return err(id, "cursor_overlay requires action: show | hide | click_ripple")
+    }
+}
+
 // MARK: - Capture (ScreenCaptureKit)
 
 func getShareableContent() throws -> SCShareableContent {
@@ -175,7 +395,15 @@ func captureDisplay(displayId: CGDirectDisplayID, outputPath: String,
     config.pixelFormat = kCVPixelFormatType_32BGRA
     config.scalesToFit = false
 
-    let filter = SCContentFilter(display: display, excludingWindows: [])
+    // Round 8: the agent's Ghost Cursor overlay must never appear in model
+    // screenshots (the model would mistake its own cursor for a page element).
+    // Exclude it by window id when it exists.
+    var excludedWindows: [SCWindow] = []
+    if let overlayId = GhostCursorOverlay.shared.currentWindowID,
+       let ow = content.windows.first(where: { $0.windowID == overlayId }) {
+        excludedWindows.append(ow)
+    }
+    let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
     let bridge = CaptureBridge()
 
     DispatchQueue.main.async {
@@ -239,6 +467,7 @@ func captureDisplay(displayId: CGDirectDisplayID, outputPath: String,
     info["display_scale_factor"] = frame.width > 0 ? Double(display.width) / Double(frame.width) : 1.0
     info["bytes"] = data.count
     info["format"] = format
+    info["overlay_excluded"] = !excludedWindows.isEmpty
     return info
 }
 
@@ -320,6 +549,8 @@ func handle(_ method: String, _ params: [String: Any], id: Any) -> String {
             let desc = (error as NSError).userInfo[NSLocalizedDescriptionKey] as? String ?? error.localizedDescription
             return err(id, desc)
         }
+    case "cursor_overlay":
+        return handleOverlay(params, id: id)
     case "active":
         return ok(id, activeAppInfo())
     case "permissions":

@@ -340,6 +340,8 @@ fn build_bridge(target: &PathBuf) -> Result<(), CuError> {
             "ApplicationServices",
             "-framework",
             "CoreImage",
+            "-framework",
+            "QuartzCore",
         ])
         .status()
         .map_err(|e| CuError::Driver(format!("cannot run swiftc: {e}")))?;

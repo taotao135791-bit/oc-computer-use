@@ -114,14 +114,14 @@ jobs:
             -o /tmp/cubridge-arm64 \
             crates/cu-driver-macos/swift/CUBridge/Sources/CUBridge/main.swift \
             -framework ScreenCaptureKit -framework CoreGraphics -framework AppKit \
-            -framework ApplicationServices -framework CoreImage
+            -framework ApplicationServices -framework CoreImage -framework QuartzCore
       - name: Build x86_64
         run: |
           swiftc -O -target x86_64-apple-macosx14.0 \
             -o /tmp/cubridge-x86_64 \
             crates/cu-driver-macos/swift/CUBridge/Sources/CUBridge/main.swift \
             -framework ScreenCaptureKit -framework CoreGraphics -framework AppKit \
-            -framework ApplicationServices -framework CoreImage
+            -framework ApplicationServices -framework CoreImage -framework QuartzCore
       - name: Lipo universal
         run: |
           lipo -create -output /tmp/cubridge-universal /tmp/cubridge-arm64 /tmp/cubridge-x86_64

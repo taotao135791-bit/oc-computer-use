@@ -238,6 +238,12 @@ fn every_error_code_is_in_the_schema_and_nothing_more() {
         ErrorCode::DaemonAdminTokenRequired.as_str(),
         ErrorCode::InvalidDaemonAdminToken.as_str(),
         ErrorCode::DaemonShuttingDown.as_str(),
+        ErrorCode::TargetOutsideSession.as_str(),
+        ErrorCode::TargetUnavailable.as_str(),
+        ErrorCode::InputFocusMismatch.as_str(),
+        ErrorCode::IsolatedPointerUnavailable.as_str(),
+        ErrorCode::IsolatedDragUnavailable.as_str(),
+        ErrorCode::PhysicalFallbackNotAllowed.as_str(),
     ];
     assert_eq!(
         expected.len(),

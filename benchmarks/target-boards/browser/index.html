@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Computer Use Pointer Target Board</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 16px; background: #f6f6f6; }
+  #board { position: relative; width: 1100px; height: 700px; background: #fff;
+           border: 1px solid #ccc; border-radius: 8px; overflow: hidden; }
+  .target { position: absolute; display: flex; align-items: center; justify-content: center;
+            user-select: none; }
+  .circle { border-radius: 50%; }
+  button.b { background: #4a7dff; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+  .hit-flash { outline: 3px solid #22c55e; }
+  #log { white-space: pre-wrap; font: 11px/ui-monospace/menlo; margin-top: 8px; }
+  #controls { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<h3>Pointer Target Board</h3>
+<div id="controls">
+  <button onclick="renderBatch(12)">新一批(12 目标)</button>
+  <button onclick="renderAllTypes()">全类型板</button>
+  <span id="stats"></span>
+</div>
+<div id="board"></div>
+<div id="log"></div>
+
+<script>
+const SIZES = [16, 20, 24, 32, 48, 64];
+const TYPES = ["button", "icon", "checkbox", "radio", "input", "link"];
+const POSITIONS = [
+  { x: 0.06, y: 0.06 }, { x: 0.86, y: 0.06 }, { x: 0.06, y: 0.82 },
+  { x: 0.86, y: 0.82 }, { x: 0.46, y: 0.46 }, { x: 0.5, y: 0.05 },
+  { x: 0.5, y: 0.92 }, { x: 0.03, y: 0.46 }, { x: 0.94, y: 0.46 },
+];
+let seq = 0;
+const LOG = [];
+
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function targetElement(t, x, y, size) {
+  const el = document.createElement(t.type === "circle" ? "button" : t.type === "link" ? "a" : t.type);
+  el.className = "target " + (t.type === "circle" ? "circle " : "") + "b";
+  el.style.left = (x - size / 2) + "px";
+  el.style.top = (y - size / 2) + "px";
+  el.style.width = size + "px";
+  el.style.height = size + "px";
+  if (t.type === "circle") { el.style.borderRadius = "50%"; }
+  if (t.type === "checkbox") { el.type = "checkbox"; }
+  if (t.type === "radio") { el.type = "radio"; el.name = "r" + seq; }
+  if (t.type === "input") { el.style.minWidth = (size * 2) + "px"; el.style.minHeight = "20px"; }
+  if (t.type === "link") { el.href = "#"; el.textContent = "L"; }
+  else if (t.type === "icon") { el.textContent = "★"; }
+  else if (t.type !== "input") { el.textContent = t.label || "B"; }
+  el.dataset.targetId = t.id;
+  el.addEventListener("click", (ev) => {
+    const r = board.getBoundingClientRect();
+    const cx = ev.clientX - r.left, cy = ev.clientY - r.top;
+    const record = {
+      target_id: t.id, type: t.type, size,
+      expected_center_x: x, expected_center_y: y,
+      predicted_x: cx, predicted_y: cy,
+      clicked_element: ev.target.localName + (ev.target.type ? "." + ev.target.type : ""),
+      hit: Math.hypot(cx - x, cy - y) <= Math.max(4, size / 2),
+      center_error_px: Math.hypot(cx - x, cy - y),
+      ts: Date.now(),
+    };
+    LOG.push(record);
+    renderLog();
+    fetch("/api/record", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record),
+    }).catch(() => {});
+  });
+  return el;
+}
+
+function addTarget(type, pos, size) {
+  const board = document.getElementById("board");
+  const r = board.getBoundingClientRect();
+  const x = r.width * pos.x, y = r.height * pos.y;
+  const id = "t" + (++seq);
+  const t = { id, type, size, label: size + "px" };
+  board.appendChild(targetElement(t, x, y, size));
+  return t;
+}
+
+function renderBatch(n) {
+  document.getElementById("board").innerHTML = "";
+  for (let i = 0; i < n; i++) {
+    addTarget(pick(TYPES), pick(POSITIONS), pick(SIZES));
+  }
+  // 滚动目标:一个在底部 scroll 容器里的目标(浏览器的滚动隔离实验)。
+  const board = document.getElementById("board");
+  const scroller = document.createElement("div");
+  scroller.style.cssText = "position:absolute;left:20px;top:520px;width:300px;height:100px;overflow-y:auto;border:1px solid #999;";
+  const inner = document.createElement("div");
+  inner.style.height = "400px";
+  scroller.appendChild(inner);
+  const scrollTarget = document.createElement("button");
+  scrollTarget.style.cssText = "position:absolute;left:20px;top:340px;width:32px;height:32px;border-radius:50%;";
+  scrollTarget.textContent = "S";
+  const scrollDef = { id: "scroll_" + (++seq), type: "circle", size: 32 };
+  scrollTarget.dataset.targetId = scrollDef.id;
+  scrollTarget.addEventListener("click", (ev) => {
+    // 相对 scroller 的 top(内容滚动后),预测坐标即页面 top + 偏移。
+    const sr = scroller.getBoundingClientRect();
+    const cr = scrollTarget.getBoundingClientRect();
+    const expected = {
+      x: cr.left - board.getBoundingClientRect().left + cr.width / 2,
+      y: cr.top - board.getBoundingClientRect().top + cr.height / 2,
+    };
+    const rec = {
+      target_id: scrollDef.id, type: "scroll_circle", size: 32,
+      expected_center_x: expected.x, expected_center_y: expected.y,
+      predicted_x: ev.clientX - board.getBoundingClientRect().left,
+      predicted_y: ev.clientY - board.getBoundingClientRect().top,
+      clicked_element: "button.scroll",
+      hit: true, center_error_px: 0, ts: Date.now(),
+    };
+    LOG.push(rec);
+    renderLog();
+    fetch("/api/record", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(rec) }).catch(() => {});
+  });
+  inner.appendChild(scrollTarget);
+  board.appendChild(scroller);
+  renderStats();
+}
+
+function renderAllTypes() {
+  document.getElementById("board").innerHTML = "";
+  const rows = [
+    ["button", 24], ["icon", 32], ["checkbox", 24], ["radio", 24],
+    ["input", 48], ["link", 24], ["circle", 20], ["circle", 48],
+  ];
+  rows.forEach(([type, size], i) => {
+    const x = 60 + (i % 4) * 260, y = 60 + Math.floor(i / 4) * 200;
+    const board = document.getElementById("board");
+    const id = "t" + (++seq);
+    const t = { id, type, size, label: size + "px" };
+    board.appendChild(targetElement(t, x, y, size));
+  });
+  renderStats();
+}
+
+function renderStats() {
+  const hits = LOG.filter(l => l.hit).length;
+  const total = LOG.length;
+  document.getElementById("stats").textContent =
+    `已记录 ${total} 次点击,命中 ${hits} (${total ? Math.round(hits / total * 100) : 0}%)`;
+}
+
+function renderLog() {
+  const last = LOG[LOG.length - 1];
+  if (!last) return;
+  const line = `#${last.target_id} ${last.type} size=${last.size}px err=${last.center_error_px.toFixed(1)}px hit=${last.hit} element=${last.clicked_element}`;
+  document.getElementById("log").textContent =
+    line + "\n" + document.getElementById("log").textContent;
+}
+
+renderBatch(12);
+</script>
+</body>
+</html>

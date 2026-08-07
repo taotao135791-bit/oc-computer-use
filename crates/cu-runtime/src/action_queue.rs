@@ -16,6 +16,7 @@ use cu_policy::{TakeoverDetector, TakeoverPolicy};
 use cu_trace::TraceRecorder;
 use tokio_util::sync::CancellationToken;
 
+use crate::human_input::HumanInputMonitor;
 use crate::sessions::{Session, SharedSession};
 
 /// Outcome of one action inside a batch.
@@ -76,6 +77,7 @@ impl<'a> ActionQueue<'a> {
         geometry: &ImageGeometry,
         token: CancellationToken,
         takeover: &mut TakeoverDetector,
+        human: Option<&HumanInputMonitor>,
         trace: Option<&TraceRecorder>,
         request_id: Option<&str>,
         frame_id: &str,
@@ -98,6 +100,17 @@ impl<'a> ActionQueue<'a> {
                 break;
             }
 
+            // Human Always Wins: if the continuous human-input monitor saw a
+            // real user event since the last poll, stop immediately and hand
+            // control to the user. Never pull the cursor back; never resume.
+            if let Some(h) = human {
+                if h.consume_takeover() {
+                    let _ = self.apply_takeover(session, takeover);
+                    self.fill_cancelled(&mut reports, i, actions.len());
+                    break;
+                }
+            }
+
             let resolved = match self.to_resolved(action, geometry, last_pointer) {
                 Ok(r) => r,
                 Err(e) => {
@@ -106,6 +119,19 @@ impl<'a> ActionQueue<'a> {
                     break;
                 }
             };
+
+            // Target Isolation (round 8): if the session is scoped to a target
+            // window, every location-bearing action's coordinate must land
+            // inside that window's bounds. Outside -> TARGET_OUTSIDE_SESSION.
+            if let Some(bounds) = session.get_target_bounds() {
+                if let Some(p) = resolved_location(&resolved) {
+                    if !bounds.contains_global(p) {
+                        reports.push(ActionRun::failed(i, 0, "TARGET_OUTSIDE_SESSION".into()));
+                        self.fill_cancelled(&mut reports, i + 1, actions.len());
+                        break;
+                    }
+                }
+            }
 
             let started = Instant::now();
             let mut wait_interrupted = false;
@@ -119,6 +145,14 @@ impl<'a> ActionQueue<'a> {
                         if token.is_cancelled() || self.session_aborted(session) {
                             wait_interrupted = true;
                             break;
+                        }
+                        // Human Always Wins applies inside waits too.
+                        if let Some(h) = human {
+                            if h.consume_takeover() {
+                                let _ = self.apply_takeover(session, takeover);
+                                wait_interrupted = true;
+                                break;
+                            }
                         }
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         tokio::select! {
@@ -346,6 +380,26 @@ impl<'a> ActionQueue<'a> {
                 session.transition(cu_core::SessionState::UserTakeover)
             }
         }
+    }
+}
+
+/// Whether an action relocates the pointer by design (so its own movement is
+/// never mistaken for a human grab).
+/// The global location (if any) an action will act on, for target-bound checks.
+fn resolved_location(r: &cu_driver::ResolvedAction) -> Option<Point> {
+    match r {
+        cu_driver::ResolvedAction::Click { x, y, .. }
+        | cu_driver::ResolvedAction::Move {
+            to: Point { x, y }, ..
+        }
+        | cu_driver::ResolvedAction::Drag {
+            to: Point { x, y }, ..
+        }
+        | cu_driver::ResolvedAction::Scroll {
+            at: Some(Point { x, y }),
+            ..
+        } => Some(Point::new(*x, *y)),
+        _ => None,
     }
 }
 

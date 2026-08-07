@@ -78,6 +78,19 @@ pub trait ComputerDriver: Send + Sync {
     /// Current pointer location in global logical points.
     async fn pointer_location(&self) -> Result<PointerInfo, CuError>;
 
+    /// Round 8: the agent's virtual pointer moved — the driver should refresh
+    /// its ghost-cursor overlay (if any) at that global point. This never
+    /// moves the real system cursor. Default implementation is a no-op so
+    /// test/fake drivers need not implement it.
+    async fn pointer_visualized(&self, _x: f64, _y: f64, _display_id: &str) -> Result<(), CuError> {
+        Ok(())
+    }
+
+    /// Round 8: hide the ghost cursor overlay (takeover / pause / stop).
+    async fn pointer_hidden(&self) -> Result<(), CuError> {
+        Ok(())
+    }
+
     /// Release any OS-level resources (CGEvent sources, the bridge process).
     async fn shutdown(&self) -> Result<(), CuError>;
 }

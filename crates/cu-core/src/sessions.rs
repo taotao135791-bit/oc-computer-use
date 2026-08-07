@@ -49,6 +49,32 @@ pub struct SessionStatus {
     pub started_by: String,
 }
 
+/// Optional app/window target for a session. When set, `computer_observe` is
+/// scoped to the target window and `computer_act` rejects coordinates outside
+/// its bounds. The runtime never auto-clicks other apps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
+pub struct SessionTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<i64>,
+}
+
+/// How strictly keyboard focus is validated before `type`/`key`/`shortcut`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum FocusPolicy {
+    /// Never steal foreground/key focus. If focus is not on the target,
+    /// reject with `INPUT_FOCUS_MISMATCH`.
+    #[default]
+    Strict,
+    /// Activate the target app/window before keyboard input (explicit opt-in).
+    ActivateTarget,
+}
+
 /// Actions a caller may issue against a session via `computer.session`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]

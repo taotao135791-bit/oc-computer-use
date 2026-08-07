@@ -80,6 +80,27 @@ pub fn click(button: MouseButton, x: f64, y: f64) {
     button_up(button, x, y, 1);
 }
 
+/// **DirectPositionEvent click** (round 8, pointer isolation): posts mouse
+/// down/up at the target position **without** first warping the system cursor.
+///
+/// This is the isolated actuator candidate: if macOS delivers the click to the
+/// element under `(x, y)` while the visible system cursor stays where the user
+/// left it, we can click anywhere without stealing the user's mouse. The
+/// visible cursor is unchanged by `button_down`/`button_up` themselves (only
+/// `EVENT_MOUSE_MOVED` relocates it).
+pub fn click_direct(button: MouseButton, x: f64, y: f64) {
+    button_down(button, x, y, 1);
+    button_up(button, x, y, 1);
+}
+
+/// Direct double-click without warping the system cursor.
+pub fn double_click_direct(button: MouseButton, x: f64, y: f64) {
+    button_down(button, x, y, 1);
+    button_up(button, x, y, 1);
+    button_down(button, x, y, 2);
+    button_up(button, x, y, 2);
+}
+
 /// A double-click at a global point. The second down/up pair carries click
 /// state 2 so the system treats it as a real double-click.
 pub fn double_click(button: MouseButton, x: f64, y: f64) {

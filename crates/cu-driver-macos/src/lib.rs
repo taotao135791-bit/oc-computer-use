@@ -7,8 +7,10 @@
 //! - The driver never converts coordinates. It receives
 //!   [`cu_driver::ResolvedAction`]s in global logical points and posts events.
 
+pub mod accessibility;
 pub mod bridge;
 pub mod capture;
+pub mod event_tap;
 pub mod ffi;
 pub mod keyboard;
 pub mod mouse;
@@ -25,6 +27,37 @@ use cu_driver::{
 use serde_json::Value;
 
 use crate::bridge::Bridge;
+
+/// Visual states of the agent's Ghost Cursor overlay (round 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayMode {
+    Isolated,
+    PhysicalFallback,
+    Paused,
+    UserTakeover,
+}
+
+impl OverlayMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OverlayMode::Isolated => "isolated",
+            OverlayMode::PhysicalFallback => "physical_fallback",
+            OverlayMode::Paused => "paused",
+            OverlayMode::UserTakeover => "user_takeover",
+        }
+    }
+}
+
+impl From<cu_core::PointerMode> for OverlayMode {
+    fn from(m: cu_core::PointerMode) -> Self {
+        match m {
+            cu_core::PointerMode::Isolated => OverlayMode::Isolated,
+            cu_core::PointerMode::PhysicalFallback => OverlayMode::PhysicalFallback,
+            cu_core::PointerMode::Paused => OverlayMode::Paused,
+            cu_core::PointerMode::UserTakeover => OverlayMode::UserTakeover,
+        }
+    }
+}
 
 /// A driver instance bound to the local machine.
 pub struct MacosDriver {
@@ -227,10 +260,15 @@ impl ComputerDriver for MacosDriver {
                 button,
                 double,
             } => {
+                // Round 8 pointer isolation: the default click path is
+                // **DirectPositionEvent** — post down/up at the target WITHOUT
+                // warping the system cursor. The visible cursor stays where the
+                // user left it. (Legacy `click` still exists for the physical
+                // fallback path and the pointer-lab A/B experiment.)
                 if *double {
-                    mouse::double_click(*button, *x, *y);
+                    mouse::double_click_direct(*button, *x, *y);
                 } else {
-                    mouse::click(*button, *x, *y);
+                    mouse::click_direct(*button, *x, *y);
                 }
                 Ok(())
             }
@@ -340,6 +378,16 @@ impl ComputerDriver for MacosDriver {
         })
     }
 
+    async fn pointer_visualized(&self, x: f64, y: f64, display_id: &str) -> Result<(), CuError> {
+        self.overlay_show(x, y, display_id, OverlayMode::Isolated);
+        Ok(())
+    }
+
+    async fn pointer_hidden(&self) -> Result<(), CuError> {
+        self.overlay_hide();
+        Ok(())
+    }
+
     async fn shutdown(&self) -> Result<(), CuError> {
         self.bridge.shutdown();
         Ok(())
@@ -347,6 +395,35 @@ impl ComputerDriver for MacosDriver {
 }
 
 impl MacosDriver {
+    /// Show the agent's Ghost Cursor overlay at a global point (CGEvent space).
+    pub fn overlay_show(&self, x: f64, y: f64, display_id: &str, mode: OverlayMode) {
+        let _ = self.bridge.request(
+            "cursor_overlay",
+            serde_json::json!({
+                "action": "show",
+                "x": x,
+                "y": y,
+                "display": display_id,
+                "mode": mode.as_str(),
+            }),
+        );
+    }
+
+    /// Hide the agent's Ghost Cursor overlay.
+    pub fn overlay_hide(&self) {
+        let _ = self
+            .bridge
+            .request("cursor_overlay", serde_json::json!({"action": "hide"}));
+    }
+
+    /// Play the click ripple at a global point (visible confirmation).
+    pub fn overlay_click_ripple(&self, x: f64, y: f64) {
+        let _ = self.bridge.request(
+            "cursor_overlay",
+            serde_json::json!({"action": "click_ripple", "x": x, "y": y}),
+        );
+    }
+
     /// Type text by swapping the pasteboard, pasting, and restoring the
     /// previous pasteboard contents. The clipboard text is never logged.
     async fn type_via_clipboard(&self, text: &str) -> Result<(), CuError> {

@@ -35,6 +35,7 @@ use cu_trace::{TraceConfig, TraceMode, TraceRecorder};
 
 use crate::action_queue::{to_action_result_reports, ActionQueue};
 use crate::frames::FrameStore;
+use crate::human_input::HumanInputMonitor;
 use crate::requests::RequestRegistry;
 use crate::sessions::{ControlLock, Session, SharedSession};
 use crate::stabilizer::{StabilizeOutcome, Stabilizer, StabilizerConfig};
@@ -92,6 +93,9 @@ pub struct Runtime {
     /// so requests that arrive during shutdown fail fast with
     /// `DAEMON_SHUTTING_DOWN` instead of starting new work.
     shutting_down: std::sync::atomic::AtomicBool,
+    /// Continuous human-input detector (Human Always Wins). The macOS driver
+    /// feeds it via an Event Tap; the action queue polls it before each action.
+    pub human_input: std::sync::Arc<HumanInputMonitor>,
 }
 
 impl Runtime {
@@ -116,6 +120,7 @@ impl Runtime {
             started_at: Instant::now(),
             requests: RequestRegistry::new(),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            human_input: std::sync::Arc::new(HumanInputMonitor::new()),
         }
     }
 
@@ -943,6 +948,7 @@ impl Runtime {
                 &geometry,
                 token.clone(),
                 &mut takeover,
+                Some(self.human_input.as_ref()),
                 session.trace.as_ref(),
                 request_id.as_deref(),
                 &params.frame_id,

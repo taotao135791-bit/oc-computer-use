@@ -10,6 +10,7 @@ pub mod config;
 pub mod coordinates;
 pub mod errors;
 pub mod frames;
+pub mod pointer;
 pub mod private_file;
 pub mod protocol;
 pub mod security;
@@ -21,6 +22,10 @@ pub use actions::{
 pub use coordinates::{CoordinateSpace, DisplayBounds, ImageGeometry, Point, Region};
 pub use errors::{CuError, ErrorCode, PermissionIssue, PermissionKind, StaleFrameDetail};
 pub use frames::{ScreenFrame, ScreenSnapshot, StaleFrameVerdict};
+pub use pointer::{
+    DragBackend, PhysicalFallbackState, PointerExecutionBackend, PointerMode, PointerPolicy,
+    PointerStatusView, VirtualPointerState,
+};
 pub use protocol::{
     ActParams, ActResult, ActionResultReport, CancelParams, CancelResult, CapabilityTokenParams,
     ClientInfo, InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult,
@@ -33,4 +38,4 @@ pub use security::{
     generate_control_token, generate_daemon_admin_token, generate_observation_token, redact_json,
     ControlToken, DaemonAdminToken, ObservationToken, SecretToken, SecretTokenHash,
 };
-pub use sessions::{SessionAction, SessionState, SessionStatus};
+pub use sessions::{FocusPolicy, SessionAction, SessionState, SessionStatus, SessionTarget};

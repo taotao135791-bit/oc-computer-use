@@ -72,6 +72,27 @@ pub enum ErrorCode {
     /// The daemon is shutting down: new requests are refused until it exits.
     /// In-flight work was cancelled (or is draining within the grace period).
     DaemonShuttingDown,
+    /// The session has an app/window target, and the action's coordinate
+    /// landed outside that target window's bounds. The agent should re-observe
+    /// the target (or confirm the coordinate) before retrying.
+    TargetOutsideSession,
+    /// The session target (app/window) is unavailable: window closed, PID
+    /// changed, bundle mismatch, or window id invalidated.
+    TargetUnavailable,
+    /// A `type`/`key` action was requested while keyboard focus is not on the
+    /// session's target. The default policy refuses to steal focus; the caller
+    /// may re-observe or explicitly allow `focus_policy: activate_target`.
+    InputFocusMismatch,
+    /// An isolated pointer operation could not be realized without touching
+    /// the real system cursor, and the current pointer policy forbids
+    /// physical fallback (`isolated_only`).
+    IsolatedPointerUnavailable,
+    /// A drag could not be executed in isolation and physical fallback is
+    /// not permitted (or the runtime does not support safe isolated drag).
+    IsolatedDragUnavailable,
+    /// Physical fallback is not allowed by the session's pointer policy or
+    /// the caller did not explicitly permit it for this action.
+    PhysicalFallbackNotAllowed,
 }
 
 impl ErrorCode {
@@ -113,6 +134,12 @@ impl ErrorCode {
             DaemonAdminTokenRequired => -32026,
             InvalidDaemonAdminToken => -32027,
             DaemonShuttingDown => -32028,
+            TargetOutsideSession => -32029,
+            TargetUnavailable => -32030,
+            InputFocusMismatch => -32031,
+            IsolatedPointerUnavailable => -32032,
+            IsolatedDragUnavailable => -32033,
+            PhysicalFallbackNotAllowed => -32034,
         }
     }
 
@@ -152,6 +179,12 @@ impl ErrorCode {
             DaemonAdminTokenRequired => "DAEMON_ADMIN_TOKEN_REQUIRED",
             InvalidDaemonAdminToken => "INVALID_DAEMON_ADMIN_TOKEN",
             DaemonShuttingDown => "DAEMON_SHUTTING_DOWN",
+            TargetOutsideSession => "TARGET_OUTSIDE_SESSION",
+            TargetUnavailable => "TARGET_UNAVAILABLE",
+            InputFocusMismatch => "INPUT_FOCUS_MISMATCH",
+            IsolatedPointerUnavailable => "ISOLATED_POINTER_UNAVAILABLE",
+            IsolatedDragUnavailable => "ISOLATED_DRAG_UNAVAILABLE",
+            PhysicalFallbackNotAllowed => "PHYSICAL_FALLBACK_NOT_ALLOWED",
         }
     }
 }
@@ -296,6 +329,24 @@ pub enum CuError {
     /// The daemon is shutting down; this request was refused.
     #[error("The daemon is shutting down. Retry once it is back up.")]
     DaemonShuttingDown,
+    /// The action's coordinate landed outside the session's target window.
+    #[error("target coordinate is outside the session's target window; re-observe the target before retrying")]
+    TargetOutsideSession,
+    /// The session target (app/window) is unavailable (closed/mismatched).
+    #[error("session target is unavailable (window closed, PID changed, or bundle mismatch)")]
+    TargetUnavailable,
+    /// Keyboard focus is not on the session's target.
+    #[error("keyboard focus is not on the session's target; re-observe or allow focus_policy: activate_target")]
+    InputFocusMismatch,
+    /// Isolated pointer execution unavailable under the current policy.
+    #[error("isolated pointer operation is unavailable without moving the real cursor")]
+    IsolatedPointerUnavailable,
+    /// Isolated drag unavailable and physical fallback is not permitted.
+    #[error("isolated drag is unavailable and physical fallback was not permitted")]
+    IsolatedDragUnavailable,
+    /// Physical fallback is not allowed by policy or caller.
+    #[error("physical fallback is not allowed by the session pointer policy")]
+    PhysicalFallbackNotAllowed,
 }
 
 impl CuError {
@@ -335,6 +386,12 @@ impl CuError {
             DaemonAdminTokenRequired => ErrorCode::DaemonAdminTokenRequired,
             InvalidDaemonAdminToken => ErrorCode::InvalidDaemonAdminToken,
             DaemonShuttingDown => ErrorCode::DaemonShuttingDown,
+            TargetOutsideSession => ErrorCode::TargetOutsideSession,
+            TargetUnavailable => ErrorCode::TargetUnavailable,
+            InputFocusMismatch => ErrorCode::InputFocusMismatch,
+            IsolatedPointerUnavailable => ErrorCode::IsolatedPointerUnavailable,
+            IsolatedDragUnavailable => ErrorCode::IsolatedDragUnavailable,
+            PhysicalFallbackNotAllowed => ErrorCode::PhysicalFallbackNotAllowed,
         }
     }
 

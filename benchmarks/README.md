@@ -1,5 +1,22 @@
 # macOS Computer Use Benchmark
 
+> **STATUS: FROZEN（已冻结）**
+>
+> Full task benchmark is currently **frozen**. 现有任务集、runner、fixtures 与
+> schema **保留不删**，但本轮不再新增：
+>
+> - 更多应用任务（TextEdit / Finder / Safari / System Settings 复杂任务）
+> - 更复杂的跨应用场景
+> - 复杂成功率评估器
+> - 大型任务集
+> - Planner 类任务测试
+> - 与鼠标隔离 / 视觉点击精度无关的 Benchmark
+>
+> 当前验证焦点已切换为 **Pointer Isolation + Visual Cursor + Human Interrupt +
+> Target Isolation + Click Accuracy**（见 `docs/pointer-isolation.md` 与
+> `benchmarks/target-boards/`）。新增测试只允许进入 `target-boards/` 与
+> `pointer-lab/`；`tasks/` 目录冻结。
+
 可重复的 macOS 桌面任务基准，用于度量 Computer Use Runtime（`cu`）在真实
 macOS 桌面上通过真实宿主（OpenCode / Pi）完成任务的能力。**禁止作弊**：任务
 结果是唯一由声明式 evaluator（文件系统 / defaults / HTTP fixture / 应用状态 /

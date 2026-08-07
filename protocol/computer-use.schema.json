@@ -647,6 +647,48 @@
             "DAEMON_SHUTTING_DOWN"
           ],
           "type": "string"
+        },
+        {
+          "description": "The session has an app/window target, and the action's coordinate landed outside that target window's bounds. The agent should re-observe the target (or confirm the coordinate) before retrying.",
+          "enum": [
+            "TARGET_OUTSIDE_SESSION"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The session target (app/window) is unavailable: window closed, PID changed, bundle mismatch, or window id invalidated.",
+          "enum": [
+            "TARGET_UNAVAILABLE"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A `type`/`key` action was requested while keyboard focus is not on the session's target. The default policy refuses to steal focus; the caller may re-observe or explicitly allow `focus_policy: activate_target`.",
+          "enum": [
+            "INPUT_FOCUS_MISMATCH"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An isolated pointer operation could not be realized without touching the real system cursor, and the current pointer policy forbids physical fallback (`isolated_only`).",
+          "enum": [
+            "ISOLATED_POINTER_UNAVAILABLE"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A drag could not be executed in isolation and physical fallback is not permitted (or the runtime does not support safe isolated drag).",
+          "enum": [
+            "ISOLATED_DRAG_UNAVAILABLE"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Physical fallback is not allowed by the session's pointer policy or the caller did not explicitly permit it for this action.",
+          "enum": [
+            "PHYSICAL_FALLBACK_NOT_ALLOWED"
+          ],
+          "type": "string"
         }
       ]
     },

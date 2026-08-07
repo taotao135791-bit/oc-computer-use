@@ -4,14 +4,27 @@
 //! drive the pointer at a time. `session start` acquires it; `session stop`
 //! releases it. Takeover/release transfer it between the agent and the human,
 //! never to a second session.
+//!
+//! Since round 8 each session also owns the agent's **virtual pointer** (the
+//! logical pointer that is *not* the system cursor), a pointer policy deciding
+//! when the runtime may borrow the real cursor, an optional app/window target
+//! for session-scoped isolation, and the keyboard focus policy.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use cu_core::{ClientInfo, CuError, SecretTokenHash, SessionState};
+use cu_core::{
+    ClientInfo, CuError, FocusPolicy, PointerMode, PointerPolicy, SecretTokenHash, SessionState,
+    SessionTarget, VirtualPointerState,
+};
 
-/// The runtime-level session object (not the wire-level [`cu_core::SessionStatus`]).
+/// The runtime-level session object (not the wire-level
+/// [`cu_core::SessionStatus`]). Since round 8 each session owns the agent's
+/// **virtual pointer** (the logical pointer that is *not* the system cursor),
+/// a pointer policy deciding when the runtime may borrow the real cursor, an
+/// optional app/window target for session-scoped isolation, and the keyboard
+/// focus policy.
 pub struct Session {
     pub id: String,
     pub display_id: String,
@@ -46,6 +59,20 @@ pub struct Session {
     /// Serializes observe/act on this session so two concurrent batches can
     /// never interleave their pointer events.
     pub busy: tokio::sync::Mutex<()>,
+    /// The agent's virtual pointer — the single source of truth for where the
+    /// agent *means* to point. Never confused with the system cursor.
+    pub virtual_pointer: Mutex<VirtualPointerState>,
+    /// Whether (and when) the runtime may borrow the real system cursor.
+    pub pointer_policy: Mutex<PointerPolicy>,
+    /// Optional app/window target for session-scoped isolation.
+    pub target: Mutex<Option<SessionTarget>>,
+    /// Bounds of the session's target window in global logical points. Set by
+    /// the runtime when a window-frame provider exists; `act` rejects
+    /// coordinates outside it with `TARGET_OUTSIDE_SESSION`. `None` = no
+    /// window-scoped check (whole display allowed).
+    pub target_bounds: Mutex<Option<cu_core::DisplayBounds>>,
+    /// How strictly keyboard focus is validated before type/key input.
+    pub focus_policy: Mutex<FocusPolicy>,
 }
 
 impl Session {
@@ -75,7 +102,74 @@ impl Session {
             batch_tokens: std::sync::Mutex::new(Vec::new()),
             trace,
             busy: tokio::sync::Mutex::new(()),
+            virtual_pointer: Mutex::new(VirtualPointerState::default()),
+            pointer_policy: Mutex::new(PointerPolicy::IsolatedPreferred),
+            target: Mutex::new(None),
+            target_bounds: Mutex::new(None),
+            focus_policy: Mutex::new(FocusPolicy::Strict),
         }
+    }
+
+    /// Seed the virtual pointer at a real position (called right after
+    /// session start, using the live system cursor position).
+    pub fn init_virtual_pointer(&self, p: cu_core::Point, display_id: impl Into<String>) {
+        let mut vp = self.virtual_pointer.lock().unwrap();
+        *vp = VirtualPointerState::new(p.x, p.y, display_id);
+    }
+
+    /// Update the virtual pointer position (usually to the target of a Move).
+    pub fn set_virtual_pointer(&self, p: cu_core::Point, display_id: impl Into<String>) {
+        self.virtual_pointer
+            .lock()
+            .unwrap()
+            .set_location(p, display_id);
+    }
+
+    /// Pointer mode currently shown by the ghost cursor.
+    pub fn pointer_mode(&self) -> PointerMode {
+        self.virtual_pointer.lock().unwrap().mode
+    }
+
+    /// Reflect a session state change in the ghost cursor's mode.
+    pub fn sync_pointer_mode(&self, state: SessionState) {
+        let mode = match state {
+            SessionState::UserTakeover => PointerMode::UserTakeover,
+            SessionState::Paused => PointerMode::Paused,
+            _ => PointerMode::Isolated,
+        };
+        self.virtual_pointer.lock().unwrap().set_mode(mode);
+    }
+
+    pub fn set_pointer_policy(&self, policy: PointerPolicy) {
+        *self.pointer_policy.lock().unwrap() = policy;
+    }
+
+    pub fn get_pointer_policy(&self) -> PointerPolicy {
+        *self.pointer_policy.lock().unwrap()
+    }
+
+    pub fn set_target(&self, target: Option<SessionTarget>) {
+        *self.target.lock().unwrap() = target;
+    }
+
+    pub fn get_target(&self) -> Option<SessionTarget> {
+        self.target.lock().unwrap().clone()
+    }
+
+    pub fn set_target_bounds(&self, bounds: Option<cu_core::DisplayBounds>) {
+        *self.target_bounds.lock().unwrap() = bounds;
+    }
+
+    pub fn get_target_bounds(&self) -> Option<cu_core::DisplayBounds> {
+        *self.target_bounds.lock().unwrap()
+    }
+
+    pub fn set_focus_policy(&self, policy: FocusPolicy) {
+        *self.focus_policy.lock().unwrap() = policy;
+    }
+
+    pub fn get_focus_policy(&self) -> FocusPolicy {
+        *self.focus_policy.lock().unwrap()
     }
 
     /// Verify a presented control token. `None` (no token supplied) is
@@ -193,6 +287,8 @@ impl Session {
             }
             _ => {}
         }
+        // Keep the ghost cursor's mode coherent with the session state.
+        self.sync_pointer_mode(target);
         Ok(())
     }
 
@@ -280,6 +376,7 @@ pub type SharedSession = Arc<Session>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cu_core::{PointerMode, SessionTarget};
 
     /// A test session with fresh independent control + observation hashes.
     fn test_session() -> Arc<Session> {
@@ -358,6 +455,45 @@ mod tests {
         s.transition(SessionState::Active).unwrap();
         let next = s.begin_batch();
         assert!(!next.is_cancelled());
+    }
+
+    #[test]
+    fn virtual_pointer_is_seeded_and_updated() {
+        let s = test_session();
+        s.init_virtual_pointer(cu_core::Point::new(100.0, 200.0), "1");
+        assert_eq!(s.virtual_pointer.lock().unwrap().x, 100.0);
+        s.set_virtual_pointer(cu_core::Point::new(-1920.0, 0.0), "2");
+        let vp = s.virtual_pointer.lock().unwrap();
+        assert_eq!(vp.x, -1920.0);
+        assert_eq!(vp.display_id, "2");
+    }
+
+    #[test]
+    fn takeover_syncs_pointer_mode() {
+        let s = test_session();
+        s.transition(SessionState::UserTakeover).unwrap();
+        assert_eq!(s.pointer_mode(), PointerMode::UserTakeover);
+        s.transition(SessionState::Active).unwrap();
+        assert_eq!(s.pointer_mode(), PointerMode::Isolated);
+    }
+
+    #[test]
+    fn target_and_policy_are_settable() {
+        let s = test_session();
+        assert_eq!(s.get_pointer_policy(), PointerPolicy::IsolatedPreferred);
+        s.set_pointer_policy(PointerPolicy::IsolatedOnly);
+        assert_eq!(s.get_pointer_policy(), PointerPolicy::IsolatedOnly);
+        s.set_target(Some(SessionTarget {
+            bundle_id: Some("com.google.Chrome".into()),
+            pid: Some(42),
+            window_id: Some(7),
+        }));
+        assert_eq!(
+            s.get_target().unwrap().bundle_id.as_deref(),
+            Some("com.google.Chrome")
+        );
+        s.set_focus_policy(FocusPolicy::ActivateTarget);
+        assert_eq!(s.get_focus_policy(), FocusPolicy::ActivateTarget);
     }
 
     #[test]
