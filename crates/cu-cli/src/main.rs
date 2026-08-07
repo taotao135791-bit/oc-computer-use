@@ -1160,7 +1160,7 @@ async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
         }
     };
 
-    let mut params = if args.action == "start" {
+    let params = if args.action == "start" {
         let mut p = session_start_params(json!(args.display_id));
         // Round 9 / P0-5: session isolation configuration (target / pointer /
         // focus) exposed at the CLI.
