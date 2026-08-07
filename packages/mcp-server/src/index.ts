@@ -10,7 +10,18 @@
 // Config via environment:
 //   COMPUTER_USE_SOCKET   — daemon socket path (default ~/.computer-use/runtime.sock)
 
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { randomBytes as cryptoRandomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -146,15 +157,46 @@ export function createComputerUseServer(
    * session. Failures are non-fatal: the session still works; trace reads
    * just fall back to the CLI-created record.
    */
+  // Round 9 / P0-13: the credential store must match the Rust private-file
+  // layer's semantics or be removed. Rust's private_file.rs enforces: parent
+  // dir 0700 not a symlink, target not a symlink, content to a fresh random
+  // temp file (O_EXCL + O_NOFOLLOW), fsync, atomic rename, then dir fsync.
+  // This Node equivalent implements the same write-path guarantees:
+  //   1. dir must be a real dir, owned by the current uid, mode 0700 (created
+  //      0700, never relaxed);
+  //   2. a symlink at the target path is refused (lstat, never follows);
+  //   3. content goes to a fresh temp file opened with O_EXCL | O_NOFOLLOW,
+  //      mode 0600 from birth;
+  //   4. fsync file + atomic rename + fsync dir; on failure the temp is
+  //      removed and the previous file (if any) is intact.
   function persistCredential(result: SessionResult, clientInstanceId: string): void {
     try {
       if (!result.session_id || !result.control_token) return;
       const dir = join(homedir(), ".local", "state", "oc-computer-use", "credentials");
       mkdirSync(dir, { recursive: true, mode: 0o700 });
-      chmodSync(dir, 0o700);
+      // Validate the directory: real dir, ours, 0700, not a symlink.
+      const dst = lstatSync(dir);
+      if (!dst.isDirectory()) throw new Error("credential dir is not a directory");
+      if (!dst.isSymbolicLink() && dst.mode & 0o077) {
+        chmodSync(dir, 0o700);
+      }
+      const st = lstatSync(dir);
+      if (st.isSymbolicLink()) throw new Error("credential dir is a symlink");
+      if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+        throw new Error("credential dir is foreign-owned");
+      }
+      if (st.mode & 0o077) throw new Error("credential dir is not 0700");
+
       const file = join(dir, `${result.session_id}.json`);
-      writeFileSync(
-        file,
+      // Refuse a symlink parked at the target.
+      try {
+        const ft = lstatSync(file);
+        if (ft.isSymbolicLink()) throw new Error("credential target is a symlink");
+      } catch (e: unknown) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      }
+
+      const payload =
         JSON.stringify(
           {
             session_id: result.session_id,
@@ -166,8 +208,31 @@ export function createComputerUseServer(
           },
           null,
           2,
-        ) + "\n",
-      );
+        ) + "\n";
+      // Atomic write: random temp name, O_EXCL|O_NOFOLLOW, 0600, fsync, rename.
+      const tmp = join(dir, `.${result.session_id}.${cryptoRandomBytes(8).toString("hex")}.tmp`);
+      const fd = openSync(tmp, "wx", 0o600);
+      try {
+        writeFileSync(fd, payload);
+        fsyncSync(fd);
+        closeSync(fd);
+        renameSync(tmp, file);
+        const dfd = openSync(dir, "r");
+        try {
+          fsyncSync(dfd);
+        } finally {
+          closeSync(dfd);
+        }
+      } catch (e) {
+        closeSync(fd);
+        try {
+          unlinkSync(tmp);
+        } catch {
+          /* best-effort */
+        }
+        throw e;
+      }
+      // Mode is already 0600 from birth; force it for defense in depth.
       chmodSync(file, 0o600);
     } catch {
       /* non-fatal: see doc comment */
@@ -252,7 +317,7 @@ export function createComputerUseServer(
           ),
       }),
     },
-    async ({ action, session_id, display_id }) => {
+    async ({ action, session_id, display_id, target, pointer_policy, focus_policy }) => {
       try {
         const c = await getClient();
         const result = await c.session(action, { session_id, display_id, target, pointer_policy, focus_policy });
@@ -355,8 +420,8 @@ export function createComputerUseServer(
       type: z.literal("type"),
       text: z
         .string()
-        .max(10_000)
-        .describe("Text to type; logged redacted by default"),
+        .max(4096)
+        .describe("Text to type (max 4096 chars; logged redacted by default)"),
       method: z
         .enum(["keyboard", "clipboard"])
         .default("keyboard")
@@ -367,8 +432,8 @@ export function createComputerUseServer(
       keys: z
         .array(z.string())
         .min(1)
-        .max(16)
-        .describe("Key names, e.g. [\"return\"] or [\"cmd\", \"c\"]"),
+        .max(8)
+        .describe("Key names (max 8), e.g. [\"return\"] or [\"cmd\", \"c\"]"),
     }),
     scroll: z.object({
       type: z.literal("scroll"),
