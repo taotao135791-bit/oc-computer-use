@@ -494,6 +494,103 @@ func activeAppInfo() -> [String: Any] {
     return info
 }
 
+// MARK: - Target window resolution (round 9 / P0-4)
+
+/// Resolve a session target to a concrete window. Rules:
+/// - window_id provided: verify it exists (PID/bundle must match if given).
+/// - pid only: the app's frontmost normal window.
+/// - bundle_id only: the app's frontmost visible normal window.
+func resolveTarget(_ params: [String: Any]) -> [String: Any] {
+    let windowID = params["window_id"] as? Int
+    let pid = params["pid"] as? Int
+    let bundleID = params["bundle_id"] as? String
+
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+        return ["found": false, "reason": "window list unavailable"]
+    }
+
+    // Build candidate windows: on-screen normal windows (exclude overlay).
+    func isNormal(_ w: [String: Any]) -> Bool {
+        let layer = (w[kCGWindowLayer as String] as? Int) ?? Int.max
+        let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 0.0
+        let bounds = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
+        let wdt = (bounds["Width"] as? Double) ?? 0
+        let hgt = (bounds["Height"] as? Double) ?? 0
+        return layer == 0 && alpha > 0.0 && wdt > 0 && hgt > 0
+    }
+    let windows = list.filter(isNormal)
+
+    func windowEntry(_ w: [String: Any]) -> [String: Any]? {
+        let ownerPID = (w[kCGWindowOwnerPID as String] as? Int) ?? 0
+        let num = (w[kCGWindowNumber as String] as? Int) ?? 0
+        let bounds = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
+        guard let x = bounds["X"] as? Double,
+              let y = bounds["Y"] as? Double,
+              let wdt = bounds["Width"] as? Double,
+              let hgt = bounds["Height"] as? Double else {
+            return nil
+        }
+        return [
+            "window_id": num,
+            "pid": ownerPID,
+            "bounds": ["x": x, "y": y, "width": wdt, "height": hgt],
+            "title": w[kCGWindowName as String] as? String ?? ""
+        ]
+    }
+
+    // 1. window_id provided: exact match.
+    if let wid = windowID {
+        for w in windows {
+            if (w[kCGWindowNumber as String] as? Int) == wid {
+                let e = windowEntry(w)
+                if let e = e {
+                    // Verify PID/bundle if provided.
+                    if let p = pid, e["pid"] as? Int != p {
+                        return ["found": false, "reason": "pid_mismatch"]
+                    }
+                    if let b = bundleID {
+                        if let app = NSRunningApplication(processIdentifier: e["pid"] as! Int),
+                           app.bundleIdentifier != b {
+                            return ["found": false, "reason": "bundle_mismatch"]
+                        }
+                    }
+                    return ["found": true, "window": e]
+                }
+            }
+        }
+        return ["found": false, "reason": "window_not_found"]
+    }
+
+    // 2. pid only: frontmost normal window of that PID.
+    if let p = pid {
+        for w in windows {
+            if (w[kCGWindowOwnerPID as String] as? Int) == p {
+                if let e = windowEntry(w) {
+                    return ["found": true, "window": e]
+                }
+            }
+        }
+        return ["found": false, "reason": "pid_no_window"]
+    }
+
+    // 3. bundle_id only: frontmost visible normal window of that bundle.
+    if let b = bundleID {
+        for w in windows {
+            let ownerPID = (w[kCGWindowOwnerPID as String] as? Int) ?? 0
+            if let app = NSRunningApplication(processIdentifier: ownerPID),
+               app.bundleIdentifier == b {
+                if let e = windowEntry(w) {
+                    return ["found": true, "window": e]
+                }
+            }
+        }
+        return ["found": false, "reason": "bundle_no_window"]
+    }
+
+    return ["found": false, "reason": "no_target_specified"]
+}
+
 // MARK: - Permissions
 
 func permissionStatus() -> [String: Any] {
@@ -553,6 +650,8 @@ func handle(_ method: String, _ params: [String: Any], id: Any) -> String {
         return handleOverlay(params, id: id)
     case "active":
         return ok(id, activeAppInfo())
+    case "resolve_target":
+        return ok(id, resolveTarget(params))
     case "permissions":
         return ok(id, permissionStatus())
     case "clipboard_get":

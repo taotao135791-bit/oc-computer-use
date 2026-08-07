@@ -29,10 +29,10 @@ pub use pointer::{
 pub use protocol::{
     ActParams, ActResult, ActionResultReport, CancelParams, CancelResult, CapabilityTokenParams,
     ClientInfo, InspectMapping, InspectParams, InspectResult, ObserveParams, ObserveResult,
-    RequestKey, RpcRequest, RpcResponse, RuntimeVersionResult, SessionParams, SessionResult,
-    SessionSummary, ShutdownParams, StabilizationInfo, TraceAdminListParams, TraceEntry,
-    TraceExportParams, TraceExportResult, TraceGetParams, TraceListParams, TraceReplayParams,
-    TraceReport, TraceSummariesParams, TraceSummary,
+    PointerExecutionResult, RequestKey, RpcRequest, RpcResponse, RuntimeVersionResult,
+    SessionParams, SessionResult, SessionSummary, ShutdownParams, StabilizationInfo,
+    TraceAdminListParams, TraceEntry, TraceExportParams, TraceExportResult, TraceGetParams,
+    TraceListParams, TraceReplayParams, TraceReport, TraceSummariesParams, TraceSummary,
 };
 pub use security::{
     generate_control_token, generate_daemon_admin_token, generate_observation_token, redact_json,

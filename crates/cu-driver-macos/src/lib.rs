@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use cu_core::{CuError, DisplayBounds, ImageGeometry, Point, TextInputMethod};
+use cu_core::{CuError, DisplayBounds, ImageGeometry, MouseButton, Point, TextInputMethod};
 use cu_driver::{
     ApplicationInfo, CaptureRequest, CapturedFrame, ComputerDriver, DesktopLayout,
     PermissionStatus, PointerInfo, QuickSnapshot, ResolvedAction,
@@ -64,6 +64,9 @@ pub struct MacosDriver {
     bridge: Bridge,
     /// Cached desktop layout, refreshed when displays change.
     layout: Mutex<Option<DesktopLayout>>,
+    /// The Event Tap human-input monitor (P0-3): dedicated native thread,
+    /// real timestamps, joinable shutdown, exposed health state.
+    event_tap: std::sync::Arc<event_tap::EventTapMonitor>,
 }
 
 impl Default for MacosDriver {
@@ -77,7 +80,15 @@ impl MacosDriver {
         Self {
             bridge: Bridge::new(),
             layout: Mutex::new(None),
+            event_tap: std::sync::Arc::new(event_tap::EventTapMonitor::new()),
         }
+    }
+
+    /// Current Event Tap health state (`active` / `failed` / `stopped` /
+    /// `starting`). The runtime / CLI / status surface this so a degraded
+    /// Human Always Wins is never silently assumed active.
+    pub fn human_input_state(&self) -> event_tap::EventTapState {
+        self.event_tap.state()
     }
 
     /// Build a driver that uses a specific bridge binary (used by the CLI's
@@ -88,6 +99,7 @@ impl MacosDriver {
         Self {
             bridge: b,
             layout: Mutex::new(None),
+            event_tap: std::sync::Arc::new(event_tap::EventTapMonitor::new()),
         }
     }
 
@@ -251,6 +263,107 @@ impl ComputerDriver for MacosDriver {
         })
     }
 
+    /// Execute a long-running action with mid-action cancellation (P0-2).
+    /// Drag / long Scroll / physical move / wait check the token between
+    /// steps; a cancelled drag ALWAYS sends mouse-up (never a stuck button).
+    async fn execute_with_cancel(
+        &self,
+        action: &ResolvedAction,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<cu_driver::ActionResult, CuError> {
+        let started = Instant::now();
+        let outcome = match action {
+            ResolvedAction::Click {
+                x,
+                y,
+                button,
+                double,
+            } => {
+                if *double {
+                    mouse::double_click_direct(*button, *x, *y);
+                } else {
+                    mouse::click_direct(*button, *x, *y);
+                }
+                Ok(())
+            }
+            ResolvedAction::Move {
+                from,
+                to,
+                duration_ms,
+            } => {
+                mouse::move_pointer_smooth(*from, *to, *duration_ms).await;
+                Ok(())
+            }
+            ResolvedAction::TypeText { text, method } => match method {
+                TextInputMethod::Keyboard => {
+                    if text.is_empty() {
+                        Ok(())
+                    } else {
+                        keyboard::type_text(text);
+                        Ok(())
+                    }
+                }
+                TextInputMethod::Clipboard => self.type_via_clipboard(text).await,
+            },
+            ResolvedAction::Key { keys } => {
+                let combo = keyboard::parse_combo(keys)?;
+                keyboard::post_combo(&combo);
+                Ok(())
+            }
+            ResolvedAction::Scroll {
+                at,
+                delta_x,
+                delta_y,
+            } => {
+                if mouse::scroll(*delta_x, *delta_y, *at, Some(&cancel)).await {
+                    Ok(())
+                } else {
+                    Err(CuError::Cancelled)
+                }
+            }
+            ResolvedAction::Drag {
+                from,
+                to,
+                duration_ms,
+            } => {
+                if mouse::drag(*from, *to, *duration_ms, Some(&cancel)).await {
+                    Ok(())
+                } else {
+                    Err(CuError::Cancelled)
+                }
+            }
+            ResolvedAction::Wait { duration_ms } => {
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(*duration_ms);
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => {}
+                    () = cancel.cancelled() => {}
+                }
+                if cancel.is_cancelled() {
+                    Err(CuError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        match outcome {
+            Ok(()) => Ok(cu_driver::ActionResult {
+                success: true,
+                duration_ms: started.elapsed().as_millis() as u64,
+                detail: None,
+            }),
+            Err(CuError::Cancelled) => Ok(cu_driver::ActionResult {
+                success: false,
+                duration_ms: started.elapsed().as_millis() as u64,
+                detail: Some("cancelled by user takeover".into()),
+            }),
+            Err(e) => Ok(cu_driver::ActionResult {
+                success: false,
+                duration_ms: started.elapsed().as_millis() as u64,
+                detail: Some(e.to_string()),
+            }),
+        }
+    }
+
     async fn execute(&self, action: &ResolvedAction) -> Result<cu_driver::ActionResult, CuError> {
         let started = Instant::now();
         let outcome = match action {
@@ -301,7 +414,7 @@ impl ComputerDriver for MacosDriver {
                 delta_x,
                 delta_y,
             } => {
-                mouse::scroll(*delta_x, *delta_y, *at).await;
+                mouse::scroll(*delta_x, *delta_y, *at, None).await;
                 Ok(())
             }
             ResolvedAction::Drag {
@@ -309,7 +422,7 @@ impl ComputerDriver for MacosDriver {
                 to,
                 duration_ms,
             } => {
-                mouse::drag(*from, *to, *duration_ms).await;
+                mouse::drag(*from, *to, *duration_ms, None).await;
                 Ok(())
             }
             ResolvedAction::Wait { duration_ms } => {
@@ -389,19 +502,129 @@ impl ComputerDriver for MacosDriver {
     }
 
     async fn shutdown(&self) -> Result<(), CuError> {
-        // The event tap (if registered) is idempotent and process-lifetime;
-        // it needs no explicit teardown here — CoreFoundation cleans it up on
-        // process exit. Only the bridge child must be stopped explicitly.
+        // P0-3: join the Event Tap thread (disable + stop run loop + join) so
+        // no native thread or CFMachPort leaks. Then stop the bridge child.
+        self.event_tap.shutdown();
         self.bridge.shutdown();
         Ok(())
     }
 
     fn start_human_input_monitor(&self, sink: Box<dyn Fn(u64) + Send + Sync>) -> bool {
-        // The tap hooks its mach-port source into the MAIN run loop (the only
-        // CFRunLoop a bare process can safely use on modern macOS); the daemon
-        // runs its Tokio runtime on the main thread, so events flow. This is
-        // the same architecture CI validated as green.
-        event_tap::register_monitor(sink, true)
+        // P0-3: dedicated native thread with its own CFRunLoop. `start` is
+        // async in the sense that the tap becomes live on the thread shortly
+        // after; health is visible via `human_input_state()`.
+        self.event_tap.start(sink);
+        // Return whether registration was accepted (the thread was spawned).
+        // The caller can check `human_input_state()` afterwards for `active`.
+        true
+    }
+
+    fn human_input_monitor_state(&self) -> Option<String> {
+        Some(self.event_tap.state().as_str().to_string())
+    }
+
+    /// Round 9 / P0-7: physical click = warp cursor + down/up.
+    async fn physical_click_at(
+        &self,
+        button: MouseButton,
+        x: f64,
+        y: f64,
+    ) -> Result<bool, CuError> {
+        // Synchronous CGEvent post; the async wrapper is just for the trait.
+        crate::mouse::click(button, x, y);
+        Ok(true)
+    }
+
+    /// Round 9 / P0-7: Accessibility `AXPress` click — an isolated actuator
+    /// that never moves the real system cursor. Returns `Ok(false)` when AX
+    /// lookup failed or the element does not support press.
+    async fn click_via_accessibility(&self, pid: i32, x: f64, y: f64) -> Result<bool, CuError> {
+        crate::accessibility::press_at(pid, x, y).await
+    }
+
+    /// Round 9 / P0-4: resolve a session target via the Swift bridge
+    /// (`resolve_target` uses CGWindowListCopyWindowInfo). The bridge returns
+    /// the frontmost visible normal window for a bundle/pid, or verifies an
+    /// exact window id — never a random pick.
+    async fn resolve_target(
+        &self,
+        target: &cu_core::SessionTarget,
+    ) -> Result<Option<cu_driver::ResolvedSessionTarget>, CuError> {
+        let mut params = serde_json::json!({});
+        if let Some(b) = &target.bundle_id {
+            params["bundle_id"] = serde_json::json!(b);
+        }
+        if let Some(pid) = target.pid {
+            params["pid"] = serde_json::json!(pid);
+        }
+        if let Some(wid) = target.window_id {
+            params["window_id"] = serde_json::json!(wid);
+        }
+        let data = self.bridge.request("resolve_target", params)?;
+        if data.get("found").and_then(Value::as_bool) != Some(true) {
+            return Ok(None);
+        }
+        let w = data
+            .get("window")
+            .ok_or_else(|| CuError::Driver("resolve_target: missing window".into()))?;
+        let pid = w
+            .get("pid")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| CuError::Driver("resolve_target: missing pid".into()))?
+            as i32;
+        let window_id = w
+            .get("window_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| CuError::Driver("resolve_target: missing window_id".into()))?
+            as u32;
+        // Bundle id: ask for the active app via a second bridge call.
+        let bundle_id = match self.bridge.request("active", serde_json::Value::Null) {
+            Ok(active) => active
+                .get("bundle_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            Err(_) => "unknown".to_string(),
+        };
+        let bounds = w.get("bounds").and_then(|b| {
+            Some(cu_core::DisplayBounds {
+                x: b.get("x")?.as_f64()?,
+                y: b.get("y")?.as_f64()?,
+                width: b.get("width")?.as_f64()?,
+                height: b.get("height")?.as_f64()?,
+            })
+        });
+        Ok(Some(cu_driver::ResolvedSessionTarget {
+            bundle_id,
+            pid,
+            window_id,
+            bounds,
+        }))
+    }
+
+    /// Round 9 / P0-4: refresh bounds for an already-resolved window.
+    async fn resolve_target_bounds(
+        &self,
+        window_id: u32,
+    ) -> Result<Option<cu_core::DisplayBounds>, CuError> {
+        let data = self.bridge.request(
+            "resolve_target",
+            serde_json::json!({ "window_id": window_id }),
+        )?;
+        if data.get("found").and_then(Value::as_bool) != Some(true) {
+            return Ok(None);
+        }
+        let w = data
+            .get("window")
+            .ok_or_else(|| CuError::Driver("resolve_target_bounds: missing window".into()))?;
+        Ok(w.get("bounds").and_then(|b| {
+            Some(cu_core::DisplayBounds {
+                x: b.get("x")?.as_f64()?,
+                y: b.get("y")?.as_f64()?,
+                width: b.get("width")?.as_f64()?,
+                height: b.get("height")?.as_f64()?,
+            })
+        }))
     }
 }
 

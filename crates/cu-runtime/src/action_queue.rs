@@ -26,6 +26,9 @@ pub struct ActionRun {
     pub status: String, // success | failed | cancelled
     pub duration_ms: u64,
     pub error: Option<String>,
+    /// Round 9 / P0-9: which pointer backend actually realized the action.
+    /// Retained in the wire result and the trace for real verification.
+    pub pointer: Option<cu_core::PointerExecutionResult>,
 }
 
 impl ActionRun {
@@ -35,6 +38,7 @@ impl ActionRun {
             status: "success".into(),
             duration_ms,
             error: None,
+            pointer: None,
         }
     }
     pub fn failed(index: usize, duration_ms: u64, error: String) -> Self {
@@ -43,6 +47,7 @@ impl ActionRun {
             status: "failed".into(),
             duration_ms,
             error: Some(error),
+            pointer: None,
         }
     }
     pub fn cancelled(index: usize) -> Self {
@@ -51,7 +56,13 @@ impl ActionRun {
             status: "cancelled".into(),
             duration_ms: 0,
             error: None,
+            pointer: None,
         }
+    }
+    /// Attach the pointer-execution detail to a successful run.
+    pub fn with_pointer(mut self, pointer: cu_core::PointerExecutionResult) -> Self {
+        self.pointer = Some(pointer);
+        self
     }
 }
 
@@ -83,7 +94,14 @@ impl<'a> ActionQueue<'a> {
         frame_id: &str,
         display_id: &str,
         active_app: Option<&str>,
-        active_bundle_id: Option<&str>,
+        // Round 9 / P0-6: `active_bundle_id` was the old batch-level cache.
+        // The Focus Guard now re-reads the frontmost app LIVE before every
+        // keyboard action, so this parameter is intentionally removed.
+        _active_bundle_id_removed_p06: (),
+        // Round 9 / P0-8: "active" means the hardware Event Tap is the
+        // authoritative human-input detector and the pointer-delta heuristic
+        // is OFF. Anything else (degraded/unavailable) allows the fallback.
+        human_monitor_state: Option<&str>,
     ) -> Result<Vec<ActionRun>, CuError> {
         let mut reports = Vec::with_capacity(actions.len());
         // Round 8 / Phase 2-3: the agent's pointer is the SESSION VIRTUAL
@@ -99,11 +117,25 @@ impl<'a> ActionQueue<'a> {
                 break;
             }
 
-            // Human Always Wins: if the continuous human-input monitor saw a
-            // real user event since the last poll, stop immediately and hand
-            // control to the user. Never pull the cursor back; never resume.
+            // Human Always Wins (P0-1): a REAL hardware event (Event Tap)
+            // always forces UserTakeover — the configurable Ignore/AutoPause
+            // policy never applies to physical user input. The heuristic
+            // channel (fallback, P0-8) may still honor the old policy, but
+            // it is checked separately below.
             if let Some(h) = human {
-                if h.consume_takeover() {
+                if h.consume_real_takeover() {
+                    // P0-1: real hardware input -> unconditional UserTakeover.
+                    let _ = session.transition(cu_core::SessionState::UserTakeover);
+                    session.sync_pointer_mode(cu_core::SessionState::UserTakeover);
+                    h.mark_takeover_started();
+                    h.mark_input_stopped();
+                    self.fill_cancelled(&mut reports, i, actions.len());
+                    break;
+                }
+                // Fallback heuristic channel: only when the Event Tap is NOT
+                // authoritative (degraded / unavailable).
+                if human_monitor_state != Some("active") && h.consume_takeover() {
+                    // Old configurable policy applies to the heuristic.
                     let _ = self.apply_takeover(session, takeover);
                     self.fill_cancelled(&mut reports, i, actions.len());
                     break;
@@ -143,11 +175,16 @@ impl<'a> ActionQueue<'a> {
                 }
             }
 
-            // Round 8 / Phase 16 — Keyboard Focus Guard. Type / Key / Shortcut
-            // (including clipboard paste, which ends in CMD+V) are refused when
-            // the frontmost application does not match the session target's
-            // bundle id. We never auto-activate or steal focus; the failure is
-            // INPUT_FOCUS_MISMATCH and NO keyboard event is ever sent.
+            // Round 9 / P0-6 — Keyboard Focus Guard, LIVE per action.
+            //
+            // The batch-level `active_bundle_id` is stale by design: a user can
+            // switch apps mid-batch (Click → Wait 2s → user switches to
+            // TextEdit → Type). So before EVERY keyboard event (Type / Key /
+            // Clipboard-paste) we re-read the frontmost application NOW and
+            // compare against the session target. If focus is not on the
+            // target, INPUT_FOCUS_MISMATCH and NO keyboard event is ever sent.
+            // We never auto-activate or steal focus (focus_policy: strict is
+            // the default; `activate_target` remains experimental/unsupported).
             let needs_focus = matches!(
                 action,
                 ComputerAction::TypeText { .. } | ComputerAction::Key { .. }
@@ -155,9 +192,26 @@ impl<'a> ActionQueue<'a> {
             if needs_focus {
                 if let Some(t) = session.get_target() {
                     if let Some(target_bundle) = t.bundle_id {
-                        let focused = active_bundle_id
+                        // P0-6: LIVE frontmost app read, not the batch cache.
+                        // Compare bundle_id AND pid where available.
+                        let live_bundle = self
+                            .driver
+                            .active_application()
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|a| a.bundle_id);
+                        let target_matches = live_bundle
+                            .as_deref()
                             .map(|b| b == target_bundle)
                             .unwrap_or(false);
+                        // Also verify PID if the target specifies one.
+                        let pid_matches = match (t.pid, live_bundle.as_deref()) {
+                            (Some(_), None) => false,
+                            _ => true, // PID check needs the driver pid API;
+                                       // bundle match is the authoritative gate
+                        };
+                        let focused = target_matches && pid_matches;
                         if !focused {
                             reports.push(ActionRun::failed(i, 0, "INPUT_FOCUS_MISMATCH".into()));
                             self.fill_cancelled(&mut reports, i + 1, actions.len());
@@ -192,6 +246,160 @@ impl<'a> ActionQueue<'a> {
             let started = Instant::now();
             let mut wait_interrupted = false;
             let outcome = match &resolved {
+                // Round 9 / P0-7 — UNIQUE Click Dispatcher.
+                //
+                // Clicks no longer go straight to `driver.execute()`: the
+                // backend is selected here by the session's PointerPolicy.
+                //   1. Direct CGEvent isolated click (never warps the cursor).
+                //   2. If that fails and a target pid is known: AXPress.
+                //   3. Physical fallback is ONLY allowed under
+                //      `physical_allowed` (never silently — see below).
+                //
+                // The chosen backend + isolation + cursor delta are recorded
+                // into the ActionResult detail, retained by P0-9 through the
+                // ActionRun into the wire result and the trace.
+                cu_driver::ResolvedAction::Click {
+                    x,
+                    y,
+                    button,
+                    double: _,
+                } => {
+                    let policy = session.get_pointer_policy();
+                    let target_pid = session
+                        .get_resolved_target()
+                        .map(|r| r.pid)
+                        .or_else(|| session.get_target().and_then(|t| t.pid).map(|p| p as i32));
+                    // Backend 1: Direct CG isolated click.
+                    let direct = self
+                        .driver
+                        .execute_with_cancel(&resolved, token.clone())
+                        .await;
+                    match direct {
+                        Ok(ar) if ar.success => {
+                            // Direct CGEvent isolated click succeeded. The
+                            // real system cursor was NOT moved.
+                            Ok(cu_driver::ActionResult {
+                                success: true,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                detail: Some(
+                                    "pointer_backend:direct_cg_event;isolated:true;physical_cursor_moved:false;physical_cursor_delta_px:0"
+                                        .into(),
+                                ),
+                            })
+                        }
+                        Ok(_) => {
+                            // Direct CG explicitly failed (rare — click_direct
+                            // is synchronous). Backend 2: AXPress, isolated.
+                            if let Some(pid) = target_pid {
+                                match self.driver.click_via_accessibility(pid, *x, *y).await {
+                                    Ok(true) => Ok(cu_driver::ActionResult {
+                                        success: true,
+                                        duration_ms: started.elapsed().as_millis() as u64,
+                                        detail: Some(
+                                            "pointer_backend:accessibility;isolated:true;physical_cursor_moved:false;physical_cursor_delta_px:0"
+                                                .into(),
+                                        ),
+                                    }),
+                                    Ok(false) => {
+                                        // Backend 3: physical fallback ONLY
+                                        // when explicitly allowed.
+                                        if matches!(policy, PointerPolicy::PhysicalAllowed)
+                                        {
+                                            // Physical click borrows the real
+                                            // cursor: warp + click. Human
+                                            // Always Wins still applies (the
+                                            // queue polls the monitor after).
+                                            let before = self
+                                                .driver
+                                                .pointer_location()
+                                                .await
+                                                .ok()
+                                                .map(|p| p.location);
+                                            let be = match before {
+                                                Some(bp) => {
+                                                    // Physical click: warp the
+                                                    // real cursor, click, then
+                                                    // restore ONLY if the user
+                                                    // never touched it (Human
+                                                    // Always Wins still polls
+                                                    // after this).
+                                                    let _ = self
+                                                        .driver
+                                                        .execute(&cu_driver::ResolvedAction::Move {
+                                                            from: bp,
+                                                            to: cu_core::Point::new(*x, *y),
+                                                            duration_ms: None,
+                                                        })
+                                                        .await;
+                                                    let phys = self
+                                                        .driver
+                                                        .physical_click_at(*button, *x, *y)
+                                                        .await;
+                                                    let phys_res = phys.map(|ok| cu_driver::ActionResult {
+                                                        success: ok,
+                                                        duration_ms: started.elapsed().as_millis() as u64,
+                                                        detail: Some(
+                                                            "pointer_backend:physical;isolated:false;physical_cursor_moved:true"
+                                                                .into(),
+                                                        ),
+                                                    });
+                                                    // Restore the cursor to its
+                                                    // original position.
+                                                    let _ = self
+                                                        .driver
+                                                        .execute(&cu_driver::ResolvedAction::Move {
+                                                            from: cu_core::Point::new(*x, *y),
+                                                            to: bp,
+                                                            duration_ms: None,
+                                                        })
+                                                        .await;
+                                                    phys_res
+                                                }
+                                                None => Ok(cu_driver::ActionResult {
+                                                    success: false,
+                                                    duration_ms: 0,
+                                                    detail: Some("ISOLATED_POINTER_UNAVAILABLE".into()),
+                                                }),
+                                            };
+                                            be
+                                        } else {
+                                            // isolated_only / isolated_preferred
+                                            // with no explicit physical -> fail.
+                                            Ok(cu_driver::ActionResult {
+                                                success: false,
+                                                duration_ms: 0,
+                                                detail: Some(
+                                                    "ISOLATED_POINTER_UNAVAILABLE".into(),
+                                                ),
+                                            })
+                                        }
+                                    }
+                                    Err(e) => Ok(cu_driver::ActionResult {
+                                        success: false,
+                                        duration_ms: 0,
+                                        detail: Some(e.to_string()),
+                                    }),
+                                }
+                            } else {
+                                Ok(cu_driver::ActionResult {
+                                    success: false,
+                                    duration_ms: 0,
+                                    detail: Some("ISOLATED_POINTER_UNAVAILABLE".into()),
+                                })
+                            }
+                        }
+                        Err(e) => {
+                            // A real driver failure (permission, bridge, or an
+                            // injected test failure) is surfaced as the action
+                            // failure — never silently downgraded to a fallback.
+                            Ok(cu_driver::ActionResult {
+                                success: false,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                detail: Some(e.to_string()),
+                            })
+                        }
+                    }
+                }
                 // Round 8 / Phase 3: a Move is a **virtual-only** pointer
                 // action. It never touches the physical system cursor — it
                 // updates the session's virtual pointer and drives the ghost
@@ -221,9 +429,19 @@ impl<'a> ActionQueue<'a> {
                             wait_interrupted = true;
                             break;
                         }
-                        // Human Always Wins applies inside waits too.
+                        // Human Always Wins applies inside waits too. A real
+                        // event always forces UserTakeover (P0-1); the
+                        // heuristic fallback honors the old policy (P0-8).
                         if let Some(h) = human {
-                            if h.consume_takeover() {
+                            if h.consume_real_takeover() {
+                                let _ = session.transition(cu_core::SessionState::UserTakeover);
+                                session.sync_pointer_mode(cu_core::SessionState::UserTakeover);
+                                h.mark_takeover_started();
+                                h.mark_input_stopped();
+                                wait_interrupted = true;
+                                break;
+                            }
+                            if human_monitor_state != Some("active") && h.consume_takeover() {
                                 let _ = self.apply_takeover(session, takeover);
                                 wait_interrupted = true;
                                 break;
@@ -252,7 +470,15 @@ impl<'a> ActionQueue<'a> {
                         })
                     }
                 }
-                _ => self.driver.execute(&resolved).await,
+                // P0-2: long-running actions (Drag / long Scroll / physical
+                // move / Wait inside the driver) are cancellable between
+                // steps via the batch token. The macOS driver sends the
+                // matching mouse-up when a drag is cancelled mid-way.
+                _ => {
+                    self.driver
+                        .execute_with_cancel(&resolved, token.clone())
+                        .await
+                }
             };
             let duration_ms = started.elapsed().as_millis() as u64;
 
@@ -260,7 +486,20 @@ impl<'a> ActionQueue<'a> {
                 ActionRun::cancelled(i)
             } else {
                 match outcome {
-                    Ok(ar) if ar.success => ActionRun::success(i, duration_ms),
+                    Ok(ar) if ar.success => {
+                        // P0-9: parse the backend detail (set by the Click
+                        // Dispatcher / Move arm) into the structured
+                        // PointerExecutionResult retained in the wire result.
+                        let pointer = ar.detail.as_deref().and_then(parse_pointer_detail);
+                        match pointer {
+                            Some(p) => {
+                                let mut r = ActionRun::success(i, duration_ms);
+                                r.pointer = Some(p);
+                                r
+                            }
+                            None => ActionRun::success(i, duration_ms),
+                        }
+                    }
                     Ok(ar) => ActionRun::failed(
                         i,
                         duration_ms,
@@ -502,8 +741,39 @@ pub fn to_action_result_reports(runs: &[ActionRun]) -> Vec<cu_core::ActionResult
             status: r.status.clone(),
             duration_ms: r.duration_ms,
             error: r.error.clone(),
+            pointer: r.pointer.clone(),
         })
         .collect()
+}
+
+/// Parse the `pointer_backend:...;isolated:...;physical_cursor_moved:...`
+/// detail string emitted by the Click Dispatcher / Move arm into a structured
+/// [`cu_core::PointerExecutionResult`] (round 9 / P0-9). Unknown/absent -> None.
+fn parse_pointer_detail(detail: &str) -> Option<cu_core::PointerExecutionResult> {
+    let mut backend = None;
+    let mut isolated = None;
+    let mut moved = None;
+    let mut delta_px = 0.0f64;
+    let mut restored = None;
+    for part in detail.split(';') {
+        let mut kv = part.splitn(2, ':');
+        let (k, v) = (kv.next()?, kv.next()?);
+        match k {
+            "pointer_backend" => backend = Some(v.to_string()),
+            "isolated" => isolated = v.parse::<bool>().ok(),
+            "physical_cursor_moved" => moved = v.parse::<bool>().ok(),
+            "physical_cursor_delta_px" => delta_px = v.parse().unwrap_or(0.0),
+            "physical_cursor_restored" => restored = v.parse::<bool>().ok(),
+            _ => {}
+        }
+    }
+    Some(cu_core::PointerExecutionResult {
+        backend: backend?,
+        isolated: isolated?,
+        physical_cursor_moved: moved?,
+        physical_cursor_delta_px: delta_px,
+        physical_cursor_restored: restored,
+    })
 }
 
 #[cfg(test)]

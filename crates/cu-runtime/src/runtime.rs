@@ -344,7 +344,17 @@ impl Runtime {
         // session: pointer policy gates physical fallback, target + focus
         // policy gate the keyboard focus guard.
         if let Some(t) = target {
+            // Round 9 / P0-4: the RUNTIME resolves the target through the
+            // DRIVER (never the adapter) BEFORE storing it. The driver
+            // returns a concrete window with current bounds; these are what
+            // the Focus Guard and TARGET_OUTSIDE_SESSION checks use.
+            // Resolution failure is not fatal: the session keeps its target
+            // intent but with no bounds (Focus Guard still enforces bundle
+            // isolation), and the first coordinate action will surface
+            // TARGET_UNAVAILABLE if the window is genuinely gone.
+            let resolved = self.driver.resolve_target(&t).await.ok().flatten();
             session.set_target(Some(t));
+            session.set_resolved_target(resolved);
         }
         if let Some(pp) = pointer_policy {
             session.set_pointer_policy(pp);
@@ -977,6 +987,28 @@ impl Runtime {
             return Err(self.stale.to_error(&verdict));
         }
 
+        // Round 9 / P0-4: refresh the session target's CURRENT bounds before
+        // any coordinate-bearing action. Windows move / resize / minimize /
+        // close / recreate; a stale bounds would let a click land outside the
+        // real window. If the target is gone -> TARGET_UNAVAILABLE. The
+        // bounds are refreshed here (not cached at batch start), then the
+        // per-action TARGET_OUTSIDE_SESSION check in the queue uses them.
+        if let Some(rt) = session.get_resolved_target() {
+            match self.driver.resolve_target_bounds(rt.window_id).await {
+                Ok(Some(b)) => {
+                    session.set_target_bounds(Some(b));
+                }
+                Ok(None) => {
+                    // Target window is gone (closed / minimized / recreated).
+                    return Err(CuError::TargetUnavailable);
+                }
+                Err(_) => {
+                    // Resolution probe failed; keep the previous bounds so the
+                    // session is not hard-failed on a transient bridge issue.
+                }
+            }
+        }
+
         // Bounds pre-check: every location-bearing action must be on-screen
         // before anything moves.
         if !cu_policy::batch_in_bounds(&batch.actions, &geometry) {
@@ -991,16 +1023,8 @@ impl Runtime {
             ..Default::default()
         };
         let queue = ActionQueue::new(self.driver.as_ref());
-        // The live frontmost bundle id feeds the keyboard focus guard
-        // (Phase 16): a real `active_application` read, not the frame's
-        // possibly-stale snapshot.
-        let live_bundle_id = self
-            .driver
-            .active_application()
-            .await
-            .ok()
-            .flatten()
-            .map(|app| app.bundle_id);
+        // Round 9 / P0-6: the Focus Guard now re-reads the frontmost app LIVE
+        // before every keyboard action inside the queue; no batch-level cache.
         let runs = queue
             .run(
                 &session,
@@ -1014,7 +1038,8 @@ impl Runtime {
                 &params.frame_id,
                 &session.display_id,
                 before_screen.active_application.as_deref(),
-                live_bundle_id.as_deref(),
+                (),
+                self.driver.human_input_monitor_state().as_deref(),
             )
             .await?;
         *session.last_action_at.lock().unwrap() = Some(Utc::now());

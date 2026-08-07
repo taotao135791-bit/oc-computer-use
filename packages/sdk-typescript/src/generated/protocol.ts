@@ -573,7 +573,34 @@ export interface ActionResultReport {
   duration_ms: number;
   error?: string;
   index: number;
+  pointer?: PointerExecutionResult;
   status: string;
+  [k: string]: unknown;
+}
+/**
+ * Round 9 / P0-9: which pointer backend/actuator realized the action (retained in the result + trace for real verification).
+ */
+export interface PointerExecutionResult {
+  /**
+   * The actuator that actually realized the action: `"virtual" | "direct_cg_event" | "accessibility" | "physical"`.
+   */
+  backend: string;
+  /**
+   * True when the action executed without touching the real system cursor.
+   */
+  isolated: boolean;
+  /**
+   * Distance the system cursor moved (logical px); 0 for isolated actions.
+   */
+  physical_cursor_delta_px: number;
+  /**
+   * True when the real system cursor was temporarily moved.
+   */
+  physical_cursor_moved: boolean;
+  /**
+   * Whether the cursor was restored to its original position after a physical fallback transaction (absent when never borrowed).
+   */
+  physical_cursor_restored?: boolean;
   [k: string]: unknown;
 }
 /**
@@ -776,6 +803,35 @@ export interface PermissionIssue {
   granted: boolean;
   guidance: string;
   kind: PermissionKind;
+  [k: string]: unknown;
+}
+/**
+ * Pointer-execution detail retained in an action result (round 9 / P0-7, P0-9). The backend that actually realized the action, whether it was isolated, and how the real system cursor moved (if at all). This is used by benchmark reports and human-interrupt latency analysis — never guessed from the action type.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "PointerExecutionResult".
+ */
+export interface PointerExecutionResult1 {
+  /**
+   * The actuator that actually realized the action: `"virtual" | "direct_cg_event" | "accessibility" | "physical"`.
+   */
+  backend: string;
+  /**
+   * True when the action executed without touching the real system cursor.
+   */
+  isolated: boolean;
+  /**
+   * Distance the system cursor moved (logical px); 0 for isolated actions.
+   */
+  physical_cursor_delta_px: number;
+  /**
+   * True when the real system cursor was temporarily moved.
+   */
+  physical_cursor_moved: boolean;
+  /**
+   * Whether the cursor was restored to its original position after a physical fallback transaction (absent when never borrowed).
+   */
+  physical_cursor_restored?: boolean;
   [k: string]: unknown;
 }
 /**

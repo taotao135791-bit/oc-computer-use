@@ -71,6 +71,10 @@ pub struct Session {
     /// coordinates outside it with `TARGET_OUTSIDE_SESSION`. `None` = no
     /// window-scoped check (whole display allowed).
     pub target_bounds: Mutex<Option<cu_core::DisplayBounds>>,
+    /// Round 9 / P0-4: the runtime-resolved target (bundle + pid + window id +
+    /// current bounds). `None` = no target, or resolution failed (the session
+    /// may still run whole-desktop but with its isolation scoped off).
+    pub resolved_target: Mutex<Option<cu_driver::ResolvedSessionTarget>>,
     /// How strictly keyboard focus is validated before type/key input.
     pub focus_policy: Mutex<FocusPolicy>,
 }
@@ -106,6 +110,7 @@ impl Session {
             pointer_policy: Mutex::new(PointerPolicy::IsolatedPreferred),
             target: Mutex::new(None),
             target_bounds: Mutex::new(None),
+            resolved_target: Mutex::new(None),
             focus_policy: Mutex::new(FocusPolicy::Strict),
         }
     }
@@ -162,6 +167,18 @@ impl Session {
 
     pub fn get_target_bounds(&self) -> Option<cu_core::DisplayBounds> {
         *self.target_bounds.lock().unwrap()
+    }
+
+    /// Store the runtime-resolved target (P0-4). Also mirrors its bounds into
+    /// `target_bounds` so the existing `TARGET_OUTSIDE_SESSION` check works.
+    pub fn set_resolved_target(&self, rt: Option<cu_driver::ResolvedSessionTarget>) {
+        let bounds = rt.as_ref().and_then(|r| r.bounds);
+        *self.resolved_target.lock().unwrap() = rt;
+        *self.target_bounds.lock().unwrap() = bounds;
+    }
+
+    pub fn get_resolved_target(&self) -> Option<cu_driver::ResolvedSessionTarget> {
+        self.resolved_target.lock().unwrap().clone()
     }
 
     pub fn set_focus_policy(&self, policy: FocusPolicy) {

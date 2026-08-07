@@ -204,6 +204,28 @@ pub struct ActParams {
     pub policy_context: Option<String>,
 }
 
+/// Pointer-execution detail retained in an action result (round 9 / P0-7,
+/// P0-9). The backend that actually realized the action, whether it was
+/// isolated, and how the real system cursor moved (if at all). This is used
+/// by benchmark reports and human-interrupt latency analysis — never guessed
+/// from the action type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PointerExecutionResult {
+    /// The actuator that actually realized the action:
+    /// `"virtual" | "direct_cg_event" | "accessibility" | "physical"`.
+    pub backend: String,
+    /// True when the action executed without touching the real system cursor.
+    pub isolated: bool,
+    /// True when the real system cursor was temporarily moved.
+    pub physical_cursor_moved: bool,
+    /// Distance the system cursor moved (logical px); 0 for isolated actions.
+    pub physical_cursor_delta_px: f64,
+    /// Whether the cursor was restored to its original position after a
+    /// physical fallback transaction (absent when never borrowed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_cursor_restored: Option<bool>,
+}
+
 /// Result of one action inside a batch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ActionResultReport {
@@ -212,6 +234,10 @@ pub struct ActionResultReport {
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Round 9 / P0-9: which pointer backend/actuator realized the action
+    /// (retained in the result + trace for real verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<PointerExecutionResult>,
 }
 
 /// Outcome of the post-batch stabilization wait (`WaitPolicy::UntilStable`).

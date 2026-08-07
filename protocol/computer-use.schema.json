@@ -104,6 +104,10 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "pointer": {
+          "$ref": "#/$defs/PointerExecutionResult",
+          "description": "Round 9 / P0-9: which pointer backend/actuator realized the action (retained in the result + trace for real verification)."
+        },
         "status": {
           "type": "string"
         }
@@ -1136,6 +1140,39 @@
       "required": [
         "x",
         "y"
+      ],
+      "type": "object"
+    },
+    "PointerExecutionResult": {
+      "description": "Pointer-execution detail retained in an action result (round 9 / P0-7, P0-9). The backend that actually realized the action, whether it was isolated, and how the real system cursor moved (if at all). This is used by benchmark reports and human-interrupt latency analysis — never guessed from the action type.",
+      "properties": {
+        "backend": {
+          "description": "The actuator that actually realized the action: `\"virtual\" | \"direct_cg_event\" | \"accessibility\" | \"physical\"`.",
+          "type": "string"
+        },
+        "isolated": {
+          "description": "True when the action executed without touching the real system cursor.",
+          "type": "boolean"
+        },
+        "physical_cursor_delta_px": {
+          "description": "Distance the system cursor moved (logical px); 0 for isolated actions.",
+          "format": "double",
+          "type": "number"
+        },
+        "physical_cursor_moved": {
+          "description": "True when the real system cursor was temporarily moved.",
+          "type": "boolean"
+        },
+        "physical_cursor_restored": {
+          "description": "Whether the cursor was restored to its original position after a physical fallback transaction (absent when never borrowed).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "backend",
+        "isolated",
+        "physical_cursor_delta_px",
+        "physical_cursor_moved"
       ],
       "type": "object"
     },

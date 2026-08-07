@@ -112,26 +112,63 @@ pub fn double_click(button: MouseButton, x: f64, y: f64) {
 }
 
 /// Smooth drag with the primary button held down from `from` to `to`.
-pub async fn drag(from: cu_core::Point, to: cu_core::Point, duration_ms: Option<u64>) {
+pub async fn drag(
+    from: cu_core::Point,
+    to: cu_core::Point,
+    duration_ms: Option<u64>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
     let duration = duration_ms.unwrap_or(400).min(10_000);
     move_pointer(from.x, from.y);
     button_down(MouseButton::Left, from.x, from.y, 1);
     let path = coordinates::drag_path(from, to, duration, 90.0);
     let drag_type = move_type_for_button(MOUSE_BUTTON_LEFT);
+    let mut cancelled = false;
     for (p, wait) in &path {
+        if let Some(c) = cancel {
+            if c.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+        }
         let ev = create_mouse_event(drag_type, CGPoint { x: p.x, y: p.y }, MOUSE_BUTTON_LEFT);
         post(&ev);
         if *wait > 0 {
-            sleep(Duration::from_millis(*wait)).await;
+            let wait_ok = match cancel {
+                Some(c) => tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(*wait)) => true,
+                    () = c.cancelled() => false,
+                },
+                None => {
+                    sleep(Duration::from_millis(*wait)).await;
+                    true
+                }
+            };
+            if !wait_ok {
+                cancelled = true;
+                break;
+            }
         }
     }
-    button_up(MouseButton::Left, to.x, to.y, 1);
+    // Mouse-down already happened: ALWAYS send mouse-up, even when cancelled,
+    // so the system is never left with a stuck pressed button.
+    if cancelled {
+        button_up(MouseButton::Left, to.x.max(0.0), to.y.max(0.0), 1);
+    } else {
+        button_up(MouseButton::Left, to.x, to.y, 1);
+    }
+    !cancelled
 }
 
-/// Scroll by pixel deltas. `delta_y < 0` scrolls down (content moves up),
-/// matching the convention used by computer-use tooling. Posting several
-/// smaller events keeps the motion smooth instead of one big jump.
-pub async fn scroll(delta_x: f64, delta_y: f64, at: Option<cu_core::Point>) {
+/// Scroll by pixel deltas, cancellation-aware (round 9 / P0-2): long scrolls
+/// are split into chunks and check the token between chunks; never sends one
+/// uninterruptible burst. Returns `true` on completion, `false` on cancel.
+pub async fn scroll(
+    delta_x: f64,
+    delta_y: f64,
+    at: Option<cu_core::Point>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
     if let Some(p) = at {
         move_pointer(p.x, p.y);
     }
@@ -142,6 +179,11 @@ pub async fn scroll(delta_x: f64, delta_y: f64, at: Option<cu_core::Point>) {
     let mut remaining_x = total_x;
     let mut remaining_y = total_y;
     while remaining_x != 0 || remaining_y != 0 {
+        if let Some(c) = cancel {
+            if c.is_cancelled() {
+                return false;
+            }
+        }
         let dx = remaining_x.clamp(-chunk as i64, chunk as i64);
         let dy = remaining_y.clamp(-chunk as i64, chunk as i64);
         let ev = create_scroll_event(dy as i32, dx as i32, true);
@@ -149,9 +191,22 @@ pub async fn scroll(delta_x: f64, delta_y: f64, at: Option<cu_core::Point>) {
         remaining_x -= dx;
         remaining_y -= dy;
         if remaining_x != 0 || remaining_y != 0 {
-            sleep(Duration::from_millis(8)).await;
+            let wait_ok = match cancel {
+                Some(c) => tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(8)) => true,
+                    () = c.cancelled() => false,
+                },
+                None => {
+                    sleep(Duration::from_millis(8)).await;
+                    true
+                }
+            };
+            if !wait_ok {
+                return false;
+            }
         }
     }
+    true
 }
 
 #[cfg(test)]

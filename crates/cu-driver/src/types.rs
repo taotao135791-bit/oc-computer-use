@@ -132,6 +132,19 @@ pub struct DesktopLayout {
     pub primary_id: String,
 }
 
+/// A session target resolved to a concrete macOS app/window (round 9 / P0-4).
+/// Produced by the DRIVER (never the adapter), so window resolution lives in
+/// the platform layer where it belongs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedSessionTarget {
+    pub bundle_id: String,
+    pub pid: i32,
+    pub window_id: u32,
+    /// Current window bounds in global logical points. Refreshed before every
+    /// coordinate-bearing action; `None` when the window is off-screen.
+    pub bounds: Option<cu_core::DisplayBounds>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
