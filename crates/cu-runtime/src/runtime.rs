@@ -574,11 +574,13 @@ impl Runtime {
         // points (takeover hid it). Drive it from the session's virtual
         // pointer position.
         {
-            let vp = session.virtual_pointer.lock().unwrap();
-            let _ = self
-                .driver
-                .pointer_visualized(vp.x, vp.y, &session.display_id)
-                .await;
+            // Snapshot the coordinates first: the MutexGuard must not live
+            // across the await (the driver may itself touch the pointer).
+            let (vx, vy, vd) = {
+                let vp = session.virtual_pointer.lock().unwrap();
+                (vp.x, vp.y, vp.display_id.clone())
+            };
+            let _ = self.driver.pointer_visualized(vx, vy, &vd).await;
         }
         if let Some(t) = session.trace.as_ref() {
             let _ = t
