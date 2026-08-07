@@ -61,6 +61,7 @@ async fn spawn_daemon() -> TestDaemon {
             frames_dir: dir.path().join("frames"),
             ..cu_runtime::RuntimeConfig::default()
         },
+        enable_human_input: false,
     };
     let handle = tokio::spawn(cu_daemon::run(config));
     // Wait until the socket is listening (the admin token is persisted before
@@ -155,6 +156,7 @@ async fn stale_socket_is_replaced_on_startup() {
             frames_dir: dir.path().join("frames"),
             ..cu_runtime::RuntimeConfig::default()
         },
+        enable_human_input: false,
     };
     let handle = tokio::spawn(cu_daemon::run(config));
     for _ in 0..200 {
@@ -202,6 +204,7 @@ async fn daemon_refuses_to_start_when_the_admin_token_cannot_be_persisted() {
             frames_dir: dir.path().join("frames"),
             ..cu_runtime::RuntimeConfig::default()
         },
+        enable_human_input: false,
     };
     std::fs::write(dir.path().join("blocker"), b"in the way").unwrap();
     let err = tokio::time::timeout(Duration::from_secs(10), cu_daemon::run(config))
@@ -259,6 +262,7 @@ async fn observation_token_is_pure_read_only_end_to_end() {
             traces_dir: traces.clone(),
             ..cu_runtime::RuntimeConfig::default()
         },
+        enable_human_input: false,
     };
     let handle = tokio::spawn(cu_daemon::run(config));
     for _ in 0..200 {

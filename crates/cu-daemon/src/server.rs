@@ -47,6 +47,10 @@ pub struct DaemonConfig {
     /// responses before aborting them (a graceful stop never hangs forever).
     pub shutdown_grace_secs: u64,
     pub runtime_config: RuntimeConfig,
+    /// Start the continuous human-input Event Tap at daemon startup. True in
+    /// production (Human Always Wins needs it); protocol-level tests set it
+    /// false so they never touch a real macOS Event Tap / TCC prompt.
+    pub enable_human_input: bool,
 }
 
 impl Default for DaemonConfig {
@@ -71,6 +75,7 @@ impl Default for DaemonConfig {
             request_timeout_secs: 600,
             shutdown_grace_secs: 10,
             runtime_config,
+            enable_human_input: true,
         }
     }
 }
@@ -88,16 +93,14 @@ pub(crate) async fn serve_with(
 ) -> anyhow::Result<()> {
     let runtime = Arc::new(Runtime::new(driver.clone(), config.runtime_config.clone()));
 
-    // Round 8 / Phase 11: start the continuous human-input monitor (Event Tap)
-    // on its own native thread. The tap feeds the runtime's HumanInputMonitor,
-    // so Human Always Wins works *while* a batch executes — not only after. It
-    // is stopped by the driver's shutdown path (joined, no leaked threads).
-    {
+    // Round 8 / Phase 11: once the daemon is fully wired, start the continuous
+    // human-input monitor (Event Tap). The tap feeds the runtime's
+    // HumanInputMonitor, so Human Always Wins works *while* a batch executes.
+    // Protocol-level tests run with `enable_human_input = false` so they never
+    // touch a real macOS Event Tap.
+    if config.enable_human_input {
         let monitor = runtime.human_input.clone();
         let started = driver.start_human_input_monitor(Box::new(move |latency_ms| {
-            // The tap already resolved the event's real timestamp; forward it
-            // to the monitor, which records the interrupt latency and raises
-            // the takeover flag (Human Always Wins).
             monitor.on_human_event(latency_ms);
         }));
         tracing::info!(event_tap = started, "human-input monitor state");
@@ -372,6 +375,7 @@ mod tests {
             request_timeout_secs: 60,
             shutdown_grace_secs: 5,
             runtime_config: test_config(),
+            enable_human_input: false,
         };
         let driver: Arc<dyn ComputerDriver> = Arc::new(FakeDriver::default());
         let handle = tokio::spawn(serve_with(driver, config));
@@ -506,6 +510,7 @@ mod tests {
             request_timeout_secs: 60,
             shutdown_grace_secs: 5,
             runtime_config: test_config(),
+            enable_human_input: false,
         };
         let driver2: Arc<dyn ComputerDriver> = Arc::new(FakeDriver::default());
         let h2 = tokio::spawn(serve_with(driver2, config));
