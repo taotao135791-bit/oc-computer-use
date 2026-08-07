@@ -278,6 +278,31 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
       }),
       session_id: Type.Optional(Type.String({ description: "Omit to act on the current session" })),
       display_id: Type.Optional(Type.String({ description: "Display to capture (defaults to primary)" })),
+      // Round 9 / P0-5: session isolation configuration.
+      target: Type.Optional(
+        Type.Object(
+          {
+            bundle_id: Type.Optional(Type.String({ description: "App bundle id, e.g. com.google.Chrome" })),
+            pid: Type.Optional(Type.Number({ description: "App process id" })),
+            window_id: Type.Optional(Type.Number({ description: "Window id (CGWindowNumber)" })),
+          },
+          { description: "Scope the session to one app/window" },
+        ),
+      ),
+      pointer_policy: Type.Optional(
+        StringEnum(["isolated_only", "isolated_preferred", "physical_allowed"], {
+          description:
+            "isolated_only never touches the real cursor; isolated_preferred prefers isolation " +
+            "(physical only when explicitly allowed); physical_allowed may borrow the cursor",
+        }),
+      ),
+      focus_policy: Type.Optional(
+        StringEnum(["strict", "activate_target"], {
+          description:
+            "strict rejects type/key when focus is not on the target (never steals foreground); " +
+            "activate_target is experimental/unsupported",
+        }),
+      ),
     }),
     async execute(toolCallId, params, signal) {
       if (signal?.aborted) return cancelledResult();
@@ -287,6 +312,15 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
         {
           session_id: params.session_id ?? undefined,
           display_id: params.display_id ?? undefined,
+          ...(params.target !== undefined
+            ? { target: params.target }
+            : {}),
+          ...(params.pointer_policy !== undefined
+            ? { pointer_policy: params.pointer_policy }
+            : {}),
+          ...(params.focus_policy !== undefined
+            ? { focus_policy: params.focus_policy }
+            : {}),
           // Record our identity when we create the session (ownership).
           ...(params.action === "start" ? { ...PI_CLIENT_INFO } : {}),
         },

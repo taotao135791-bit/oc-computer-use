@@ -108,6 +108,21 @@ struct SessionArgs {
     /// Display to bind a new session to.
     #[arg(long)]
     display_id: Option<String>,
+    /// App bundle id for a session target (e.g. com.google.Chrome).
+    #[arg(long)]
+    bundle_id: Option<String>,
+    /// App pid for a session target.
+    #[arg(long)]
+    pid: Option<i32>,
+    /// Window id (CGWindowNumber) for a session target.
+    #[arg(long)]
+    window_id: Option<u32>,
+    /// Pointer isolation policy.
+    #[arg(long, value_parser = ["isolated_only", "isolated_preferred", "physical_allowed"])]
+    pointer_policy: Option<String>,
+    /// Keyboard focus policy.
+    #[arg(long, value_parser = ["strict", "activate_target"])]
+    focus_policy: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -1145,8 +1160,30 @@ async fn run_session(args: SessionArgs) -> Result<(), ClientError> {
         }
     };
 
-    let params = if args.action == "start" {
-        session_start_params(json!(args.display_id))
+    let mut params = if args.action == "start" {
+        let mut p = session_start_params(json!(args.display_id));
+        // Round 9 / P0-5: session isolation configuration (target / pointer /
+        // focus) exposed at the CLI.
+        let mut target = serde_json::Map::new();
+        if let Some(b) = &args.bundle_id {
+            target.insert("bundle_id".into(), json!(b));
+        }
+        if let Some(pid) = args.pid {
+            target.insert("pid".into(), json!(pid));
+        }
+        if let Some(wid) = args.window_id {
+            target.insert("window_id".into(), json!(wid));
+        }
+        if !target.is_empty() {
+            p["target"] = json!(target);
+        }
+        if let Some(pp) = &args.pointer_policy {
+            p["pointer_policy"] = json!(pp);
+        }
+        if let Some(fp) = &args.focus_policy {
+            p["focus_policy"] = json!(fp);
+        }
+        p
     } else if args.action == "status" {
         // status resolves the active session daemon-side; without one it is
         // a typed SESSION_NOT_FOUND, which adapters rely on. It is also a

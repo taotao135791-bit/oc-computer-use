@@ -223,12 +223,39 @@ export function createComputerUseServer(
           .describe("Session action"),
         session_id: z.string().optional().describe("Required except for start/status"),
         display_id: z.string().optional().describe("Display to capture (defaults to primary)"),
+        // Round 9 / P0-5: expose session isolation configuration. `target`
+        // scopes the session to an app/window (Chrome, TextEdit); the
+        // pointer policy decides when the real cursor may be borrowed;
+        // focus policy defaults to strict (no focus stealing).
+        target: z
+          .object({
+            bundle_id: z.string().optional().describe("App bundle id, e.g. com.google.Chrome"),
+            pid: z.number().int().optional().describe("App process id"),
+            window_id: z.number().int().optional().describe("Window id (CGWindowNumber)"),
+          })
+          .optional()
+          .describe("Scope the session to one app/window"),
+        pointer_policy: z
+          .enum(["isolated_only", "isolated_preferred", "physical_allowed"])
+          .optional()
+          .describe(
+            "Pointer isolation: isolated_only never touches the real cursor; " +
+            "isolated_preferred prefers isolation and only uses physical fallback " +
+            "when explicitly allowed; physical_allowed may borrow the cursor",
+          ),
+        focus_policy: z
+          .enum(["strict", "activate_target"])
+          .optional()
+          .describe(
+            "Keyboard focus policy: strict rejects type/key when focus is not on the " +
+            "target (never steals foreground); activate_target is experimental/unsupported",
+          ),
       }),
     },
     async ({ action, session_id, display_id }) => {
       try {
         const c = await getClient();
-        const result = await c.session(action, { session_id, display_id });
+        const result = await c.session(action, { session_id, display_id, target, pointer_policy, focus_policy });
         // Ownership follows the token: the daemon issued one in this response,
         // so this server is the owner and may (should) stop it on exit.
         if (action === "start" && result.control_token) {
