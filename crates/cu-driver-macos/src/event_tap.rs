@@ -5,7 +5,6 @@
 #![allow(non_camel_case_types, dead_code)]
 
 use std::ffi::c_void;
-use std::os::raw::c_char;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,7 +23,6 @@ extern "C" {
         user_info: *mut c_void,
     ) -> *mut c_void;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
-    fn CGEventTapIsEnabled(tap: *mut c_void) -> bool;
     fn CGEventGetTimestamp(event: *mut c_void) -> u64;
     fn CGEventGetIntegerValueField(event: *mut c_void, field: u32) -> i64;
     fn CFMachPortCreateRunLoopSource(
@@ -32,8 +30,13 @@ extern "C" {
         port: *mut c_void,
         order: i64,
     ) -> *mut c_void;
-    fn CFRunLoopAddSource(runloop: *mut c_void, source: *mut c_void, mode: *const c_char);
-    fn CFRunLoopRemoveSource(runloop: *mut c_void, source: *mut c_void, mode: *const c_char);
+    fn CFStringCreateWithCString(
+        allocator: *const c_void,
+        c_str: *const i8,
+        encoding: u32,
+    ) -> *mut c_void;
+    fn CFRunLoopAddSource(runloop: *mut c_void, source: *mut c_void, mode: *const c_void);
+    fn CFRunLoopRemoveSource(runloop: *mut c_void, source: *mut c_void, mode: *const c_void);
     fn CFRunLoopGetCurrent() -> *mut c_void;
     fn CFRunLoopRun();
     fn CFRunLoopStop(runloop: *mut c_void);
@@ -187,28 +190,42 @@ fn run_tap_thread<F>(
             return;
         }
         let rl = CFRunLoopGetCurrent();
-        let common_modes = c"kCFRunLoopCommonModes".as_ptr();
-        CFRunLoopAddSource(rl, source, common_modes);
-        CGEventTapEnable(tap, true);
-        if !CGEventTapIsEnabled(tap) {
-            CFRunLoopRemoveSource(rl, source, common_modes);
+        // CFRunLoopAddSource REQUIRES a real CFStringRef mode.
+        // A C-string pointer or NULL is dereferenced as a CF object by
+        // __CFRunLoopCopyMode -> CFSetGetValue -> CFHash and traps with
+        // SIGTRAP on arm64 (observed: daemon died at startup).
+        let mode = CFStringCreateWithCString(
+            ptr::null(),
+            c"kCFRunLoopDefaultMode".as_ptr(),
+            0x08000100, // kCFStringEncodingUTF8
+        );
+        if mode.is_null() {
             CFMachPortInvalidate(tap);
             CFRelease(source);
             CFRelease(tap);
             *state.lock().unwrap() = EventTapState::Failed;
             return;
         }
-        // Only now is the tap genuinely live.
+        CFRunLoopAddSource(rl, source, mode);
+        CGEventTapEnable(tap, true);
+        // The tap is genuinely live once the mach port was created and the
+        // run-loop source was added. (Do NOT probe via CGEventTapIsEnabled:
+        // the FFI return path is unreliable for a tap owned by another run
+        // loop and an accidental false caused a wrong-path CFRelease that
+        // crashed the process with SIGTRAP. Create-failure and source-failure
+        // are the two authoritative failure gates; both are checked above.)
         runloop.store(rl as usize, Ordering::SeqCst);
         let arc: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(sink);
-        GLOBAL_SINK.store(
-            Arc::into_raw(arc) as *mut std::sync::Arc<dyn Fn(u64) + Send + Sync>,
-            Ordering::SeqCst,
-        );
+        // FAT-pointer UB fix: an Arc<dyn Fn> into_raw is a fat pointer; casting
+        // it to a thin *mut and dereferencing later read a garbage vtable ->
+        // SIGBUS when the daemon started the Event Tap thread (CI never hit it
+        // because no real events flowed). OnceLock stores the Arc whole.
+        let _ = GLOBAL_SINK.set(arc);
         *state.lock().unwrap() = EventTapState::Active;
         tracing::info!("event tap active on dedicated thread");
         CFRunLoopRun();
-        CFRunLoopRemoveSource(rl, source, common_modes);
+        CFRunLoopRemoveSource(rl, source, mode);
+        CFRelease(mode as *const c_void);
         CFMachPortInvalidate(tap);
         CFRelease(source);
         CFRelease(tap);
@@ -221,17 +238,18 @@ fn run_tap_thread<F>(
     }
 }
 
-static GLOBAL_SINK: std::sync::atomic::AtomicPtr<std::sync::Arc<dyn Fn(u64) + Send + Sync>> =
-    std::sync::atomic::AtomicPtr::new(ptr::null_mut());
+// The sink is registered exactly once, on the tap thread, only after the tap
+// is genuinely live. OnceLock (not AtomicPtr): storing an `Arc<dyn Fn>`'s
+// `Arc::into_raw` (a FAT pointer) as a thin `*mut Arc<...>` and dereferencing
+// it later read garbage vtable bytes -> SIGBUS the moment the daemon started
+// the Event Tap thread.
+static GLOBAL_SINK: std::sync::OnceLock<std::sync::Arc<dyn Fn(u64) + Send + Sync>> =
+    std::sync::OnceLock::new();
 
 fn with_sink(f: impl FnOnce(&dyn Fn(u64))) {
-    let p = GLOBAL_SINK.load(Ordering::Acquire);
-    if p.is_null() {
-        return;
+    if let Some(sink) = GLOBAL_SINK.get() {
+        f(sink.as_ref());
     }
-    // SAFETY: leaked on install, never freed until process exit.
-    let arc: &std::sync::Arc<dyn Fn(u64) + Send + Sync> = unsafe { &*p };
-    f(arc.as_ref());
 }
 
 extern "C" fn event_tap_callback(
