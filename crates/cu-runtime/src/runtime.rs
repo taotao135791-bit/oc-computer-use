@@ -21,13 +21,13 @@ use chrono::Utc;
 use cu_core::{
     generate_control_token, generate_observation_token, ActParams, ActResult, ClientInfo,
     CoordinateSpace, CuError, ErrorCode, ImageGeometry, InspectMapping, InspectParams,
-    InspectResult, ObserveParams, ObserveResult, Region, RequestKey, ScreenFrame, ScreenSnapshot,
-    SecretToken, SecretTokenHash, SessionAction, SessionResult, SessionState, SessionSummary,
-    StabilizationInfo, TraceReport, WaitPolicy,
+    InspectResult, ObserveParams, ObserveResult, PointerMode, Region, RequestKey, ScreenFrame,
+    ScreenSnapshot, SecretToken, SecretTokenHash, SessionAction, SessionResult, SessionState,
+    SessionSummary, StabilizationInfo, TraceReport, WaitPolicy,
 };
 use cu_driver::{
-    ApplicationInfo, CaptureRequest, ComputerDriver, DesktopLayout, DisplayInfo, PermissionStatus,
-    PointerInfo,
+    ApplicationInfo, CaptureRegion, CaptureRequest, ComputerDriver, DesktopLayout, DisplayInfo,
+    PermissionStatus, PointerInfo,
 };
 use cu_policy::confirmation::Authorization;
 use cu_policy::{authorize, ConfirmationPolicy, TakeoverDetector, TakeoverPolicy};
@@ -127,6 +127,59 @@ impl Runtime {
     /// Path where session traces are written (used by the daemon's trace RPCs).
     pub fn traces_dir(&self) -> &std::path::Path {
         &self.config.traces_dir
+    }
+
+    /// P0-1: a real hardware event (Event Tap) must cancel the ACTIVE batch at
+    /// event time — not merely set a flag the next loop iteration reads. The
+    /// daemon calls this once at startup. The hook runs synchronously on the
+    /// Event Tap thread and, for the control-holder session:
+    ///
+    /// 1. **cancels** its in-flight batches — a long-running action (drag /
+    ///    scroll / wait via `execute_with_cancel`) aborts at event time;
+    /// 2. **transitions** it to `UserTakeover` — this is a synchronous,
+    ///    no-await operation (state mutex + token list + virtual-pointer
+    ///    mutex), so it is safe on the Event Tap thread.
+    ///
+    /// The real-takeover flag is intentionally left set: the action queue
+    /// thread consumes it to perform the async ghost-cursor hide and record
+    /// the interrupt metrics. `Weak` (not `Arc`) is captured so a dropped
+    /// runtime does not leak.
+    pub fn install_human_takeover_hook(&self, rt: Arc<Self>) {
+        let weak = Arc::downgrade(&rt);
+        let hook: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            let Some(rt) = weak.upgrade() else { return };
+            // The control-lock holder is the only session that can drive the
+            // pointer; cancelling its batches aborts the in-flight action and
+            // any queued batch immediately.
+            let Some(sid) = rt.control_lock.holder() else {
+                return;
+            };
+            let Some(session) = rt.sessions.lock().unwrap().get(&sid).cloned() else {
+                return;
+            };
+            session.cancel_in_flight();
+            // Synchronous (no-await) state transition so the session reflects
+            // the takeover immediately, even before the queue consumes the flag.
+            let _ = session.transition(cu_core::SessionState::UserTakeover);
+        });
+        self.human_input.set_real_takeover_hook(hook);
+    }
+
+    /// P0-1: consume a pending real takeover and complete the transition
+    /// (state, pointer mode, interrupt metrics, ghost-cursor hide). Used by the
+    /// between-batch waits so a human event that lands *after* the queue
+    /// drained still forces `UserTakeover`. Returns true if applied.
+    async fn consume_real_takeover(&self, session: &SharedSession) -> bool {
+        if self.human_input.consume_real_takeover() {
+            let _ = session.transition(cu_core::SessionState::UserTakeover);
+            session.sync_pointer_mode(cu_core::SessionState::UserTakeover);
+            self.human_input.mark_takeover_started();
+            self.human_input.mark_input_stopped();
+            let _ = self.driver.pointer_hidden().await;
+            true
+        } else {
+            false
+        }
     }
 
     // ------------------------------------------------------------------
@@ -347,16 +400,49 @@ impl Runtime {
         // policy gate the keyboard focus guard.
         if let Some(t) = target {
             // Round 9 / P0-4: the RUNTIME resolves the target through the
-            // DRIVER (never the adapter) BEFORE storing it. The driver
-            // returns a concrete window with current bounds; these are what
-            // the Focus Guard and TARGET_OUTSIDE_SESSION checks use.
-            // Resolution failure is not fatal: the session keeps its target
-            // intent but with no bounds (Focus Guard still enforces bundle
-            // isolation), and the first coordinate action will surface
-            // TARGET_UNAVAILABLE if the window is genuinely gone.
-            let resolved = self.driver.resolve_target(&t).await.ok().flatten();
+            // DRIVER (never the adapter) BEFORE storing it, and FAIL-CLOSED:
+            // a caller that explicitly scopes the session to an app/window
+            // must get a concrete, fully-identified window or no session at
+            // all. Silently starting unbound would let the agent operate on
+            // arbitrary windows, defeating the target's isolation intent.
+            //
+            // `Ok(None)` => the window is genuinely gone / identity mismatch;
+            // `Err` => the driver could not resolve. Both fail the start, and
+            // the trace + manifest opened above are cleaned up so no orphaned
+            // session artifacts remain (mirrors the CONTROL_LOCKED path).
+            let resolved = match self.driver.resolve_target(&t).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    if let Some(t) = session.trace.as_ref() {
+                        let _ = t.close().await;
+                    }
+                    let _ = cu_trace::manifest::remove_manifest(&self.config.traces_dir, &id);
+                    return Err(cu_core::CuError::TargetUnavailable);
+                }
+                Err(e) => {
+                    if let Some(t) = session.trace.as_ref() {
+                        let _ = t.close().await;
+                    }
+                    let _ = cu_trace::manifest::remove_manifest(&self.config.traces_dir, &id);
+                    return Err(e);
+                }
+            };
+            // P0-4 full identity: backfill the caller's (possibly partial)
+            // target intent with the resolved window's complete identity, so
+            // downstream guards (Focus Guard, observe window-scoping) never
+            // depend on the caller having supplied every field. The driver
+            // verified PID/bundle consistency during resolution.
+            let mut t = t;
+            t.bundle_id
+                .get_or_insert_with(|| resolved.bundle_id.clone());
+            if t.pid.is_none() {
+                t.pid = Some(resolved.pid as i64);
+            }
+            if t.window_id.is_none() {
+                t.window_id = Some(resolved.window_id as i64);
+            }
             session.set_target(Some(t));
-            session.set_resolved_target(resolved);
+            session.set_resolved_target(Some(resolved));
         }
         if let Some(pp) = pointer_policy {
             session.set_pointer_policy(pp);
@@ -393,7 +479,12 @@ impl Runtime {
             session.init_virtual_pointer(pi.location, session.display_id.clone());
             let _ = self
                 .driver
-                .pointer_visualized(pi.location.x, pi.location.y, &session.display_id)
+                .pointer_visualized(
+                    pi.location.x,
+                    pi.location.y,
+                    &session.display_id,
+                    PointerMode::Isolated,
+                )
                 .await;
         }
 
@@ -577,15 +668,17 @@ impl Runtime {
         // Round 9 / P0-12: on release the agent is back in control — the
         // ghost cursor must re-appear so the user can see where the agent
         // points (takeover hid it). Drive it from the session's virtual
-        // pointer position.
+        // pointer position, in the session's CURRENT pointer mode (after the
+        // transition above that is `Isolated`; using the live mode keeps the
+        // overlay honest if a mode ever differs).
         {
-            // Snapshot the coordinates first: the MutexGuard must not live
-            // across the await (the driver may itself touch the pointer).
-            let (vx, vy, vd) = {
+            // Snapshot the coordinates + mode first: the MutexGuard must not
+            // live across the await (the driver may itself touch the pointer).
+            let (vx, vy, vd, mode) = {
                 let vp = session.virtual_pointer.lock().unwrap();
-                (vp.x, vp.y, vp.display_id.clone())
+                (vp.x, vp.y, vp.display_id.clone(), vp.mode)
             };
-            let _ = self.driver.pointer_visualized(vx, vy, &vd).await;
+            let _ = self.driver.pointer_visualized(vx, vy, &vd, mode).await;
         }
         if let Some(t) = session.trace.as_ref() {
             let _ = t
@@ -790,6 +883,36 @@ impl Runtime {
             .frames_dir
             .join(format!("{session_id}_{counter}.{ext}"));
 
+        // P0-6: window-scoped observe. When the session is scoped to a target
+        // window with known bounds, the capture is CROPPED to that window so
+        // the model sees only the target (never neighboring apps / chrome), and
+        // the stored frame geometry becomes window-relative — coordinates in
+        // the model's screenshot map straight to the window's global bounds.
+        let window_scope: Option<(cu_core::DisplayBounds, u32)> = session
+            .get_resolved_target()
+            .and_then(|rt| rt.bounds.map(|b| (b, rt.window_id)));
+        let region_px: Option<CaptureRegion> = if let Some((wb, _)) = window_scope {
+            // Window bounds are global logical points; the crop must be in the
+            // captured display's pixel space. `list_displays` provides the
+            // display's global origin and scale factor.
+            let displays = self.driver.list_displays().await?;
+            let disp = displays
+                .iter()
+                .find(|d| d.id == display_id)
+                .ok_or_else(|| {
+                    CuError::Driver(format!("observe: display {display_id} not found"))
+                })?;
+            let s = disp.scale_factor.max(f64::EPSILON);
+            Some(CaptureRegion {
+                x: (wb.x - disp.bounds.x) * s,
+                y: (wb.y - disp.bounds.y) * s,
+                width: wb.width * s,
+                height: wb.height * s,
+            })
+        } else {
+            None
+        };
+
         let request = CaptureRequest {
             display_id: display_id.clone(),
             output_path: output_path.clone(),
@@ -799,6 +922,7 @@ impl Runtime {
             jpeg_quality: params
                 .jpeg_quality
                 .unwrap_or(self.config.observe_jpeg_quality),
+            region: region_px,
         };
         // A capture failure is a CAPTURE_FAILED error, distinct from generic
         // driver failures, so agents can distinguish "screen could not be
@@ -809,10 +933,28 @@ impl Runtime {
             .await
             .map_err(|e| CuError::CaptureFailed(e.to_string()))?;
 
+        // P0-6 fail-closed: a window crop was requested; if the driver could
+        // not produce a matching image (the window moved off-screen and the
+        // crop fell back to the full frame), surface TARGET_UNAVAILABLE rather
+        // than label a full-display image as window-scoped.
+        if let Some(r) = region_px {
+            let (want_w, want_h) = (r.width.round() as u32, r.height.round() as u32);
+            if captured.width.abs_diff(want_w) > 2 || captured.height.abs_diff(want_h) > 2 {
+                return Err(CuError::TargetUnavailable);
+            }
+        }
+
         // A cheap snapshot gives us the thumbnail + live app name for the
         // stale-frame fingerprint of this frame.
         let snapshot: ScreenSnapshot = self.driver.quick_snapshot(&display_id).await?.into();
 
+        // P0-6: a window-scoped frame's geometry is WINDOW-relative — the
+        // stored bounds are the window's global bounds so `act` maps model
+        // coordinates in the cropped image straight to the right screen point.
+        let frame_bounds = window_scope
+            .as_ref()
+            .map(|(b, _)| *b)
+            .unwrap_or(captured.bounds);
         let frame = ScreenFrame {
             frame_id: frame_id.clone(),
             session_id: session_id.clone(),
@@ -822,7 +964,7 @@ impl Runtime {
             width: captured.width,
             height: captured.height,
             display_id: captured.display_id.clone(),
-            bounds: captured.bounds,
+            bounds: frame_bounds,
             scale_factor: captured.scale_factor,
             active_application: snapshot.active_application.clone(),
             active_window_title: snapshot.active_window_title.clone(),
@@ -873,6 +1015,12 @@ impl Runtime {
                 "image/jpeg".into()
             },
             captured_at: frame.captured_at,
+            // P0-6: every observe declares its coordinate space; a window-
+            // scoped observe also reports the target window's global bounds
+            // and id so the caller can map window coords to the screen.
+            coordinate_space: Some("normalized_1000".into()),
+            target_bounds: window_scope.as_ref().map(|(b, _)| *b),
+            window_id: window_scope.as_ref().map(|(_, id)| *id),
         })
     }
 
@@ -1075,6 +1223,12 @@ impl Runtime {
                 if ms > 0 {
                     let deadline = Instant::now() + Duration::from_millis(ms);
                     while Instant::now() < deadline {
+                        // P0-1: a REAL human event during the between-batch wait
+                        // forces UserTakeover (the hook cancelled the token, but
+                        // the token-cancel alone does not transition state).
+                        if self.consume_real_takeover(&session).await {
+                            return Err(CuError::Cancelled);
+                        }
                         if token.is_cancelled() {
                             return Err(CuError::Cancelled);
                         }
@@ -1090,10 +1244,10 @@ impl Runtime {
             }
             WaitPolicy::UntilStable => {
                 let stabilizer = Stabilizer::new(self.driver.as_ref(), self.config.stabilizer);
-                match stabilizer
+                let outcome = stabilizer
                     .until_stable(&session.display_id, &before_q, &token)
-                    .await
-                {
+                    .await;
+                match outcome {
                     Ok(StabilizeOutcome::Stable {
                         change_score,
                         samples,
@@ -1119,7 +1273,13 @@ impl Runtime {
                             elapsed_ms: Some(elapsed_ms),
                         });
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        // P0-1: a real takeover likely aborted the wait (the
+                        // hook cancelled the token). Complete the transition
+                        // before surfacing the cancellation.
+                        let _ = self.consume_real_takeover(&session).await;
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -1189,6 +1349,93 @@ impl Runtime {
     // Inspect
     // ------------------------------------------------------------------
 
+    /// P0-6: clamp an inspect region to the session's target window. The
+    /// region is expressed in the frame's image space; the window is expressed
+    /// in global logical points. Both are intersected in global space and the
+    /// result re-expressed in the region's original coordinate space — a model
+    /// that asks to inspect the desktop outside its target window never
+    /// receives pixels outside it. A region that does not intersect the window
+    /// at all is an OutOfBounds error.
+    fn clamp_region_to_window(
+        geometry: &ImageGeometry,
+        region: &Region,
+        window: cu_core::DisplayBounds,
+    ) -> Result<Region, CuError> {
+        let (gx0, gy0, gx1, gy1) = match region.coordinate_space {
+            CoordinateSpace::Normalized1000 => {
+                let a = geometry.normalized_1000_to_global(region.x, region.y)?;
+                let b = geometry
+                    .normalized_1000_to_global(region.x + region.width, region.y + region.height)?;
+                (a.x, a.y, b.x, b.y)
+            }
+            CoordinateSpace::ImagePixels => {
+                let a = geometry
+                    .image_pixel_to_global(region.x.round() as u32, region.y.round() as u32);
+                let b = geometry.image_pixel_to_global(
+                    (region.x + region.width).round() as u32,
+                    (region.y + region.height).round() as u32,
+                );
+                (a.x, a.y, b.x, b.y)
+            }
+        };
+        let (wx1, wy1) = (window.x + window.width, window.y + window.height);
+        let (ix0, iy0) = (gx0.max(window.x), gy0.max(window.y));
+        let (ix1, iy1) = (gx1.min(wx1), gy1.min(wy1));
+        if ix1 <= ix0 || iy1 <= iy0 {
+            return Err(CuError::OutOfBounds(cu_core::errors::BoundsDetail {
+                coordinate_space: region.coordinate_space.as_str().into(),
+                x: region.x,
+                y: region.y,
+                image_width: geometry.image_width_px,
+                image_height: geometry.image_height_px,
+            }));
+        }
+        let (x, y, width, height) = match region.coordinate_space {
+            CoordinateSpace::Normalized1000 => {
+                let a = geometry
+                    .global_to_image_pixel(cu_core::Point::new(ix0, iy0))
+                    .ok_or_else(|| {
+                        CuError::OutOfBounds(cu_core::errors::BoundsDetail {
+                            coordinate_space: region.coordinate_space.as_str().into(),
+                            x: region.x,
+                            y: region.y,
+                            image_width: geometry.image_width_px,
+                            image_height: geometry.image_height_px,
+                        })
+                    })?;
+                let b = geometry
+                    .global_to_image_pixel(cu_core::Point::new(ix1, iy1))
+                    .ok_or_else(|| {
+                        CuError::OutOfBounds(cu_core::errors::BoundsDetail {
+                            coordinate_space: region.coordinate_space.as_str().into(),
+                            x: region.x,
+                            y: region.y,
+                            image_width: geometry.image_width_px,
+                            image_height: geometry.image_height_px,
+                        })
+                    })?;
+                let na = geometry.image_pixel_to_normalized_1000(a.0, a.1);
+                let nb = geometry.image_pixel_to_normalized_1000(b.0, b.1);
+                (na.x, na.y, nb.x - na.x, nb.y - na.y)
+            }
+            CoordinateSpace::ImagePixels => {
+                let s = geometry.scale_factor().max(f64::EPSILON);
+                let x = ((ix0 - geometry.display_bounds.x) * s).round();
+                let y = ((iy0 - geometry.display_bounds.y) * s).round();
+                let x2 = ((ix1 - geometry.display_bounds.x) * s).round();
+                let y2 = ((iy1 - geometry.display_bounds.y) * s).round();
+                (x, y, x2 - x, y2 - y)
+            }
+        };
+        Ok(Region {
+            x,
+            y,
+            width,
+            height,
+            coordinate_space: region.coordinate_space,
+        })
+    }
+
     pub async fn inspect(&self, params: InspectParams) -> Result<InspectResult, CuError> {
         let session = self.get_session(&params.session_id)?;
         // Inspecting a stored frame exposes desktop pixels: capability token
@@ -1208,7 +1455,14 @@ impl Runtime {
             image_height_px: stored.frame.height,
             display_bounds: stored.frame.bounds,
         };
-        let (px, py, w, h) = params.region.to_image_pixels(&geometry)?;
+        // P0-6: a window-scoped session may only inspect inside its target
+        // window. Clamp the request region to the window before mapping it to
+        // image pixels (a full-display frame stays clamped too).
+        let region = match session.get_resolved_target().and_then(|rt| rt.bounds) {
+            Some(wb) => Self::clamp_region_to_window(&geometry, &params.region, wb)?,
+            None => params.region,
+        };
+        let (px, py, w, h) = region.to_image_pixels(&geometry)?;
 
         let img = if let Some(bytes) = &stored.frame.image_bytes {
             image::load_from_memory(bytes)
@@ -1502,6 +1756,16 @@ mod tests {
         pub fail_next: std::sync::atomic::AtomicBool,
         /// Frontmost bundle id for the keyboard focus guard (None = unknown).
         pub active_bundle: std::sync::Mutex<Option<String>>,
+        /// P0-5: frontmost pid / window id for the strict focus guard.
+        pub active_pid: std::sync::Mutex<Option<i32>>,
+        pub active_window: std::sync::Mutex<Option<u32>>,
+        /// P0-4: configured `resolve_target` result (None = unresolved). Lets
+        /// tests exercise fail-closed session start and identity backfill.
+        pub resolve_result: std::sync::Mutex<Option<cu_driver::ResolvedSessionTarget>>,
+        /// P0-6: full-display capture bounds (None = legacy 4x4 dark PNG).
+        /// Tests needing realistic display geometry set this to the display's
+        /// logical bounds so a full-display observe yields a consistent frame.
+        pub capture_bounds: std::sync::Mutex<Option<cu_core::DisplayBounds>>,
     }
 
     #[async_trait::async_trait]
@@ -1532,8 +1796,24 @@ mod tests {
             &self,
             request: CaptureRequest,
         ) -> Result<cu_driver::CapturedFrame, CuError> {
-            // 4x4 dark PNG.
-            let img = image::RgbImage::from_pixel(4, 4, image::Rgb([40, 40, 40]));
+            // Dark PNG. A window crop (P0-6) uses the region's pixel size; a
+            // full-display capture is 4x4 unless `capture_bounds` is set for a
+            // realistic geometry (bounds * display scale 2.0).
+            let cfg_bounds = *self.capture_bounds.lock().unwrap();
+            let (w, h) = match request.region {
+                Some(r) => (r.width.max(1.0) as u32, r.height.max(1.0) as u32),
+                None => match cfg_bounds {
+                    Some(b) => ((b.width * 2.0) as u32, (b.height * 2.0) as u32),
+                    None => (4, 4),
+                },
+            };
+            let bounds = cfg_bounds.unwrap_or(cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 4.0,
+                height: 4.0,
+            });
+            let img = image::RgbImage::from_pixel(w, h, image::Rgb([40, 40, 40]));
             let mut buf = Vec::new();
             image::DynamicImage::ImageRgb8(img)
                 .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
@@ -1541,15 +1821,10 @@ mod tests {
             std::fs::write(&request.output_path, &buf).unwrap();
             Ok(cu_driver::CapturedFrame {
                 display_id: request.display_id,
-                width: 4,
-                height: 4,
+                width: w,
+                height: h,
                 scale_factor: 1.0,
-                bounds: cu_core::DisplayBounds {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 4.0,
-                    height: 4.0,
-                },
+                bounds,
                 image_path: request.output_path,
                 image_bytes: buf,
                 format: request.format,
@@ -1611,7 +1886,15 @@ mod tests {
                     bundle_id: b,
                     name: "fake".into(),
                     window_title: None,
+                    pid: *self.active_pid.lock().unwrap(),
+                    window_id: *self.active_window.lock().unwrap(),
                 }))
+        }
+        async fn resolve_target(
+            &self,
+            _target: &cu_core::SessionTarget,
+        ) -> Result<Option<cu_driver::ResolvedSessionTarget>, CuError> {
+            Ok(self.resolve_result.lock().unwrap().clone())
         }
         async fn pointer_location(&self) -> Result<PointerInfo, CuError> {
             Ok(PointerInfo {
@@ -1647,6 +1930,9 @@ mod tests {
     async fn runtime_with_driver() -> (Arc<Runtime>, Arc<FakeDriver>) {
         let driver = Arc::new(FakeDriver::default());
         let rt = Arc::new(Runtime::new(driver.clone(), test_config()));
+        // Match production wiring so a `record_human_event` in a test cancels
+        // the active batch exactly like the Event Tap would.
+        rt.install_human_takeover_hook(rt.clone());
         (rt, driver)
     }
 
@@ -1936,6 +2222,99 @@ mod tests {
         );
 
         // The session is still under takeover and still rejects actions.
+        let err = rt
+            .act(wait_params(&sid, &obs.frame_id, Some(token.clone())), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::UserTakeover);
+        rt.session_release(&sid, Some(&token)).await.unwrap();
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// P0-1: a REAL hardware event (the Event Tap -> HumanInputMonitor) must
+    /// cancel the ACTIVE batch at event time — a long in-flight action aborts
+    /// immediately, not on the next loop iteration. The batch token is
+    /// cancelled by the registered hook; the queue consumes the flag and
+    /// completes the UserTakeover transition.
+    #[tokio::test]
+    async fn real_human_event_cancels_active_batch_immediately() {
+        let (rt, fake) = runtime_with_driver().await;
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
+        let sid = s.session_id.clone();
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let params = ActParams {
+            session_id: sid.clone(),
+            frame_id: obs.frame_id.clone(),
+            actions: vec![
+                ComputerAction::Click {
+                    x: 400.0,
+                    y: 400.0,
+                    button: cu_core::MouseButton::Left,
+                    coordinate_space: cu_core::CoordinateSpace::Normalized1000,
+                },
+                // A long wait the hardware event must interrupt mid-flight.
+                ComputerAction::Wait { duration_ms: 800 },
+            ],
+            wait_policy: None,
+            fixed_wait_ms: None,
+            return_screenshot: None,
+            risk_level: None,
+            requires_confirmation: None,
+            policy_context: None,
+            control_token: Some(token.clone()),
+        };
+
+        let rt2 = rt.clone();
+        let handle = tokio::spawn(async move { rt2.act(params, None).await });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // The Event Tap fires a real human event. The installed hook cancels
+        // the active batch immediately — the in-flight Wait must abort.
+        rt.human_input.record_human_event(std::time::Instant::now());
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(
+            result.action_results[0].status, "success",
+            "the click before the event completed"
+        );
+        assert_eq!(
+            result.action_results[1].status, "cancelled",
+            "the in-flight wait must abort at event time, got {result:?}"
+        );
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the interrupted wait must not reach the driver"
+        );
+        // The session immediately reflects the human's takeover.
+        let status = rt
+            .session_status(&sid, None, Some(token.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(
+            status.state,
+            SessionState::UserTakeover,
+            "a real hardware event forces UserTakeover at event time"
+        );
+        // And the session now rejects further actions.
         let err = rt
             .act(wait_params(&sid, &obs.frame_id, Some(token.clone())), None)
             .await
@@ -3284,6 +3663,269 @@ mod tests {
         rt.session_stop(&sid, Some(&token)).await.unwrap();
     }
 
+    /// Round 9 / P0-5 — Keyboard Focus Guard is STRICT: it compares bundle AND
+    /// pid AND window id. A bundle match on a recycled pid (app relaunched) or
+    /// a different window of the same app is NOT focus — INPUT_FOCUS_MISMATCH
+    /// and no keyboard event reaches the driver.
+    #[tokio::test]
+    async fn strict_focus_compares_pid_and_window() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_observed(&rt).await;
+
+        // Target: Chrome, pid 111, window 500 (all three identity dimensions).
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_target(Some(cu_core::SessionTarget {
+                bundle_id: Some("com.google.Chrome".into()),
+                pid: Some(111),
+                window_id: Some(500),
+            }));
+        }
+        let act_type = |frame: String| ActParams {
+            session_id: sid.clone(),
+            frame_id: frame,
+            actions: vec![ComputerAction::TypeText {
+                text: "hi".into(),
+                method: cu_core::TextInputMethod::Keyboard,
+            }],
+            wait_policy: None,
+            fixed_wait_ms: None,
+            return_screenshot: None,
+            risk_level: None,
+            requires_confirmation: None,
+            policy_context: None,
+            control_token: Some(token.clone()),
+        };
+
+        // Same bundle, recycled pid (app relaunched) -> NOT focus.
+        *fake.active_bundle.lock().unwrap() = Some("com.google.Chrome".into());
+        *fake.active_pid.lock().unwrap() = Some(222);
+        *fake.active_window.lock().unwrap() = Some(500);
+        let res = rt.act(act_type(frame.clone()), None).await.unwrap();
+        assert_eq!(
+            res.action_results[0].error.as_deref(),
+            Some("INPUT_FOCUS_MISMATCH"),
+            "a recycled pid under the same bundle must not pass as focus"
+        );
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no keyboard event may reach the driver on pid mismatch"
+        );
+
+        // Same bundle + pid, but a DIFFERENT window of the same app -> NOT focus.
+        *fake.active_window.lock().unwrap() = Some(999);
+        let res = rt.act(act_type(frame.clone()), None).await.unwrap();
+        assert_eq!(
+            res.action_results[0].error.as_deref(),
+            Some("INPUT_FOCUS_MISMATCH"),
+            "a different window of the same app must not pass as focus"
+        );
+        assert_eq!(fake.executes.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Exact bundle + pid + window match -> Type succeeds.
+        *fake.active_pid.lock().unwrap() = Some(111);
+        *fake.active_window.lock().unwrap() = Some(500);
+        let res = rt.act(act_type(frame.clone()), None).await.unwrap();
+        assert_eq!(res.action_results[0].status, "success");
+        assert_eq!(fake.executes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A pid-only target (no bundle) is still guarded: pid 333 vs live 111.
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_target(Some(cu_core::SessionTarget {
+                bundle_id: None,
+                pid: Some(333),
+                window_id: None,
+            }));
+        }
+        let res = rt.act(act_type(frame.clone()), None).await.unwrap();
+        assert_eq!(
+            res.action_results[0].error.as_deref(),
+            Some("INPUT_FOCUS_MISMATCH"),
+            "a pid-only target must still be guarded"
+        );
+        assert_eq!(fake.executes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// Round 9 / P0-6 — a session scoped to a target window observes a CROP of
+    /// that window (never the full display), and the result declares the
+    /// coordinate space + the window's global bounds + window id so the model
+    /// can map window coords to the screen.
+    #[tokio::test]
+    async fn observe_is_window_scoped_when_target_has_bounds() {
+        let (rt, _fake) = runtime_with_driver().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+        // Window at origin, 2x2 logical points → 4x4 px at the fake's 2x scale.
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_resolved_target(Some(cu_driver::ResolvedSessionTarget {
+                bundle_id: "com.example.Target".into(),
+                pid: 4242,
+                window_id: 777,
+                bounds: Some(cu_core::DisplayBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 2.0,
+                    height: 2.0,
+                }),
+            }));
+        }
+
+        let res = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    include_image: Some(false),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.coordinate_space.as_deref(), Some("normalized_1000"));
+        assert_eq!(
+            res.target_bounds,
+            Some(cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+            }),
+            "a window-scoped observe must report the window's global bounds"
+        );
+        assert_eq!(res.window_id, Some(777));
+        assert_eq!(
+            res.width, 4,
+            "the image is the window crop, not the display"
+        );
+        assert_eq!(res.height, 4);
+
+        // The stored frame's geometry is window-relative so `act` maps model
+        // coords in the cropped image straight to the window's global bounds.
+        // The guard is block-scoped so it is released before the await below.
+        {
+            let store = rt.frames.lock().unwrap();
+            let sf = store.get(&res.frame_id).expect("frame stored");
+            assert_eq!(sf.frame.bounds.width, 2.0);
+            assert_eq!(sf.frame.bounds.height, 2.0);
+            assert_eq!(sf.frame.width, 4);
+        }
+
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// Round 9 / P0-6 — inspect clamps its region to the session's target
+    /// window: a request covering the whole display only returns the window's
+    /// pixels, and a region entirely outside the window is OutOfBounds.
+    #[tokio::test]
+    async fn inspect_clamps_region_to_target_window() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+        // Realistic full-display geometry: 1280x800 logical @ 2x = 2560x1600.
+        *fake.capture_bounds.lock().unwrap() = Some(cu_core::DisplayBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1280.0,
+            height: 800.0,
+        });
+        // Observe the full display FIRST (no target yet).
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    include_image: Some(false),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(obs.target_bounds.is_none(), "no window scope yet");
+        let frame_id = obs.frame_id;
+
+        // Now scope the session to a window inside that display.
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_resolved_target(Some(cu_driver::ResolvedSessionTarget {
+                bundle_id: "com.example.Target".into(),
+                pid: 4242,
+                window_id: 777,
+                bounds: Some(cu_core::DisplayBounds {
+                    x: 100.0,
+                    y: 100.0,
+                    width: 400.0,
+                    height: 300.0,
+                }),
+            }));
+        }
+
+        // A region covering the whole display is clamped to the window.
+        let res = rt
+            .inspect(InspectParams {
+                session_id: sid.clone(),
+                frame_id: frame_id.clone(),
+                region: Region {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 1000.0,
+                    coordinate_space: CoordinateSpace::Normalized1000,
+                },
+                scale: None,
+                observation_token: None,
+                control_token: Some(token.clone()),
+            })
+            .await
+            .unwrap();
+        // Window 400x300 logical @ 2x = 800x600 px.
+        assert_eq!(
+            res.width, 800,
+            "inspect must be clamped to the window width"
+        );
+        assert_eq!(
+            res.height, 600,
+            "inspect must be clamped to the window height"
+        );
+        assert!(
+            (res.mapping.global_origin.0 - 100.0).abs() < 0.01
+                && (res.mapping.global_origin.1 - 100.0).abs() < 0.01,
+            "crop top-left is the window's global top-left"
+        );
+
+        // A region entirely outside the window is OutOfBounds, not silently
+        // inspected.
+        let err = rt
+            .inspect(InspectParams {
+                session_id: sid.clone(),
+                frame_id,
+                region: Region {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 50.0,
+                    height: 50.0,
+                    coordinate_space: CoordinateSpace::Normalized1000,
+                },
+                scale: None,
+                observation_token: None,
+                control_token: Some(token.clone()),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::OutOfBounds);
+
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
     /// Round 8 / Phase 9 — PointerPolicy `isolated_only`: physical-required
     /// actions (Drag, located Scroll) are refused before any driver call, and
     /// the rest of the batch is marked cancelled. The real cursor is never
@@ -3369,6 +4011,244 @@ mod tests {
             0,
             "isolated_only must never move the physical cursor for scroll"
         );
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// Round 8 / Phase 9 / P0-3 — PointerPolicy `isolated_preferred` (the
+    /// session default) must NOT silently execute a physical-only Drag /
+    /// located Scroll. The runtime has no isolated Drag / located-Scroll
+    /// backend (the macOS driver always borrows the real cursor), so these are
+    /// refused with PHYSICAL_FALLBACK_REQUIRED and the real cursor is never
+    /// moved. Only `physical_allowed` permits them.
+    #[tokio::test]
+    async fn isolated_preferred_refuses_physical_drag_and_scroll() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_observed(&rt).await;
+
+        // isolated_preferred is the session default; assert it explicitly.
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            assert_eq!(
+                session.get_pointer_policy(),
+                cu_core::PointerPolicy::IsolatedPreferred
+            );
+        }
+
+        // Drag under isolated_preferred → PHYSICAL_FALLBACK_REQUIRED.
+        let res = rt
+            .act(
+                ActParams {
+                    session_id: sid.clone(),
+                    frame_id: frame.clone(),
+                    actions: vec![ComputerAction::Drag {
+                        from: cu_core::Point::new(100.0, 100.0),
+                        to: cu_core::Point::new(200.0, 200.0),
+                        coordinate_space: CoordinateSpace::Normalized1000,
+                        duration_ms: None,
+                    }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.action_results[0].status, "failed");
+        assert_eq!(
+            res.action_results[0].error.as_deref(),
+            Some("PHYSICAL_FALLBACK_REQUIRED")
+        );
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "isolated_preferred must never silently move the physical cursor"
+        );
+
+        // Located Scroll under isolated_preferred → PHYSICAL_FALLBACK_REQUIRED.
+        let res = rt
+            .act(
+                ActParams {
+                    session_id: sid.clone(),
+                    frame_id: frame.clone(),
+                    actions: vec![ComputerAction::Scroll {
+                        x: Some(100.0),
+                        y: Some(100.0),
+                        delta_x: 0.0,
+                        delta_y: -30.0,
+                        coordinate_space: CoordinateSpace::Normalized1000,
+                    }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.action_results[0].status, "failed");
+        assert_eq!(
+            res.action_results[0].error.as_deref(),
+            Some("PHYSICAL_FALLBACK_REQUIRED")
+        );
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "isolated_preferred must never silently move the physical cursor for scroll"
+        );
+
+        // The same Drag under `physical_allowed` DOES execute (the interruptible
+        // physical path is the whole point of that policy).
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_pointer_policy(cu_core::PointerPolicy::PhysicalAllowed);
+        }
+        let res = rt
+            .act(
+                ActParams {
+                    session_id: sid.clone(),
+                    frame_id: frame,
+                    actions: vec![ComputerAction::Drag {
+                        from: cu_core::Point::new(100.0, 100.0),
+                        to: cu_core::Point::new(200.0, 200.0),
+                        coordinate_space: CoordinateSpace::Normalized1000,
+                        duration_ms: None,
+                    }],
+                    wait_policy: None,
+                    fixed_wait_ms: None,
+                    return_screenshot: None,
+                    risk_level: None,
+                    requires_confirmation: None,
+                    policy_context: None,
+                    control_token: Some(token.clone()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.action_results[0].status, "success");
+        assert_eq!(
+            fake.executes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "physical_allowed must permit the physical drag"
+        );
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// Round 9 / P0-4 — Target Resolve FAIL-CLOSED: a caller that explicitly
+    /// scopes a session to an app/window must get a concrete window or no
+    /// session at all. When the driver cannot resolve the target (window gone
+    /// / identity mismatch), session start errors with TARGET_UNAVAILABLE and
+    /// leaves NO orphaned session behind — the agent never runs unbound.
+    #[tokio::test]
+    async fn session_start_fails_closed_when_target_unresolved() {
+        let (rt, fake) = runtime_with_driver().await;
+        // Default: resolve_result = None (window not found / unresolved).
+        assert!(fake.resolve_result.lock().unwrap().is_none());
+
+        let err = rt
+            .session_start(
+                None,
+                test_client(),
+                Some(cu_core::SessionTarget {
+                    bundle_id: Some("com.example.Gone".into()),
+                    pid: Some(99999),
+                    window_id: None,
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::TargetUnavailable);
+        // No session may exist after the failed start, and the control lock
+        // must be free — a ghost session must not block the next real one.
+        assert!(
+            rt.sessions.lock().unwrap().is_empty(),
+            "failed start must not leave a session"
+        );
+        assert!(
+            rt.control_lock.holder().is_none(),
+            "failed start must not hold the control lock"
+        );
+    }
+
+    /// Round 9 / P0-4 — Target Resolve FULL IDENTITY: when the caller provides
+    /// partial identity (pid only), the runtime backfills the session target
+    /// with the resolved window's complete identity (bundle_id, pid,
+    /// window_id) so the Focus Guard and observe window-scoping never depend
+    /// on the caller having supplied every field.
+    #[tokio::test]
+    async fn session_start_backfills_full_target_identity() {
+        let (rt, fake) = runtime_with_driver().await;
+        *fake.resolve_result.lock().unwrap() = Some(cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 4242,
+            window_id: 777,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 10.0,
+                y: 20.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+        });
+
+        let started = rt
+            .session_start(
+                None,
+                test_client(),
+                Some(cu_core::SessionTarget {
+                    bundle_id: None,
+                    pid: Some(4242),
+                    window_id: None,
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let sid = started.session_id.clone();
+        let token = started
+            .control_token
+            .expect("start must issue the control token")
+            .as_str()
+            .to_string();
+
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).expect("session must exist");
+            let t = session.get_target().expect("target must be stored");
+            assert_eq!(
+                t.bundle_id.as_deref(),
+                Some("com.example.Target"),
+                "bundle_id must be backfilled from the resolved window"
+            );
+            assert_eq!(t.pid, Some(4242));
+            assert_eq!(t.window_id, Some(777), "window_id must be backfilled");
+            let rt2 = session
+                .get_resolved_target()
+                .expect("resolved target stored");
+            assert_eq!(rt2.bundle_id, "com.example.Target");
+            assert_eq!(rt2.pid, 4242);
+            assert_eq!(rt2.window_id, 777);
+            assert_eq!(
+                session.get_target_bounds(),
+                rt2.bounds,
+                "resolved bounds must mirror into target_bounds"
+            );
+        }
+
         rt.session_stop(&sid, Some(&token)).await.unwrap();
     }
 

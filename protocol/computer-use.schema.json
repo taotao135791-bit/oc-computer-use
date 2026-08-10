@@ -533,6 +533,34 @@
         }
       ]
     },
+    "DisplayBounds": {
+      "description": "Logical bounds of a display in global desktop coordinates.\n\nOn macOS the origin can be negative (a secondary display to the left/above the primary one). Width/height are logical points; the backing store is `width * scale_factor` pixels.",
+      "properties": {
+        "height": {
+          "format": "double",
+          "type": "number"
+        },
+        "width": {
+          "format": "double",
+          "type": "number"
+        },
+        "x": {
+          "format": "double",
+          "type": "number"
+        },
+        "y": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "height",
+        "width",
+        "x",
+        "y"
+      ],
+      "type": "object"
+    },
     "ErrorCode": {
       "description": "Well-known structured error codes. These are the stable strings that appear in the `data.code` field of a JSON-RPC error response.",
       "oneOf": [
@@ -1063,6 +1091,10 @@
           "format": "date-time",
           "type": "string"
         },
+        "coordinate_space": {
+          "description": "P0-6: the coordinate space the returned image's pixels are expressed in (`\"normalized_1000\"` — the image is treated as a 1000x1000 canvas). Present on every observe so the caller never has to guess.",
+          "type": "string"
+        },
         "display_id": {
           "type": "string"
         },
@@ -1092,7 +1124,17 @@
         "session_id": {
           "type": "string"
         },
+        "target_bounds": {
+          "$ref": "#/$defs/DisplayBounds",
+          "description": "P0-6: when the session is scoped to a target window, the image is a CROP of that window and this is its global logical bounds (the caller maps window coords → screen via this). `None` = full-display observe."
+        },
         "width": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_id": {
+          "description": "P0-6: the observed window's id, when the session is window-scoped.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -1163,6 +1205,10 @@
         "backend": {
           "description": "The actuator that actually realized the action: `\"virtual\" | \"direct_cg_event\" | \"accessibility\" | \"physical\"`.",
           "type": "string"
+        },
+        "human_input_during_fallback": {
+          "description": "P0-2: whether a real human input occurred during the physical fallback transaction (in which case the cursor is NEVER yanked back). Absent when no physical fallback ran.",
+          "type": "boolean"
         },
         "human_interrupt_latency_ms": {
           "description": "Human interrupt latency (ms) measured from the hardware event to the last synthetic input event. Present when a human interrupt occurred during or near this action.",

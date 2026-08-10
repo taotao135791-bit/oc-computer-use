@@ -3,7 +3,7 @@
 //! (Windows, Linux) implement the same trait without touching the runtime.
 
 use async_trait::async_trait;
-use cu_core::{CuError, MouseButton, Point, TextInputMethod};
+use cu_core::{CuError, MouseButton, Point, PointerMode, TextInputMethod};
 use tokio_util::sync::CancellationToken;
 
 use crate::types::{
@@ -96,15 +96,30 @@ pub trait ComputerDriver: Send + Sync {
     async fn pointer_location(&self) -> Result<PointerInfo, CuError>;
 
     /// Round 8: the agent's virtual pointer moved — the driver should refresh
-    /// its ghost-cursor overlay (if any) at that global point. This never
-    /// moves the real system cursor. Default implementation is a no-op so
-    /// test/fake drivers need not implement it.
-    async fn pointer_visualized(&self, _x: f64, _y: f64, _display_id: &str) -> Result<(), CuError> {
+    /// its ghost-cursor overlay (if any) at that global point in the given
+    /// pointer mode. This never moves the real system cursor. The mode makes
+    /// the overlay's fallback/paused/takeover visual states reachable (audit:
+    /// hardcoding `Isolated` left `physical_fallback` unreachable). Default
+    /// implementation is a no-op so test/fake drivers need not implement it.
+    async fn pointer_visualized(
+        &self,
+        _x: f64,
+        _y: f64,
+        _display_id: &str,
+        _mode: PointerMode,
+    ) -> Result<(), CuError> {
         Ok(())
     }
 
     /// Round 8: hide the ghost cursor overlay (takeover / pause / stop).
     async fn pointer_hidden(&self) -> Result<(), CuError> {
+        Ok(())
+    }
+
+    /// Audit: play the click-ripple visual confirmation at a global point after
+    /// a click was realized (visible feedback that the agent clicked HERE).
+    /// Default is a no-op so test/fake drivers need not implement it.
+    async fn pointer_click_ripple(&self, _x: f64, _y: f64) -> Result<(), CuError> {
         Ok(())
     }
 

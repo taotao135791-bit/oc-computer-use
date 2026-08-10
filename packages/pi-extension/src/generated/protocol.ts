@@ -588,6 +588,10 @@ export interface PointerExecutionResult {
    */
   backend: string;
   /**
+   * P0-2: whether a real human input occurred during the physical fallback transaction (in which case the cursor is NEVER yanked back). Absent when no physical fallback ran.
+   */
+  human_input_during_fallback?: boolean;
+  /**
    * Human interrupt latency (ms) measured from the hardware event to the last synthetic input event. Present when a human interrupt occurred during or near this action.
    */
   human_interrupt_latency_ms?: number;
@@ -619,6 +623,10 @@ export interface ObserveResult {
   active_application?: string;
   active_window?: string;
   captured_at: string;
+  /**
+   * P0-6: the coordinate space the returned image's pixels are expressed in (`"normalized_1000"` — the image is treated as a 1000x1000 canvas). Present on every observe so the caller never has to guess.
+   */
+  coordinate_space?: string;
   display_id: string;
   frame_id: string;
   height: number;
@@ -633,7 +641,22 @@ export interface ObserveResult {
   image_path: string;
   scale_factor: number;
   session_id: string;
+  target_bounds?: DisplayBounds;
   width: number;
+  /**
+   * P0-6: the observed window's id, when the session is window-scoped.
+   */
+  window_id?: number;
+  [k: string]: unknown;
+}
+/**
+ * P0-6: when the session is scoped to a target window, the image is a CROP of that window and this is its global logical bounds (the caller maps window coords → screen via this). `None` = full-display observe.
+ */
+export interface DisplayBounds {
+  height: number;
+  width: number;
+  x: number;
+  y: number;
   [k: string]: unknown;
 }
 /**
@@ -735,6 +758,21 @@ export interface ConfirmationDetail {
   [k: string]: unknown;
 }
 /**
+ * Logical bounds of a display in global desktop coordinates.
+ *
+ * On macOS the origin can be negative (a secondary display to the left/above the primary one). Width/height are logical points; the backing store is `width * scale_factor` pixels.
+ *
+ * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
+ * via the `definition` "DisplayBounds".
+ */
+export interface DisplayBounds1 {
+  height: number;
+  width: number;
+  x: number;
+  y: number;
+  [k: string]: unknown;
+}
+/**
  * Mapping info that lets a model safely translate an inspect-relative coordinate back into global desktop coordinates.
  *
  * This interface was referenced by `ComputerUseProtocolV3`'s JSON-Schema
@@ -822,6 +860,10 @@ export interface PointerExecutionResult1 {
    * The actuator that actually realized the action: `"virtual" | "direct_cg_event" | "accessibility" | "physical"`.
    */
   backend: string;
+  /**
+   * P0-2: whether a real human input occurred during the physical fallback transaction (in which case the cursor is NEVER yanked back). Absent when no physical fallback ran.
+   */
+  human_input_during_fallback?: boolean;
   /**
    * Human interrupt latency (ms) measured from the hardware event to the last synthetic input event. Present when a human interrupt occurred during or near this action.
    */

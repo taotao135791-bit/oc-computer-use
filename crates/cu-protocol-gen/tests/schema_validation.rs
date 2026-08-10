@@ -136,9 +136,19 @@ fn observe_result_passes_the_schema_including_the_rfc3339_timestamp() {
         image_path: "/tmp/cu-frames/frame_9.png".into(),
         image_mime_type: "image/png".into(),
         captured_at: Utc::now(),
+        coordinate_space: Some("normalized_1000".into()),
+        target_bounds: None,
+        window_id: None,
     };
     let v = serde_json::to_value(result).unwrap();
     validate("ObserveResult", &v).unwrap();
+    // P0-6: a window-scoped observe carries target bounds + window id.
+    let mut windowed = v.clone();
+    windowed["target_bounds"] = serde_json::json!({
+        "x": 10.0, "y": 20.0, "width": 800.0, "height": 600.0,
+    });
+    windowed["window_id"] = serde_json::json!(777);
+    validate("ObserveResult", &windowed).unwrap();
 }
 
 #[test]

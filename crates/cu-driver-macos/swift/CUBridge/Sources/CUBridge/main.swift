@@ -367,7 +367,8 @@ func getShareableContent() throws -> SCShareableContent {
 
 func captureDisplay(displayId: CGDirectDisplayID, outputPath: String,
                     showsCursor: Bool, maxWidth: Int, format: String,
-                    quality: Int) throws -> [String: Any] {
+                    quality: Int,
+                    region: [Double]?) throws -> [String: Any] {
     // ScreenCaptureKit silently hangs (no error, no completion callback) when
     // the calling process lacks Screen Recording permission. Fail fast with a
     // clear message instead. The permission is bound to the executable's
@@ -430,8 +431,28 @@ func captureDisplay(displayId: CGDirectDisplayID, outputPath: String,
     }
 
     var finalImage = image
+    // P0-6: window-scoped observe — crop to a pixel rectangle relative to the
+    // captured display's top-left. The region arrives in image pixels, so the
+    // CGImage crop is direct (top-left origin). The rect is clamped to the
+    // display; a window that moved fully off-screen yields a zero-area crop
+    // and we fall back to the full frame (the Rust side detects the mismatch
+    // and reports TARGET_UNAVAILABLE rather than trusting a wrong image).
+    if let region = region, region.count == 4 {
+        let x = region[0].rounded(.down)
+        let y = region[1].rounded(.down)
+        let w = region[2].rounded(.up)
+        let h = region[3].rounded(.up)
+        let cx = max(x, 0)
+        let cy = max(y, 0)
+        let cw = min(w, Double(image.width) - cx)
+        let ch = min(h, Double(image.height) - cy)
+        if cw > 1 && ch > 1,
+           let cropped = image.cropping(to: CGRect(x: cx, y: cy, width: cw, height: ch)) {
+            finalImage = cropped
+        }
+    }
     // Downscale so the width does not exceed maxWidth.
-    if maxWidth > 0 && image.width > maxWidth {
+    if maxWidth > 0 && finalImage.width > maxWidth {
         let scale = Double(maxWidth) / Double(image.width)
         let h = Int(Double(image.height) * scale)
         let ctx = CGContext(data: nil, width: maxWidth, height: h,
@@ -479,8 +500,12 @@ func activeAppInfo() -> [String: Any] {
         "bundle_id": app.bundleIdentifier ?? "unknown",
         "name": app.localizedName ?? "unknown",
     ]
-    // Window title via Accessibility (requires the Accessibility permission).
+    // P0-5: the strict focus guard compares bundle + pid + window. The frontmost
+    // app's own pid is authoritative — a recycled pid under the same bundle is
+    // NOT the target window.
     let pid = app.processIdentifier
+    info["pid"] = pid
+    // Window title via Accessibility (requires the Accessibility permission).
     let appElement = AXUIElementCreateApplication(pid)
     var title: CFTypeRef?
     let res = AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &title)
@@ -489,6 +514,20 @@ func activeAppInfo() -> [String: Any] {
         if AXUIElementCopyAttributeValue(window as! AXUIElement, kAXTitleAttribute as CFString, &windowTitle) == .success,
            let t = windowTitle as? String {
             info["window_title"] = t
+        }
+    }
+    // Window id of the frontmost normal window owned by this pid.
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    if let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] {
+        for w in list {
+            let ownerPID = (w[kCGWindowOwnerPID as String] as? Int) ?? -1
+            let layer = (w[kCGWindowLayer as String] as? Int) ?? Int.max
+            if ownerPID == pid && layer == 0 {
+                if let num = w[kCGWindowNumber as String] as? Int {
+                    info["window_id"] = num
+                }
+                break
+            }
         }
     }
     return info
@@ -531,9 +570,15 @@ func resolveTarget(_ params: [String: Any]) -> [String: Any] {
               let hgt = bounds["Height"] as? Double else {
             return nil
         }
+        // P0-4: the window's OWN identity bundle id (from the owner PID's
+        // NSRunningApplication) — never the frontmost app's. The Focus Guard
+        // and identity backfill depend on this being the target window's
+        // owner, so it must NOT be borrowed from the active application.
+        let bundleID = NSRunningApplication(processIdentifier: pid_t(ownerPID))?.bundleIdentifier
         return [
             "window_id": num,
             "pid": ownerPID,
+            "bundle_id": bundleID ?? "unknown",
             "bounds": ["x": x, "y": y, "width": wdt, "height": hgt],
             "title": w[kCGWindowName as String] as? String ?? ""
         ]
@@ -640,7 +685,8 @@ func handle(_ method: String, _ params: [String: Any], id: Any) -> String {
                 showsCursor: params["shows_cursor"] as? Bool ?? true,
                 maxWidth: params["max_width"] as? Int ?? 0,
                 format: params["format"] as? String ?? "png",
-                quality: params["quality"] as? Int ?? 85)
+                quality: params["quality"] as? Int ?? 85,
+                region: params["region"] as? [Double])
             return ok(id, info)
         } catch {
             let desc = (error as NSError).userInfo[NSLocalizedDescriptionKey] as? String ?? error.localizedDescription

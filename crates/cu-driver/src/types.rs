@@ -24,6 +24,18 @@ pub struct DisplayInfo {
     pub is_main: bool,
 }
 
+/// A pixel-space crop rectangle (top-left origin) for a display capture
+/// (P0-6 window-scoped observe).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CaptureRegion {
+    /// Left edge in pixels relative to the captured display's top-left.
+    pub x: f64,
+    /// Top edge in pixels relative to the captured display's top-left.
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 /// What the caller wants from a capture.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaptureRequest {
@@ -39,6 +51,11 @@ pub struct CaptureRequest {
     pub format: String,
     /// JPEG quality 1..=100 (only used for jpeg).
     pub jpeg_quality: u8,
+    /// P0-6: optional crop region in PIXELS relative to the captured display's
+    /// top-left. When set the driver returns only this sub-rectangle of the
+    /// display (window-scoped observe); when `None` the full display is
+    /// captured.
+    pub region: Option<CaptureRegion>,
 }
 
 /// A captured frame as delivered by the driver.
@@ -116,6 +133,14 @@ pub struct ApplicationInfo {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_title: Option<String>,
+    /// P0-5: process id of the frontmost app. The strict focus guard compares
+    /// bundle AND pid AND window — a bundle match on a recycled pid (the app
+    /// relaunched) must not be treated as focus on the target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// P0-5: id of the frontmost focused window, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<u32>,
 }
 
 /// Where the pointer currently sits (global logical points), for trace/inspector.
@@ -160,6 +185,8 @@ mod tests {
                 bundle_id: "com.apple.TextEdit".into(),
                 name: "TextEdit".into(),
                 window_title: Some("Doc".into()),
+                pid: Some(4242),
+                window_id: Some(777),
             }),
             captured_at: chrono::Utc::now(),
         };

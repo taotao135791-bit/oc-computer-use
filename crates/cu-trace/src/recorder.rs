@@ -436,6 +436,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn action_result_retains_pointer_telemetry() {
+        // Section 三十八 test 12 / audit G: the pointer-execution result the
+        // runtime writes into the action result (backend, isolation, cursor
+        // deltas, and the REAL human_interrupt_latency_ms) must survive into
+        // the trace verbatim — latency analysis reads it from the trace alone.
+        let dir = tempdir().unwrap();
+        let rec = TraceRecorder::open("s_ptr", dir.path(), TraceConfig::default())
+            .await
+            .unwrap();
+        let action = ComputerAction::Click {
+            x: 10.0,
+            y: 20.0,
+            button: cu_core::MouseButton::Left,
+            coordinate_space: cu_core::CoordinateSpace::Normalized1000,
+        };
+        let result = serde_json::json!({
+            "status": "success",
+            "duration_ms": 3,
+            "pointer": {
+                "backend": "physical",
+                "isolated": false,
+                "physical_cursor_moved": true,
+                "physical_cursor_delta_px": 12.0,
+                "physical_cursor_restored": false,
+                "human_input_during_fallback": true,
+                "human_interrupt_latency_ms": 42
+            }
+        });
+        rec.record_action(
+            Some("req-p".into()),
+            Some("frame_1".into()),
+            &action,
+            result.clone(),
+            3,
+            Some("1".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        rec.close().await.unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("s_ptr.jsonl")).unwrap();
+        let entry: TraceEntry = serde_json::from_str(raw.trim()).unwrap();
+        let p = &entry.result.unwrap()["pointer"];
+        assert_eq!(p["backend"], "physical");
+        assert_eq!(p["isolated"], serde_json::json!(false));
+        assert_eq!(p["physical_cursor_moved"], serde_json::json!(true));
+        assert_eq!(p["physical_cursor_delta_px"], serde_json::json!(12.0));
+        assert_eq!(p["physical_cursor_restored"], serde_json::json!(false));
+        assert_eq!(p["human_input_during_fallback"], serde_json::json!(true));
+        assert_eq!(p["human_interrupt_latency_ms"], serde_json::json!(42));
+    }
+
+    #[tokio::test]
     async fn best_effort_mode_degrades_instead_of_failing() {
         // A closed writer cannot be written to; in best-effort mode append
         // degrades the recorder and returns Ok. (A real failing FS write is

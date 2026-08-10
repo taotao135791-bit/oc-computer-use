@@ -70,7 +70,7 @@ impl std::str::FromStr for CoordinateSpace {
 /// On macOS the origin can be negative (a secondary display to the left/above
 /// the primary one). Width/height are logical points; the backing store is
 /// `width * scale_factor` pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DisplayBounds {
     pub x: f64,
     pub y: f64,

@@ -185,7 +185,7 @@ impl ComputerDriver for MacosDriver {
     }
 
     async fn capture(&self, request: CaptureRequest) -> Result<CapturedFrame, CuError> {
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "display": request.display_id,
             "output": request.output_path.to_string_lossy(),
             "shows_cursor": request.include_cursor,
@@ -193,6 +193,10 @@ impl ComputerDriver for MacosDriver {
             "format": request.format,
             "quality": request.jpeg_quality,
         });
+        // P0-6: window-scoped observe crops the capture to a pixel rectangle.
+        if let Some(r) = request.region {
+            params["region"] = serde_json::json!([r.x, r.y, r.width, r.height]);
+        }
         let data = self.bridge.request("capture", params)?;
         let width = data
             .get("width")
@@ -248,6 +252,7 @@ impl ComputerDriver for MacosDriver {
             max_width: 96,
             format: "png".into(),
             jpeg_quality: 70,
+            region: None,
         };
         let frame = self.capture(req).await?;
         let thumbnail = capture::to_grayscale_thumbnail(&frame.image_bytes, 64, 64)?;
@@ -476,6 +481,13 @@ impl ComputerDriver for MacosDriver {
             .get("window_title")
             .and_then(Value::as_str)
             .map(|s| s.to_string());
+        // P0-5: the strict focus guard needs the frontmost app's pid and window
+        // id too — a bundle match on a recycled pid must not pass as focus.
+        let pid = data.get("pid").and_then(Value::as_i64).map(|p| p as i32);
+        let window_id = data
+            .get("window_id")
+            .and_then(Value::as_i64)
+            .map(|w| w as u32);
         if bundle_id == "unknown" && name == "unknown" {
             Ok(None)
         } else {
@@ -483,6 +495,8 @@ impl ComputerDriver for MacosDriver {
                 bundle_id: bundle_id.to_string(),
                 name: name.to_string(),
                 window_title,
+                pid,
+                window_id,
             }))
         }
     }
@@ -495,13 +509,28 @@ impl ComputerDriver for MacosDriver {
         })
     }
 
-    async fn pointer_visualized(&self, x: f64, y: f64, display_id: &str) -> Result<(), CuError> {
-        self.overlay_show(x, y, display_id, OverlayMode::Isolated);
+    async fn pointer_visualized(
+        &self,
+        x: f64,
+        y: f64,
+        display_id: &str,
+        mode: cu_core::PointerMode,
+    ) -> Result<(), CuError> {
+        // Audit: the overlay mode is the SESSION's real pointer mode, so the
+        // physical_fallback / paused / user_takeover visual states are
+        // reachable (before, `OverlayMode::Isolated` was hardcoded and
+        // `From<PointerMode>` was dead).
+        self.overlay_show(x, y, display_id, mode.into());
         Ok(())
     }
 
     async fn pointer_hidden(&self) -> Result<(), CuError> {
         self.overlay_hide();
+        Ok(())
+    }
+
+    async fn pointer_click_ripple(&self, x: f64, y: f64) -> Result<(), CuError> {
+        self.overlay_click_ripple(x, y);
         Ok(())
     }
 
@@ -570,45 +599,7 @@ impl ComputerDriver for MacosDriver {
             params["window_id"] = serde_json::json!(wid);
         }
         let data = self.bridge.request("resolve_target", params)?;
-        if data.get("found").and_then(Value::as_bool) != Some(true) {
-            return Ok(None);
-        }
-        let w = data
-            .get("window")
-            .ok_or_else(|| CuError::Driver("resolve_target: missing window".into()))?;
-        let pid = w
-            .get("pid")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| CuError::Driver("resolve_target: missing pid".into()))?
-            as i32;
-        let window_id = w
-            .get("window_id")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| CuError::Driver("resolve_target: missing window_id".into()))?
-            as u32;
-        // Bundle id: ask for the active app via a second bridge call.
-        let bundle_id = match self.bridge.request("active", serde_json::Value::Null) {
-            Ok(active) => active
-                .get("bundle_id")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-            Err(_) => "unknown".to_string(),
-        };
-        let bounds = w.get("bounds").and_then(|b| {
-            Some(cu_core::DisplayBounds {
-                x: b.get("x")?.as_f64()?,
-                y: b.get("y")?.as_f64()?,
-                width: b.get("width")?.as_f64()?,
-                height: b.get("height")?.as_f64()?,
-            })
-        });
-        Ok(Some(cu_driver::ResolvedSessionTarget {
-            bundle_id,
-            pid,
-            window_id,
-            bounds,
-        }))
+        parse_resolved_target(&data)
     }
 
     /// Round 9 / P0-4: refresh bounds for an already-resolved window.
@@ -635,6 +626,50 @@ impl ComputerDriver for MacosDriver {
             })
         }))
     }
+}
+
+/// Parse the bridge's `resolve_target` response into a resolved session
+/// target. Identity is the Focus Guard's foundation (P0-4/P0-5): the bundle id
+/// MUST be the RESOLVED WINDOW's own owner bundle — never the active app's,
+/// which would silently bind a session to the wrong app. A window that cannot
+/// be fully identified (missing / `"unknown"` bundle) fails closed to `None`.
+/// Extracted so the identity contract is testable without a live Swift bridge.
+fn parse_resolved_target(
+    data: &Value,
+) -> Result<Option<cu_driver::ResolvedSessionTarget>, CuError> {
+    if data.get("found").and_then(Value::as_bool) != Some(true) {
+        return Ok(None);
+    }
+    let w = data
+        .get("window")
+        .ok_or_else(|| CuError::Driver("resolve_target: missing window".into()))?;
+    let pid = w
+        .get("pid")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| CuError::Driver("resolve_target: missing pid".into()))? as i32;
+    let window_id = w
+        .get("window_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| CuError::Driver("resolve_target: missing window_id".into()))?
+        as u32;
+    let bundle_id = match w.get("bundle_id").and_then(Value::as_str) {
+        Some(b) if b != "unknown" => b.to_string(),
+        _ => return Ok(None),
+    };
+    let bounds = w.get("bounds").and_then(|b| {
+        Some(cu_core::DisplayBounds {
+            x: b.get("x")?.as_f64()?,
+            y: b.get("y")?.as_f64()?,
+            width: b.get("width")?.as_f64()?,
+            height: b.get("height")?.as_f64()?,
+        })
+    });
+    Ok(Some(cu_driver::ResolvedSessionTarget {
+        bundle_id,
+        pid,
+        window_id,
+        bounds,
+    }))
 }
 
 impl MacosDriver {
@@ -749,5 +784,64 @@ mod tests {
         };
         let g = geometry_for(&d, 2880, 1800);
         assert!((g.scale_factor() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resolve_parse_returns_the_resolved_windows_own_identity() {
+        // Section 三十八 test 6 / P0-4-P0-5: the target's bundle/pid/window all
+        // come from the WINDOW the resolver actually picked (the bridge echoes
+        // the owner bundle inside the window entry), never the active app's.
+        let data = serde_json::json!({
+            "found": true,
+            "window": {
+                "pid": 4242,
+                "window_id": 777,
+                "bundle_id": "com.apple.Safari",
+                "bounds": {"x": 10.0, "y": 20.0, "width": 1200.0, "height": 800.0}
+            }
+        });
+        let r = parse_resolved_target(&data).unwrap().unwrap();
+        assert_eq!(r.pid, 4242, "pid is the resolved window's pid");
+        assert_eq!(r.window_id, 777, "window id is the resolved window's id");
+        assert_eq!(
+            r.bundle_id, "com.apple.Safari",
+            "bundle is the resolved window's OWN owner"
+        );
+        let b = r.bounds.unwrap();
+        assert_eq!(b.x, 10.0);
+        assert_eq!(b.y, 20.0);
+        assert_eq!(b.width, 1200.0);
+        assert_eq!(b.height, 800.0);
+    }
+
+    #[test]
+    fn resolve_parse_fails_closed_on_missing_or_unknown_bundle() {
+        // Section 三十八 test 6: a window we cannot fully identify must never
+        // become a session target. Unresolved, missing bundle, and an
+        // `"unknown"` bundle all resolve to None (fail closed).
+        assert!(
+            parse_resolved_target(&serde_json::json!({"found": false}))
+                .unwrap()
+                .is_none(),
+            "unresolved target -> None"
+        );
+        assert!(
+            parse_resolved_target(&serde_json::json!({
+                "found": true,
+                "window": {"pid": 1, "window_id": 2, "bundle_id": "unknown"}
+            }))
+            .unwrap()
+            .is_none(),
+            "'unknown' bundle -> None (would break the Focus Guard)"
+        );
+        assert!(
+            parse_resolved_target(&serde_json::json!({
+                "found": true,
+                "window": {"pid": 1, "window_id": 2}
+            }))
+            .unwrap()
+            .is_none(),
+            "missing bundle -> None (cannot identify the window)"
+        );
     }
 }

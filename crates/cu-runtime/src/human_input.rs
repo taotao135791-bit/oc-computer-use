@@ -18,7 +18,7 @@
 //! event → last runtime synthetic event).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A sink that receives real human input events. Implemented by the
@@ -57,6 +57,17 @@ pub struct HumanInputMonitor {
     /// Computed when the action loop observes the input stop.
     event_to_input_stop_ms: AtomicU64,
     synthetic_count: std::sync::atomic::AtomicU64,
+    /// P0-2: monotonic generation counter, incremented on every REAL human
+    /// event. A transaction can snapshot it before borrowing the cursor and
+    /// compare afterwards to learn "did the user touch anything mid-flight?"
+    human_event_generation: AtomicU64,
+    /// P0-1: registered by the runtime. Invoked synchronously (on the Event Tap
+    /// thread) the moment a REAL human event is observed, so the active batch
+    /// is cancelled **at event time** — not merely flagged for the next loop
+    /// iteration. The runtime's hook finds the control-holder session and
+    /// cancels its in-flight batches; the queue thread still performs the
+    /// `UserTakeover` state transition (it needs async driver calls).
+    real_takeover_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Default for HumanInputMonitor {
@@ -77,6 +88,30 @@ impl HumanInputMonitor {
             last_synthetic_event_at: Mutex::new(None),
             event_to_input_stop_ms: AtomicU64::new(u64::MAX),
             synthetic_count: std::sync::atomic::AtomicU64::new(0),
+            human_event_generation: AtomicU64::new(0),
+            real_takeover_hook: Mutex::new(None),
+        }
+    }
+
+    /// Register the P0-1 real-takeover hook. The runtime installs a hook that
+    /// cancels the active session's in-flight batches the instant a real human
+    /// event fires, so a long-running action (drag / scroll / wait) aborts
+    /// immediately instead of waiting for the loop's next poll.
+    pub fn set_real_takeover_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.real_takeover_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Remove the P0-1 real-takeover hook (runtime shutdown / test teardown).
+    pub fn clear_real_takeover_hook(&self) {
+        *self.real_takeover_hook.lock().unwrap() = None;
+    }
+
+    /// Invoke the registered hook, if any. The Arc is cloned out of the lock
+    /// before the call so a hook that re-enters the monitor cannot deadlock.
+    fn fire_real_takeover_hook(&self) {
+        let hook = self.real_takeover_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -103,6 +138,12 @@ impl HumanInputMonitor {
         self.pending_takeover.swap(false, Ordering::SeqCst)
     }
 
+    /// P0-2: current human-event generation. Snapshot before borrowing the
+    /// cursor and compare after to detect human input mid-transaction.
+    pub fn human_event_generation(&self) -> u64 {
+        self.human_event_generation.load(Ordering::SeqCst)
+    }
+
     /// Clear all state (called when a session starts or releases control).
     pub fn reset(&self) {
         self.pending_real_takeover.store(false, Ordering::SeqCst);
@@ -115,6 +156,7 @@ impl HumanInputMonitor {
         self.event_to_input_stop_ms
             .store(u64::MAX, Ordering::SeqCst);
         self.synthetic_count.store(0, Ordering::SeqCst);
+        self.human_event_generation.store(0, Ordering::SeqCst);
     }
 
     /// Record a **real** human event. `event_instant` should be the event's own
@@ -127,6 +169,11 @@ impl HumanInputMonitor {
         *self.last_latency_ms.lock().unwrap() = Some(latency_ms);
         *self.human_event_at.lock().unwrap() = Some(event_instant);
         self.pending_real_takeover.store(true, Ordering::SeqCst);
+        self.human_event_generation.fetch_add(1, Ordering::SeqCst);
+        // P0-1: cancel the ACTIVE batch NOW. A long in-flight action (drag /
+        // scroll / wait via execute_with_cancel) must abort at event time —
+        // not merely be flagged for the next loop iteration.
+        self.fire_real_takeover_hook();
     }
 
     /// Record a **heuristic** detection (pointer jump while the Event Tap is
@@ -181,6 +228,24 @@ impl HumanInputMonitor {
         }
     }
 
+    /// Human interrupt latency (audit G): time from the LAST runtime synthetic
+    /// input event to the most recent real human event, ms. This is how long
+    /// after the agent's input the user grabbed the machine — the number the
+    /// action result + trace report as `human_interrupt_latency_ms`. `None`
+    /// when no synthetic event precedes the human event (a purely
+    /// human-initiated interrupt, or the monitor has seen no synthetic input).
+    pub fn human_interrupt_latency_ms(&self) -> Option<u64> {
+        let last_synth = *self.last_synthetic_event_at.lock().unwrap();
+        let human_at = *self.human_event_at.lock().unwrap();
+        match (last_synth, human_at) {
+            (Some(s), Some(h)) if h >= s => {
+                let delta = h.saturating_duration_since(s);
+                Some(delta.as_millis().min(u64::MAX as u128) as u64)
+            }
+            _ => None,
+        }
+    }
+
     /// Last measured human-interrupt latency in ms, if any.
     pub fn last_latency_ms(&self) -> Option<u64> {
         *self.last_latency_ms.lock().unwrap()
@@ -208,6 +273,10 @@ impl HumanInputSink for HumanInputMonitor {
         *self.human_event_at.lock().unwrap() = Some(now);
         // P0-1: a real hardware event ALWAYS raises the real-takeover flag.
         self.pending_real_takeover.store(true, Ordering::SeqCst);
+        self.human_event_generation.fetch_add(1, Ordering::SeqCst);
+        // P0-1: cancel the ACTIVE batch at event time (see
+        // `record_human_event`). This is the sink path the Event Tap drives.
+        self.fire_real_takeover_hook();
     }
 }
 
@@ -294,6 +363,55 @@ mod tests {
         sink.on_human_event(3);
         assert!(m.real_takeover_requested());
         assert_eq!(m.last_latency_ms(), Some(3));
+    }
+
+    #[test]
+    fn real_event_fires_the_takeover_hook_immediately() {
+        // P0-1: the hook (which cancels the active batch) must fire the MOMENT
+        // a real event arrives — not on the next loop poll. Both the record
+        // path and the Event Tap sink path must invoke it.
+        use std::sync::atomic::AtomicUsize;
+        let m = HumanInputMonitor::new();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let c2 = calls.clone();
+        m.set_real_takeover_hook(std::sync::Arc::new(move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+        }));
+        m.record_human_event(Instant::now());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "record path must fire the hook"
+        );
+        let sink: &dyn HumanInputSink = &m;
+        sink.on_human_event(3);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "Event Tap sink path must fire the hook too"
+        );
+        // reset() must not clear the persistent registration.
+        m.reset();
+        m.record_human_event(Instant::now());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn cleared_hook_does_not_fire() {
+        use std::sync::atomic::AtomicUsize;
+        let m = HumanInputMonitor::new();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let c2 = calls.clone();
+        m.set_real_takeover_hook(std::sync::Arc::new(move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+        }));
+        m.clear_real_takeover_hook();
+        m.record_human_event(Instant::now());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "cleared hook must not fire"
+        );
     }
 
     #[test]

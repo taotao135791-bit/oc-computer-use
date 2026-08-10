@@ -176,6 +176,19 @@ pub struct ObserveResult {
     pub image_path: String,
     pub image_mime_type: String,
     pub captured_at: DateTime<Utc>,
+    /// P0-6: the coordinate space the returned image's pixels are expressed
+    /// in (`"normalized_1000"` — the image is treated as a 1000x1000 canvas).
+    /// Present on every observe so the caller never has to guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinate_space: Option<String>,
+    /// P0-6: when the session is scoped to a target window, the image is a
+    /// CROP of that window and this is its global logical bounds (the caller
+    /// maps window coords → screen via this). `None` = full-display observe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_bounds: Option<crate::coordinates::DisplayBounds>,
+    /// P0-6: the observed window's id, when the session is window-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<u32>,
 }
 
 /// `computer.act` request.
@@ -224,6 +237,11 @@ pub struct PointerExecutionResult {
     /// physical fallback transaction (absent when never borrowed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_cursor_restored: Option<bool>,
+    /// P0-2: whether a real human input occurred during the physical fallback
+    /// transaction (in which case the cursor is NEVER yanked back). Absent
+    /// when no physical fallback ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_input_during_fallback: Option<bool>,
     /// Human interrupt latency (ms) measured from the hardware event to the
     /// last synthetic input event. Present when a human interrupt occurred
     /// during or near this action.

@@ -92,6 +92,10 @@ pub(crate) async fn serve_with(
     config: DaemonConfig,
 ) -> anyhow::Result<()> {
     let runtime = Arc::new(Runtime::new(driver.clone(), config.runtime_config.clone()));
+    // P0-1: a real human input must cancel the active batch at event time (not
+    // when the action loop next polls). The Event Tap thread invokes this hook
+    // synchronously; it cancels the control-holder session's in-flight batches.
+    runtime.install_human_takeover_hook(runtime.clone());
 
     // Round 8 / Phase 11: once the daemon is fully wired, start the continuous
     // human-input monitor (Event Tap). The tap feeds the runtime's

@@ -185,12 +185,23 @@ pub async fn drag(
     }
     // Mouse-down already happened: ALWAYS send mouse-up, even when cancelled,
     // so the system is never left with a stuck pressed button.
-    if cancelled {
-        button_up(MouseButton::Left, to.x.max(0.0), to.y.max(0.0), 1);
-    } else {
-        button_up(MouseButton::Left, to.x, to.y, 1);
-    }
+    let up = drag_up_position(cancelled, to);
+    button_up(MouseButton::Left, up.x, up.y, 1);
     !cancelled
+}
+
+/// The release point for the mouse-up that MUST follow a `drag` (P0-2: "never
+/// leave a stuck pressed button"). When cancelled mid-path the drag may not
+/// have reached `to` (and `to` itself could be off-screen), so the up is
+/// posted at a non-negative position on the visible desktop; on completion it
+/// lands exactly at `to`. Extracted so the invariant is testable without
+/// posting real events (tests never touch the user's pointer).
+fn drag_up_position(cancelled: bool, to: cu_core::Point) -> cu_core::Point {
+    if cancelled {
+        cu_core::Point::new(to.x.max(0.0), to.y.max(0.0))
+    } else {
+        to
+    }
 }
 
 /// Scroll by pixel deltas, cancellation-aware (round 9 / P0-2): long scrolls
@@ -262,5 +273,26 @@ mod tests {
             move_type_for_button(MOUSE_BUTTON_MIDDLE),
             EVENT_OTHER_MOUSE_DRAGGED
         );
+    }
+
+    #[test]
+    fn drag_always_releases_the_button_after_cancel() {
+        // Section 三十八 test 2 / P0-2: a drag cancelled mid-path must still
+        // send the matching mouse-up (the pressed button must never be left
+        // stuck). This pins the release-point decision without posting events
+        // — tests must never hijack the user's pointer in CI.
+        let to = cu_core::Point::new(-20.0, 40.0);
+        // Completed drag: the up lands exactly at the destination.
+        assert_eq!(drag_up_position(false, to), to);
+        // Cancelled drag: the up still fires, clamped back onto the desktop.
+        let up = drag_up_position(true, to);
+        assert_eq!(
+            up.x, 0.0,
+            "a cancelled drag must clamp a negative x back onto the desktop"
+        );
+        assert_eq!(up.y, 40.0, "y is already on-screen and is kept");
+        // An off-desktop destination is clamped in both axes.
+        let up = drag_up_position(true, cu_core::Point::new(-5.0, -80.0));
+        assert_eq!(up, cu_core::Point::new(0.0, 0.0));
     }
 }
