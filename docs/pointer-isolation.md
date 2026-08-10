@@ -68,7 +68,7 @@ SwiftUI Button 响应 / AppKit Button 响应 / Electron 响应
 2. 测试者随机移动真实鼠标。
 3. 期望:Agent 立即停 → 不拉回 Cursor → Queue 停 → `USER_TAKEOVER`。
 
-记录 `human_input_detected` + `human_interrupt_latency_ms`。
+记录 `human_input_detected` + P0-4 指标:`event_detection_latency_ms`(事件→callback)、`human_to_takeover_ms`(事件→takeover)、`human_to_input_stop_ms`(事件→最后一次 synthetic 输入,THE KPI;0 = agent 已先停)。
 
 ## 诚实状态
 

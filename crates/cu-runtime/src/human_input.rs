@@ -12,10 +12,23 @@
 //!    Event Tap is degraded/unavailable. This channel MAY use the old
 //!    configurable policy.
 //!
-//! The monitor also records the real interrupt-latency chain:
-//! `human_event_at` → `takeover_started_at` → `last_synthetic_event_at`, and
-//! exposes `event_to_input_stop_ms` (the metric that matters: real hardware
-//! event → last runtime synthetic event).
+//! The monitor also records the real interrupt-latency chain (P0-4). The
+//! metric that matters is `human_to_input_stop_ms`:
+//!
+//! ```text
+//! human_event_at ──► takeover_started_at ──► last_synthetic_event_at
+//!        │                                       │
+//!        │             human_to_takeover_ms      │
+//!        └───────────────────────────────────────┘
+//!             human_to_input_stop_ms = last_synthetic − human (saturating)
+//! ```
+//!
+//! `human_to_input_stop_ms` answers "how long after the user's real input the
+//! agent's LAST synthetic input landed": 0 when the agent had already stopped
+//! before the user touched anything, positive when a synthetic event slipped
+//! in AFTER the human event. It is NOT `synthetic → human` (the old
+//! `human_interrupt_latency` mislabel); that inverse direction is exposed
+//! separately as `agent_input_to_human_ms` for analysis only.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,13 +62,18 @@ pub struct HumanInputMonitor {
     last_latency_ms: Mutex<Option<u64>>,
     /// Timestamp (monotonic) of the last real human event.
     human_event_at: Mutex<Option<Instant>>,
+    /// P0-4: timestamp when the Event Tap callback observed the same human
+    /// event (set by `on_human_event`). When the tap is live this is within
+    /// microseconds of `human_event_at`; the difference is `event_detection`.
+    event_callback_at: Mutex<Option<Instant>>,
     /// Timestamp when the takeover was actually applied (transition to
     /// UserTakeover + cancellation).
     takeover_started_at: Mutex<Option<Instant>>,
-    /// Timestamp of the last runtime synthetic input event.
+    /// Timestamp of the last runtime synthetic input event (updated on EVERY
+    /// synthetic mouse/keyboard/scroll/physical input, including any that slip
+    /// in AFTER a human event — that is exactly what `human_to_input_stop_ms`
+    /// must measure).
     last_synthetic_event_at: Mutex<Option<Instant>>,
-    /// Computed when the action loop observes the input stop.
-    event_to_input_stop_ms: AtomicU64,
     synthetic_count: std::sync::atomic::AtomicU64,
     /// P0-2: monotonic generation counter, incremented on every REAL human
     /// event. A transaction can snapshot it before borrowing the cursor and
@@ -84,9 +102,9 @@ impl HumanInputMonitor {
             pending_takeover: AtomicBool::new(false),
             last_latency_ms: Mutex::new(None),
             human_event_at: Mutex::new(None),
+            event_callback_at: Mutex::new(None),
             takeover_started_at: Mutex::new(None),
             last_synthetic_event_at: Mutex::new(None),
-            event_to_input_stop_ms: AtomicU64::new(u64::MAX),
             synthetic_count: std::sync::atomic::AtomicU64::new(0),
             human_event_generation: AtomicU64::new(0),
             real_takeover_hook: Mutex::new(None),
@@ -151,10 +169,9 @@ impl HumanInputMonitor {
         *self.last_human.lock().unwrap() = None;
         *self.last_latency_ms.lock().unwrap() = None;
         *self.human_event_at.lock().unwrap() = None;
+        *self.event_callback_at.lock().unwrap() = None;
         *self.takeover_started_at.lock().unwrap() = None;
         *self.last_synthetic_event_at.lock().unwrap() = None;
-        self.event_to_input_stop_ms
-            .store(u64::MAX, Ordering::SeqCst);
         self.synthetic_count.store(0, Ordering::SeqCst);
         self.human_event_generation.store(0, Ordering::SeqCst);
     }
@@ -188,29 +205,68 @@ impl HumanInputMonitor {
         *self.takeover_started_at.lock().unwrap() = Some(Instant::now());
     }
 
-    /// Called by the action loop once it observes the last synthetic input
-    /// event stopped (i.e. no further runtime input will be posted).
-    pub fn mark_input_stopped(&self) {
-        if let Some(started) = *self.takeover_started_at.lock().unwrap() {
-            let ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            self.event_to_input_stop_ms.store(ms, Ordering::SeqCst);
-        }
-    }
-
     /// Record the last runtime synthetic input event (for the interrupt chain).
+    /// Called on EVERY synthetic mouse move/down/up, drag step, scroll event,
+    /// keyboard event, physical fallback warp and restore (P0-4). The
+    /// timestamp is intentionally updated even when it lands AFTER a human
+    /// event — that is the "accidental late synthetic" case
+    /// `human_to_input_stop_ms` must measure, not paper over.
     pub fn record_synthetic_event(&self, instant: Instant) {
         *self.last_synthetic_event_at.lock().unwrap() = Some(instant);
         self.synthetic_count.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// The real metric: human event → last runtime synthetic input event, ms.
-    pub fn event_to_input_stop_ms(&self) -> Option<u64> {
-        let v = self.event_to_input_stop_ms.load(Ordering::SeqCst);
-        if v == u64::MAX {
-            None // sentinel: never measured
-        } else {
-            Some(v)
+    /// **The** Human Interrupt KPI (P0-4): time from the real hardware human
+    /// event to the LAST runtime synthetic input event, ms.
+    ///
+    /// - No synthetic event AFTER the human event (the agent had already
+    ///   stopped — including the never-input case, where there is no last
+    ///   synthetic to measure) → `0`, never a negative number. Section 四十七:
+    ///   "no synthetic event after human → 0 latency".
+    /// - A synthetic event that slipped in after the human event → its
+    ///   positive distance from the human event, e.g. human at t100, stray
+    ///   synthetic at t112 → `12`.
+    /// - No human event at all → `None` (the metric is undefined without one).
+    ///
+    /// This is what the action result, the trace, and the benchmark report
+    /// must carry as the interrupt latency — never the old
+    /// `synthetic → human` direction.
+    pub fn human_to_input_stop_ms(&self) -> Option<u64> {
+        let last_synth = *self.last_synthetic_event_at.lock().unwrap();
+        let human_at = *self.human_event_at.lock().unwrap();
+        match (last_synth, human_at) {
+            (Some(s), Some(h)) => {
+                let delta = s.saturating_duration_since(h);
+                Some(delta.as_millis().min(u64::MAX as u128) as u64)
+            }
+            // No synthetic ever -> the agent had no input to stop; the KPI is
+            // a real 0 (P0-4: "0 when none"), not an undefined None.
+            (None, Some(_)) => Some(0),
+            _ => None,
         }
+    }
+
+    /// Analysis-only inverse metric (P0-4): time from the agent's last
+    /// synthetic input to the human event — "how long after the agent's input
+    /// did the user grab the machine". This is the OLD `human_interrupt_latency`
+    /// meaning and must NOT be labelled as the interrupt KPI.
+    pub fn agent_input_to_human_ms(&self) -> Option<u64> {
+        let last_synth = *self.last_synthetic_event_at.lock().unwrap();
+        let human_at = *self.human_event_at.lock().unwrap();
+        match (last_synth, human_at) {
+            (Some(s), Some(h)) => {
+                let delta = h.saturating_duration_since(s);
+                Some(delta.as_millis().min(u64::MAX as u128) as u64)
+            }
+            _ => None,
+        }
+    }
+
+    /// Detection latency: hardware human event → Event Tap callback (ms).
+    /// This is the `latency_ms` the tap measured from the event's own
+    /// `CGEventGetTimestamp` to the callback (P0-4 `event_detection_latency`).
+    pub fn event_detection_latency_ms(&self) -> Option<u64> {
+        *self.last_latency_ms.lock().unwrap()
     }
 
     /// Human event → takeover-applied latency, ms.
@@ -228,22 +284,10 @@ impl HumanInputMonitor {
         }
     }
 
-    /// Human interrupt latency (audit G): time from the LAST runtime synthetic
-    /// input event to the most recent real human event, ms. This is how long
-    /// after the agent's input the user grabbed the machine — the number the
-    /// action result + trace report as `human_interrupt_latency_ms`. `None`
-    /// when no synthetic event precedes the human event (a purely
-    /// human-initiated interrupt, or the monitor has seen no synthetic input).
-    pub fn human_interrupt_latency_ms(&self) -> Option<u64> {
-        let last_synth = *self.last_synthetic_event_at.lock().unwrap();
-        let human_at = *self.human_event_at.lock().unwrap();
-        match (last_synth, human_at) {
-            (Some(s), Some(h)) if h >= s => {
-                let delta = h.saturating_duration_since(s);
-                Some(delta.as_millis().min(u64::MAX as u128) as u64)
-            }
-            _ => None,
-        }
+    /// Back-compat alias for the real KPI (kept so existing trace consumers
+    /// do not break); the value IS `human_to_input_stop_ms`.
+    pub fn event_to_input_stop_ms(&self) -> Option<u64> {
+        self.human_to_input_stop_ms()
     }
 
     /// Last measured human-interrupt latency in ms, if any.
@@ -271,6 +315,9 @@ impl HumanInputSink for HumanInputMonitor {
         *self.last_human.lock().unwrap() = Some(now);
         *self.last_latency_ms.lock().unwrap() = Some(latency_ms);
         *self.human_event_at.lock().unwrap() = Some(now);
+        // P0-4: the Event Tap callback time — the far end of
+        // `event_detection_latency_ms` (event → callback).
+        *self.event_callback_at.lock().unwrap() = Some(now);
         // P0-1: a real hardware event ALWAYS raises the real-takeover flag.
         self.pending_real_takeover.store(true, Ordering::SeqCst);
         self.human_event_generation.fetch_add(1, Ordering::SeqCst);
@@ -419,8 +466,45 @@ mod tests {
         let m = HumanInputMonitor::new();
         m.record_human_event(Instant::now() - Duration::from_millis(10));
         m.mark_takeover_started();
-        m.mark_input_stopped();
         assert!(m.event_to_takeover_ms().is_some());
-        assert!(m.event_to_input_stop_ms().is_some());
+        // With no synthetic after the human event the real KPI is exactly 0.
+        assert_eq!(m.event_to_input_stop_ms(), Some(0));
+        assert_eq!(m.human_to_input_stop_ms(), Some(0));
+    }
+
+    /// P0-4 key test: human event with NO synthetic after it → `0` latency.
+    /// Human at t100, last synthetic before it at t90 → input stop = 0 (the
+    /// agent had already stopped); never a negative number.
+    #[test]
+    fn human_to_input_stop_is_zero_when_no_synthetic_after_human() {
+        let m = HumanInputMonitor::new();
+        let human = Instant::now();
+        m.record_synthetic_event(human - Duration::from_millis(10));
+        m.record_human_event(human);
+        assert_eq!(
+            m.human_to_input_stop_ms(),
+            Some(0),
+            "0 latency when the last synthetic preceded the human event"
+        );
+        // The inverse (analysis-only) metric is 10ms — but it is NOT the KPI.
+        assert_eq!(m.agent_input_to_human_ms(), Some(10));
+    }
+
+    /// P0-4 key test: a synthetic event that slips in AFTER the human event is
+    /// measured. Human at t100, stray synthetic at t112 → `12` ms.
+    #[test]
+    fn human_to_input_stop_is_positive_when_synthetic_slips_in_after_human() {
+        let m = HumanInputMonitor::new();
+        let human = Instant::now();
+        m.record_human_event(human);
+        m.record_synthetic_event(human + Duration::from_millis(12));
+        assert_eq!(
+            m.human_to_input_stop_ms(),
+            Some(12),
+            "a late synthetic after the human event must be measured, not hidden"
+        );
+        // A fresh monitor with no human event yet has no KPI.
+        let m2 = HumanInputMonitor::new();
+        assert_eq!(m2.human_to_input_stop_ms(), None);
     }
 }

@@ -26,8 +26,8 @@ use cu_core::{
     SessionSummary, StabilizationInfo, TraceReport, WaitPolicy,
 };
 use cu_driver::{
-    ApplicationInfo, CaptureRegion, CaptureRequest, ComputerDriver, DesktopLayout, DisplayInfo,
-    PermissionStatus, PointerInfo,
+    expected_crop_output_size, ApplicationInfo, CaptureRegion, CaptureRequest, ComputerDriver,
+    DesktopLayout, DisplayInfo, PermissionStatus, PointerInfo,
 };
 use cu_policy::confirmation::Authorization;
 use cu_policy::{authorize, ConfirmationPolicy, TakeoverDetector, TakeoverPolicy};
@@ -174,7 +174,9 @@ impl Runtime {
             let _ = session.transition(cu_core::SessionState::UserTakeover);
             session.sync_pointer_mode(cu_core::SessionState::UserTakeover);
             self.human_input.mark_takeover_started();
-            self.human_input.mark_input_stopped();
+            // P0-4: input-stop is measured from `last_synthetic_event_at`, never
+            // force-marked at takeover time — a stamp set here would fabricate
+            // the KPI (the agent's last input may long predate the takeover).
             let _ = self.driver.pointer_hidden().await;
             true
         } else {
@@ -853,6 +855,62 @@ impl Runtime {
         self.observe_inner(&session, params, request_id).await
     }
 
+    /// P0-3: refresh a target-scoped session's resolved target BEFORE every
+    /// observe / inspect, so window bounds are always current. Fail-closed:
+    /// a resolver error, a vanished window, or a window whose identity no
+    /// longer matches the session's target all yield `TARGET_UNAVAILABLE` —
+    /// NEVER stale bounds, and NEVER an auto-picked sibling window of the same
+    /// app. This is the shared refresh path for observe and inspect; there is
+    /// deliberately no best-effort fallback: an isolation system does not
+    /// "continue with the old bounds".
+    async fn refresh_resolved_target(
+        &self,
+        session: &Session,
+    ) -> Result<cu_driver::ResolvedSessionTarget, CuError> {
+        let target = session.get_target().or_else(|| {
+            session
+                .get_resolved_target()
+                .map(|rt| cu_core::SessionTarget {
+                    bundle_id: Some(rt.bundle_id),
+                    pid: Some(rt.pid as i64),
+                    window_id: Some(rt.window_id as i64),
+                })
+        });
+        let target = match target {
+            Some(t) => t,
+            // Not target-scoped: nothing to refresh.
+            None => return Err(CuError::TargetUnavailable),
+        };
+        // Fail closed on EVERY resolver outcome except a fully-identified
+        // window: Err (bridge/resolver failure) and Ok(None) (window gone)
+        // both mean "no capture, no act".
+        let resolved = match self.driver.resolve_target(&target).await {
+            Ok(Some(r)) => r,
+            Ok(None) | Err(_) => return Err(CuError::TargetUnavailable),
+        };
+        // Identity re-check: the resolved window MUST be the very window the
+        // session is bound to. A different window_id (even the same app /
+        // bundle — the original window closed and another took its place)
+        // means fail closed, never re-scope.
+        if let Some(wid) = target.window_id {
+            if resolved.window_id as i64 != wid {
+                return Err(CuError::TargetUnavailable);
+            }
+        }
+        if let Some(b) = &target.bundle_id {
+            if resolved.bundle_id != *b {
+                return Err(CuError::TargetUnavailable);
+            }
+        }
+        if let Some(pid) = target.pid {
+            if resolved.pid as i64 != pid {
+                return Err(CuError::TargetUnavailable);
+            }
+        }
+        session.set_resolved_target(Some(resolved.clone()));
+        Ok(resolved)
+    }
+
     /// The observe core, called while the session's busy lock is held (either
     /// by [`Runtime::observe`] or by `act`'s post-batch re-observe).
     async fn observe_inner(
@@ -888,9 +946,17 @@ impl Runtime {
         // the model sees only the target (never neighboring apps / chrome), and
         // the stored frame geometry becomes window-relative — coordinates in
         // the model's screenshot map straight to the window's global bounds.
-        let window_scope: Option<(cu_core::DisplayBounds, u32)> = session
-            .get_resolved_target()
-            .and_then(|rt| rt.bounds.map(|b| (b, rt.window_id)));
+        // P0-3: the target is REFRESHED before every observe (never the stale
+        // session-start bounds) — the window may have moved / resized / closed
+        // since the last capture. Fail-closed: a vanished or re-identified
+        // window is TARGET_UNAVAILABLE, not a stale-bounds crop.
+        let window_scope: Option<(cu_core::DisplayBounds, u32)> =
+            if session.get_target().is_some() || session.get_resolved_target().is_some() {
+                let rt = self.refresh_resolved_target(session).await?;
+                rt.bounds.map(|b| (b, rt.window_id))
+            } else {
+                None
+            };
         let region_px: Option<CaptureRegion> = if let Some((wb, _)) = window_scope {
             // Window bounds are global logical points; the crop must be in the
             // captured display's pixel space. `list_displays` provides the
@@ -927,19 +993,30 @@ impl Runtime {
         // A capture failure is a CAPTURE_FAILED error, distinct from generic
         // driver failures, so agents can distinguish "screen could not be
         // captured" from other bridge problems.
+        // Snapshot the max_width before `request` is moved into the driver.
+        let request_max_width = request.max_width;
         let captured = self
             .driver
             .capture(request)
             .await
             .map_err(|e| CuError::CaptureFailed(e.to_string()))?;
 
-        // P0-6 fail-closed: a window crop was requested; if the driver could
-        // not produce a matching image (the window moved off-screen and the
-        // crop fell back to the full frame), surface TARGET_UNAVAILABLE rather
-        // than label a full-display image as window-scoped.
+        // P0-6/P0-2 fail-closed: a window crop was requested; if the driver
+        // could not produce a matching image (the window moved off-screen and
+        // the crop fell back to the full frame), surface TARGET_UNAVAILABLE
+        // rather than label a full-display image as window-scoped. The expected
+        // size is the CROP possibly downscaled to `max_width` — the Swift
+        // bridge legitimately shrinks a crop wider than max_width (P0-1), so
+        // comparing against the raw crop size would spuriously reject every
+        // wide-target capture. Tolerance is a documented ±1px for Swift/Rust
+        // rounding differences; any larger mismatch is a real isolation break.
         if let Some(r) = region_px {
-            let (want_w, want_h) = (r.width.round() as u32, r.height.round() as u32);
-            if captured.width.abs_diff(want_w) > 2 || captured.height.abs_diff(want_h) > 2 {
+            let (exp_w, exp_h) = expected_crop_output_size(
+                r.width.round() as u32,
+                r.height.round() as u32,
+                request_max_width,
+            );
+            if captured.width.abs_diff(exp_w) > 1 || captured.height.abs_diff(exp_h) > 1 {
                 return Err(CuError::TargetUnavailable);
             }
         }
@@ -1164,13 +1241,11 @@ impl Runtime {
                 Ok(Some(b)) => {
                     session.set_target_bounds(Some(b));
                 }
-                Ok(None) => {
-                    // Target window is gone (closed / minimized / recreated).
+                // Fail closed on EVERY failure mode: a vanished window and a
+                // resolver/bridge error both mean "no act". An isolation
+                // system does not act on stale bounds.
+                Ok(None) | Err(_) => {
                     return Err(CuError::TargetUnavailable);
-                }
-                Err(_) => {
-                    // Resolution probe failed; keep the previous bounds so the
-                    // session is not hard-failed on a transient bridge issue.
                 }
             }
         }
@@ -1458,9 +1533,18 @@ impl Runtime {
         // P0-6: a window-scoped session may only inspect inside its target
         // window. Clamp the request region to the window before mapping it to
         // image pixels (a full-display frame stays clamped too).
-        let region = match session.get_resolved_target().and_then(|rt| rt.bounds) {
-            Some(wb) => Self::clamp_region_to_window(&geometry, &params.region, wb)?,
-            None => params.region,
+        // P0-3: the target is refreshed first — inspect must use the LATEST
+        // window bounds, and a window that no longer resolves (closed /
+        // re-created / re-identified) fails closed to TARGET_UNAVAILABLE
+        // instead of clamping against stale bounds.
+        let region = if session.get_target().is_some() || session.get_resolved_target().is_some() {
+            let rt = self.refresh_resolved_target(&session).await?;
+            match rt.bounds {
+                Some(wb) => Self::clamp_region_to_window(&geometry, &params.region, wb)?,
+                None => params.region,
+            }
+        } else {
+            params.region
         };
         let (px, py, w, h) = region.to_image_pixels(&geometry)?;
 
@@ -1800,13 +1884,24 @@ mod tests {
             // full-display capture is 4x4 unless `capture_bounds` is set for a
             // realistic geometry (bounds * display scale 2.0).
             let cfg_bounds = *self.capture_bounds.lock().unwrap();
-            let (w, h) = match request.region {
+            let (mut w, mut h) = match request.region {
                 Some(r) => (r.width.max(1.0) as u32, r.height.max(1.0) as u32),
                 None => match cfg_bounds {
                     Some(b) => ((b.width * 2.0) as u32, (b.height * 2.0) as u32),
                     None => (4, 4),
                 },
             };
+            // Faithfully mirror the Swift bridge's max-width downscale
+            // (P0-1/P0-2): a crop wider than max_width is scaled to
+            // max_width wide, `floor(h * max_width / w)` tall — exactly what
+            // `captureDisplay` in CUBridge/main.swift produces. Without this
+            // the runtime's fail-closed crop check could not be exercised
+            // against a real downscaled frame.
+            if request.max_width > 0 && w > request.max_width {
+                let scale = request.max_width as f64 / w as f64;
+                w = request.max_width;
+                h = (h as f64 * scale).trunc() as u32;
+            }
             let bounds = cfg_bounds.unwrap_or(cu_core::DisplayBounds {
                 x: 0.0,
                 y: 0.0,
@@ -1895,6 +1990,18 @@ mod tests {
             _target: &cu_core::SessionTarget,
         ) -> Result<Option<cu_driver::ResolvedSessionTarget>, CuError> {
             Ok(self.resolve_result.lock().unwrap().clone())
+        }
+        async fn resolve_target_bounds(
+            &self,
+            _window_id: u32,
+        ) -> Result<Option<cu_core::DisplayBounds>, CuError> {
+            // Mirrors the macOS driver: bounds come from the same resolution.
+            Ok(self
+                .resolve_result
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|r| r.bounds))
         }
         async fn pointer_location(&self) -> Result<PointerInfo, CuError> {
             Ok(PointerInfo {
@@ -3758,9 +3865,22 @@ mod tests {
     /// can map window coords to the screen.
     #[tokio::test]
     async fn observe_is_window_scoped_when_target_has_bounds() {
-        let (rt, _fake) = runtime_with_driver().await;
+        let (rt, fake) = runtime_with_driver().await;
         let (sid, token, _frame) = start_observed(&rt).await;
         // Window at origin, 2x2 logical points → 4x4 px at the fake's 2x scale.
+        // P0-3: observe REFRESHES the target via the driver before cropping,
+        // so the fake's resolution must return the same window.
+        *fake.resolve_result.lock().unwrap() = Some(cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 4242,
+            window_id: 777,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+            }),
+        });
         {
             let sessions = rt.sessions.lock().unwrap();
             let session = sessions.get(&sid).unwrap();
@@ -3822,6 +3942,340 @@ mod tests {
         rt.session_stop(&sid, Some(&token)).await.unwrap();
     }
 
+    /// P0-1/P0-2 — a target window WIDER than the observe max_width is
+    /// legitimately downscaled by the bridge (crop → finalImage → max-width
+    /// downscale), and the runtime's fail-closed crop check must ACCEPT the
+    /// downscaled frame. This pins the "crop + downscale uses finalImage"
+    /// contract: output 1440x800 is the downscaled CROP, never a 2560px
+    /// full-desktop downscale.
+    #[tokio::test]
+    async fn observe_accepts_downscaled_wide_window_crop() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+        // Window 900x500 logical @ 2x = 1800x1000 px crop on the 1280x800
+        // logical display. Wider than max_width 1440 → downscale to
+        // 1440 wide, floor(1000 * 1440/1800) = 800 tall.
+        let resolved = cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 4242,
+            window_id: 777,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 900.0,
+                height: 500.0,
+            }),
+        };
+        *fake.resolve_result.lock().unwrap() = Some(resolved.clone());
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_resolved_target(Some(resolved));
+        }
+
+        let res = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    include_image: Some(false),
+                    control_token: Some(token.clone()),
+                    max_width: Some(1440),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.width, 1440,
+            "output must be the downscaled CROP (1440 wide), never the display"
+        );
+        assert_eq!(res.height, 800);
+        assert_eq!(res.window_id, Some(777));
+        {
+            let store = rt.frames.lock().unwrap();
+            let sf = store.get(&res.frame_id).expect("frame stored");
+            assert_eq!(sf.frame.width, 1440);
+            assert_eq!(sf.frame.height, 800);
+        }
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// P0-3 — observe re-resolves the target before EVERY capture: after the
+    /// window MOVES, the next observe uses the NEW bounds (never the stale
+    /// session-start bounds), and the crop follows the new position.
+    #[tokio::test]
+    async fn observe_uses_refreshed_bounds_after_window_moves() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+        let set_bounds =
+            |fake: &Arc<FakeDriver>, rt: &Arc<Runtime>, sid: &str, b: cu_core::DisplayBounds| {
+                *fake.resolve_result.lock().unwrap() = Some(cu_driver::ResolvedSessionTarget {
+                    bundle_id: "com.example.Target".into(),
+                    pid: 4242,
+                    window_id: 777,
+                    bounds: Some(b),
+                });
+                let sessions = rt.sessions.lock().unwrap();
+                let session = sessions.get(sid).unwrap();
+                session.set_resolved_target(Some(cu_driver::ResolvedSessionTarget {
+                    bundle_id: "com.example.Target".into(),
+                    pid: 4242,
+                    window_id: 777,
+                    bounds: Some(b),
+                }));
+            };
+
+        // Window at origin: 2x2 logical → 4x4 px crop.
+        set_bounds(
+            &fake,
+            &rt,
+            &sid,
+            cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+            },
+        );
+        let obs1 = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    include_image: Some(false),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(obs1.target_bounds.unwrap().x, 0.0);
+        assert_eq!(obs1.width, 4);
+
+        // Window MOVES to (5, 5); resolution reflects it.
+        set_bounds(
+            &fake,
+            &rt,
+            &sid,
+            cu_core::DisplayBounds {
+                x: 5.0,
+                y: 5.0,
+                width: 2.0,
+                height: 2.0,
+            },
+        );
+        let obs2 = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    include_image: Some(false),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let tb = obs2.target_bounds.unwrap();
+        assert_eq!(
+            (tb.x, tb.y),
+            (5.0, 5.0),
+            "a moved window must be observed at its NEW position"
+        );
+        assert_eq!(obs2.width, 4, "the crop still matches the 2x2 window");
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// P0-3 — when the target window is gone (resolver returns None), observe
+    /// FAILS CLOSED with TARGET_UNAVAILABLE. It never re-captures with stale
+    /// bounds and never silently re-scopes to another window.
+    #[tokio::test]
+    async fn observe_fails_closed_when_target_window_closed() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+        let resolved = cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 4242,
+            window_id: 777,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+            }),
+        };
+        *fake.resolve_result.lock().unwrap() = Some(resolved.clone());
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_resolved_target(Some(resolved));
+        }
+        // Window exists: observe succeeds.
+        rt.observe(
+            ObserveParams {
+                session_id: Some(sid.clone()),
+                include_image: Some(false),
+                control_token: Some(token.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Window closes: the resolver now returns None.
+        *fake.resolve_result.lock().unwrap() = None;
+        let err = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    include_image: Some(false),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            ErrorCode::TargetUnavailable,
+            "a closed target window must fail closed, not capture stale bounds"
+        );
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// P0-3 — the refresh must NEVER re-scope: if the original window A is
+    /// gone and the resolver would hand back a sibling window B (same app),
+    /// observe fails closed instead of silently switching targets.
+    #[tokio::test]
+    async fn observe_fails_closed_when_refresh_returns_sibling_window() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+        let resolved = cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 4242,
+            window_id: 777,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+            }),
+        };
+        *fake.resolve_result.lock().unwrap() = Some(resolved.clone());
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_resolved_target(Some(resolved));
+        }
+        rt.observe(
+            ObserveParams {
+                session_id: Some(sid.clone()),
+                include_image: Some(false),
+                control_token: Some(token.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The resolver now returns a DIFFERENT window (888) of the same app.
+        *fake.resolve_result.lock().unwrap() = Some(cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 4242,
+            window_id: 888,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+            }),
+        });
+        let err = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    include_image: Some(false),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            ErrorCode::TargetUnavailable,
+            "a sibling window must never silently replace the bound target"
+        );
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// P0-3 — inspect also refreshes the target before clamping: a window that
+    /// has since closed fails closed to TARGET_UNAVAILABLE instead of
+    /// inspecting pixels against stale bounds.
+    #[tokio::test]
+    async fn inspect_fails_closed_when_target_window_gone() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, _frame) = start_observed(&rt).await;
+        let resolved = cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 4242,
+            window_id: 777,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+            }),
+        };
+        *fake.resolve_result.lock().unwrap() = Some(resolved.clone());
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            session.set_resolved_target(Some(resolved));
+        }
+        // Capture a window-scoped frame first.
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(sid.clone()),
+                    include_image: Some(false),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let frame_id = obs.frame_id;
+
+        // The window closes before the inspect.
+        *fake.resolve_result.lock().unwrap() = None;
+        let err = rt
+            .inspect(InspectParams {
+                session_id: sid.clone(),
+                frame_id,
+                region: Region {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 1000.0,
+                    coordinate_space: CoordinateSpace::Normalized1000,
+                },
+                scale: None,
+                observation_token: None,
+                control_token: Some(token.clone()),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::TargetUnavailable);
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
     /// Round 9 / P0-6 — inspect clamps its region to the session's target
     /// window: a request covering the whole display only returns the window's
     /// pixels, and a region entirely outside the window is OutOfBounds.
@@ -3836,13 +4290,16 @@ mod tests {
             width: 1280.0,
             height: 800.0,
         });
-        // Observe the full display FIRST (no target yet).
+        // Observe the full display FIRST (no target yet). A huge max_width
+        // keeps the frame at the fake's native 2560x1600 (no bridge-style
+        // downscale) so the clamp math below stays clean.
         let obs = rt
             .observe(
                 ObserveParams {
                     session_id: Some(sid.clone()),
                     include_image: Some(false),
                     control_token: Some(token.clone()),
+                    max_width: Some(10000),
                     ..Default::default()
                 },
                 None,
@@ -3852,7 +4309,20 @@ mod tests {
         assert!(obs.target_bounds.is_none(), "no window scope yet");
         let frame_id = obs.frame_id;
 
-        // Now scope the session to a window inside that display.
+        // Now scope the session to a window inside that display. P0-3:
+        // inspect REFRESHES the target before clamping, so the fake's
+        // resolution must return the same window.
+        *fake.resolve_result.lock().unwrap() = Some(cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 4242,
+            window_id: 777,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 100.0,
+                y: 100.0,
+                width: 400.0,
+                height: 300.0,
+            }),
+        });
         {
             let sessions = rt.sessions.lock().unwrap();
             let session = sessions.get(&sid).unwrap();

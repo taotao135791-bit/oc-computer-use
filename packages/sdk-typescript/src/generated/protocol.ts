@@ -588,13 +588,15 @@ export interface PointerExecutionResult {
    */
   backend: string;
   /**
+   * P0-4: human-interrupt telemetry, present when a real human input occurred during or near this action. `human_to_input_stop_ms` is THE Human Interrupt KPI — hardware event → LAST runtime synthetic input; 0 when the agent had already stopped. `event_detection_latency_ms` is hardware event → Event Tap callback; `human_to_takeover_ms` is hardware event → takeover applied. The inverse `synthetic → human` direction is intentionally NOT exposed here (it must never be labelled as interrupt latency).
+   */
+  event_detection_latency_ms?: number;
+  /**
    * P0-2: whether a real human input occurred during the physical fallback transaction (in which case the cursor is NEVER yanked back). Absent when no physical fallback ran.
    */
   human_input_during_fallback?: boolean;
-  /**
-   * Human interrupt latency (ms) measured from the hardware event to the last synthetic input event. Present when a human interrupt occurred during or near this action.
-   */
-  human_interrupt_latency_ms?: number;
+  human_to_input_stop_ms?: number;
+  human_to_takeover_ms?: number;
   /**
    * True when the action executed without touching the real system cursor.
    */
@@ -861,13 +863,15 @@ export interface PointerExecutionResult1 {
    */
   backend: string;
   /**
+   * P0-4: human-interrupt telemetry, present when a real human input occurred during or near this action. `human_to_input_stop_ms` is THE Human Interrupt KPI — hardware event → LAST runtime synthetic input; 0 when the agent had already stopped. `event_detection_latency_ms` is hardware event → Event Tap callback; `human_to_takeover_ms` is hardware event → takeover applied. The inverse `synthetic → human` direction is intentionally NOT exposed here (it must never be labelled as interrupt latency).
+   */
+  event_detection_latency_ms?: number;
+  /**
    * P0-2: whether a real human input occurred during the physical fallback transaction (in which case the cursor is NEVER yanked back). Absent when no physical fallback ran.
    */
   human_input_during_fallback?: boolean;
-  /**
-   * Human interrupt latency (ms) measured from the hardware event to the last synthetic input event. Present when a human interrupt occurred during or near this action.
-   */
-  human_interrupt_latency_ms?: number;
+  human_to_input_stop_ms?: number;
+  human_to_takeover_ms?: number;
   /**
    * True when the action executed without touching the real system cursor.
    */

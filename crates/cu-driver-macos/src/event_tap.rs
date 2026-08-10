@@ -109,13 +109,25 @@ pub enum EventTapState {
 }
 
 impl EventTapState {
+    /// P1: the daemon-facing word for the state — "starting" while Starting,
+    /// "active" ONLY when Active, "unavailable" when Failed (never "failed":
+    /// from the operator's point of view a failed tap means hardware human
+    /// detection is unavailable, and the pointer-delta heuristic takes over).
     pub fn as_str(self) -> &'static str {
         match self {
             EventTapState::Starting => "starting",
             EventTapState::Active => "active",
-            EventTapState::Failed => "failed",
+            EventTapState::Failed => "unavailable",
             EventTapState::Stopped => "stopped",
         }
+    }
+
+    /// P1: a monitor is REPORTED live only when it is genuinely `Active`.
+    /// `Starting` is a pending, not-yet-live state — a caller that treats it
+    /// as live would believe hardware detection is authoritative before the
+    /// tap thread has finished setting up.
+    pub fn is_live(self) -> bool {
+        matches!(self, EventTapState::Active)
     }
 }
 
@@ -342,6 +354,32 @@ mod tests {
     fn tap_not_started_is_stopped() {
         let m = EventTapMonitor::new();
         assert_eq!(m.state(), EventTapState::Stopped);
+    }
+
+    #[test]
+    fn only_active_reports_live() {
+        // P1 truth table: a monitor is REPORTED active only when it is
+        // genuinely `Active`. `Starting` is a pending state — a caller must
+        // never treat it as authoritative hardware detection.
+        assert!(EventTapState::Active.is_live());
+        assert!(
+            !EventTapState::Starting.is_live(),
+            "Starting must NOT report active (pending, not yet live)"
+        );
+        assert!(
+            !EventTapState::Failed.is_live(),
+            "a failed tap must not report active"
+        );
+        assert!(
+            !EventTapState::Stopped.is_live(),
+            "a stopped tap must not report active"
+        );
+        // The daemon-facing word: "starting" / "active" / "unavailable" /
+        // "stopped" — a failed tap reads "unavailable", never "failed".
+        assert_eq!(EventTapState::Starting.as_str(), "starting");
+        assert_eq!(EventTapState::Active.as_str(), "active");
+        assert_eq!(EventTapState::Failed.as_str(), "unavailable");
+        assert_eq!(EventTapState::Stopped.as_str(), "stopped");
     }
 
     #[test]

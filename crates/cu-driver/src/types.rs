@@ -36,6 +36,31 @@ pub struct CaptureRegion {
     pub height: f64,
 }
 
+/// Expected output size of a window crop after the bridge's max-width
+/// downscale (P0-2). Mirrors `captureDisplay` in CUBridge/main.swift exactly:
+///
+/// - crop ≤ max_width (or max_width == 0, i.e. downscale disabled)
+///   → output is the crop unchanged;
+/// - crop > max_width
+///   → `scale = max_width / crop_width`, output `(max_width,
+///   floor(crop_height * scale))`. Swift computes the height as
+///   `Int(Double(h) * scale)`, which truncates toward zero — floor for
+///   positive values — so we use `.trunc()` here, NOT `.round()`.
+///
+/// The runtime's fail-closed crop check compares the captured frame against
+/// this expected size with a documented ±1px tolerance (rounding differences
+/// between Swift's CGFloat crop math and Rust's u32 math). This must stay in
+/// lockstep with the Swift `Int(Double(...) * scale)` rule or Rust/Swift will
+/// argue about one pixel forever.
+pub fn expected_crop_output_size(crop_width: u32, crop_height: u32, max_width: u32) -> (u32, u32) {
+    if max_width == 0 || crop_width <= max_width {
+        (crop_width, crop_height)
+    } else {
+        let scale = max_width as f64 / crop_width as f64;
+        (max_width, (crop_height as f64 * scale).trunc() as u32)
+    }
+}
+
 /// What the caller wants from a capture.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaptureRequest {

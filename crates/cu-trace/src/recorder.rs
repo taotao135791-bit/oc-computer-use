@@ -439,8 +439,9 @@ mod tests {
     async fn action_result_retains_pointer_telemetry() {
         // Section 三十八 test 12 / audit G: the pointer-execution result the
         // runtime writes into the action result (backend, isolation, cursor
-        // deltas, and the REAL human_interrupt_latency_ms) must survive into
-        // the trace verbatim — latency analysis reads it from the trace alone.
+        // deltas, and the REAL P0-4 interrupt telemetry — event detection,
+        // human→takeover, human→input-stop) must survive into the trace
+        // verbatim — latency analysis reads it from the trace alone.
         let dir = tempdir().unwrap();
         let rec = TraceRecorder::open("s_ptr", dir.path(), TraceConfig::default())
             .await
@@ -461,7 +462,9 @@ mod tests {
                 "physical_cursor_delta_px": 12.0,
                 "physical_cursor_restored": false,
                 "human_input_during_fallback": true,
-                "human_interrupt_latency_ms": 42
+                "event_detection_latency_ms": 1,
+                "human_to_takeover_ms": 3,
+                "human_to_input_stop_ms": 0
             }
         });
         rec.record_action(
@@ -486,7 +489,9 @@ mod tests {
         assert_eq!(p["physical_cursor_delta_px"], serde_json::json!(12.0));
         assert_eq!(p["physical_cursor_restored"], serde_json::json!(false));
         assert_eq!(p["human_input_during_fallback"], serde_json::json!(true));
-        assert_eq!(p["human_interrupt_latency_ms"], serde_json::json!(42));
+        assert_eq!(p["event_detection_latency_ms"], serde_json::json!(1));
+        assert_eq!(p["human_to_takeover_ms"], serde_json::json!(3));
+        assert_eq!(p["human_to_input_stop_ms"], serde_json::json!(0));
     }
 
     #[tokio::test]

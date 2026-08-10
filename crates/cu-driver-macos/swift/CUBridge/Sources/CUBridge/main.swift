@@ -451,16 +451,20 @@ func captureDisplay(displayId: CGDirectDisplayID, outputPath: String,
             finalImage = cropped
         }
     }
-    // Downscale so the width does not exceed maxWidth.
+    // Downscale so the width does not exceed maxWidth. P0-1: this MUST draw
+    // `finalImage` (the window crop), never the original full-display `image`.
+    // Drawing `image` here re-paints the whole desktop and silently breaks
+    // target-window isolation for every crop that needs downscaling.
     if maxWidth > 0 && finalImage.width > maxWidth {
-        let scale = Double(maxWidth) / Double(image.width)
-        let h = Int(Double(image.height) * scale)
+        let sourceImage = finalImage
+        let scale = Double(maxWidth) / Double(sourceImage.width)
+        let h = Int(Double(sourceImage.height) * scale)
         let ctx = CGContext(data: nil, width: maxWidth, height: h,
                             bitsPerComponent: 8, bytesPerRow: maxWidth * 4,
                             space: CGColorSpaceCreateDeviceRGB(),
                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         ctx?.interpolationQuality = .high
-        ctx?.draw(image, in: CGRect(x: 0, y: 0, width: maxWidth, height: h))
+        ctx?.draw(sourceImage, in: CGRect(x: 0, y: 0, width: maxWidth, height: h))
         if let scaled = ctx?.makeImage() {
             finalImage = scaled
         }

@@ -65,4 +65,41 @@ mod tests {
         let (w, h) = image_dimensions(&png).unwrap();
         assert_eq!((w, h), (200, 100));
     }
+
+    #[test]
+    fn expected_crop_output_size_is_identity_when_within_max_width() {
+        // crop ≤ max_width: no downscale, the crop size is the output size.
+        assert_eq!(
+            cu_driver::expected_crop_output_size(800, 600, 1440),
+            (800, 600)
+        );
+        // max_width == 0 disables downscale entirely.
+        assert_eq!(
+            cu_driver::expected_crop_output_size(2000, 1000, 0),
+            (2000, 1000)
+        );
+    }
+
+    #[test]
+    fn expected_crop_output_size_downscales_with_swift_truncation() {
+        // Section 四 fixture: Display 2560x1440, target window 1800x1000,
+        // max_width 1440 → scale 0.8 → output 1440 x 800 (Swift's
+        // `Int(1000 * 0.8)` truncates to 800). The output must be the CROP
+        // downscaled — never a full-desktop downscale.
+        assert_eq!(
+            cu_driver::expected_crop_output_size(1800, 1000, 1440),
+            (1440, 800)
+        );
+        // Odd heights truncate, they do not round: 1001 * 0.8 = 800.8 → 800.
+        assert_eq!(
+            cu_driver::expected_crop_output_size(1800, 1001, 1440),
+            (1440, 800)
+        );
+        // A crop already at/under the cap stays put even when the display
+        // itself would downscale.
+        assert_eq!(
+            cu_driver::expected_crop_output_size(1440, 900, 1440),
+            (1440, 900)
+        );
+    }
 }

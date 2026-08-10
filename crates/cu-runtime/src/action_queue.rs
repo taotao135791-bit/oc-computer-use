@@ -10,7 +10,9 @@
 
 use std::time::{Duration, Instant};
 
-use cu_core::{ComputerAction, CuError, ImageGeometry, Point, PointerMode, PointerPolicy};
+use cu_core::{
+    ComputerAction, CuError, ImageGeometry, MouseButton, Point, PointerMode, PointerPolicy,
+};
 use cu_driver::ComputerDriver;
 use cu_policy::{TakeoverDetector, TakeoverPolicy};
 use cu_trace::TraceRecorder;
@@ -131,7 +133,8 @@ impl<'a> ActionQueue<'a> {
                     let _ = session.transition(cu_core::SessionState::UserTakeover);
                     session.sync_pointer_mode(cu_core::SessionState::UserTakeover);
                     h.mark_takeover_started();
-                    h.mark_input_stopped();
+                    // P0-4: `human_to_input_stop_ms` is derived from
+                    // `last_synthetic_event_at`, never force-marked here.
                     // P0-1: ghost cursor must be hidden immediately — the user
                     // is back in control.
                     let _ = self.driver.pointer_hidden().await;
@@ -308,7 +311,7 @@ impl<'a> ActionQueue<'a> {
                     x,
                     y,
                     button,
-                    double: _,
+                    double,
                 } => {
                     let policy = session.get_pointer_policy();
                     let target_pid = session
@@ -340,8 +343,37 @@ impl<'a> ActionQueue<'a> {
                         }
                         Ok(_) => {
                             // Direct CG explicitly failed (rare — click_direct
-                            // is synchronous). Backend 2: AXPress, isolated.
-                            if let Some(pid) = target_pid {
+                            // is synchronous).
+                            //
+                            // Backend 2: AXPress, isolated — EXCEPT for
+                            // double-clicks (P1). AX cannot express a
+                            // double-press, so a double-click is NEVER degraded
+                            // to a single AXPress: it skips the AX backend
+                            // entirely and goes straight to the physical
+                            // double-click (only under `physical_allowed`), or
+                            // fails closed with AX_UNSUPPORTED_FOR_DOUBLE_CLICK.
+                            if *double {
+                                if matches!(policy, PointerPolicy::PhysicalAllowed) {
+                                    self.physical_fallback_click(
+                                        session,
+                                        token.clone(),
+                                        human,
+                                        display_id,
+                                        *button,
+                                        *x,
+                                        *y,
+                                        true,
+                                        started,
+                                    )
+                                    .await
+                                } else {
+                                    Ok(cu_driver::ActionResult {
+                                        success: false,
+                                        duration_ms: 0,
+                                        detail: Some("AX_UNSUPPORTED_FOR_DOUBLE_CLICK".into()),
+                                    })
+                                }
+                            } else if let Some(pid) = target_pid {
                                 // Audit G: AXPress is also real machine input.
                                 stamp_synthetic(human);
                                 match self.driver.click_via_accessibility(pid, *x, *y).await {
@@ -362,246 +394,26 @@ impl<'a> ActionQueue<'a> {
                                         // Backend 3: physical fallback ONLY
                                         // when explicitly allowed.
                                         if matches!(policy, PointerPolicy::PhysicalAllowed) {
-                                            // P0-2: the physical fallback is a REAL
-                                            // interruptible transaction:
-                                            //   1. Snapshot the cursor position and
-                                            //      the human-input generation BEFORE
-                                            //      borrowing the cursor.
-                                            //   2. Refuse to start while the user is
-                                            //      actively operating (HUMAN_TAKEOVER).
-                                            //   3. Warp + restore share the batch
-                                            //      token (execute_with_cancel), so a
-                                            //      human event aborts them mid-path.
-                                            //   4. Restore ONLY when no human input
-                                            //      occurred mid-flight; otherwise the
-                                            //      cursor is NEVER yanked back and the
-                                            //      queue's real-takeover consume
-                                            //      completes the UserTakeover.
-                                            let before = self
-                                                .driver
-                                                .pointer_location()
-                                                .await
-                                                .ok()
-                                                .map(|p| p.location);
-                                            let generation_before =
-                                                human.map(|h| h.human_event_generation());
-                                            let be = match before {
-                                                Some(bp) => {
-                                                    // Req 2: the user is at the mouse
-                                                    // right now — do not borrow it.
-                                                    if human
-                                                        .and_then(|h| h.idle_secs())
-                                                        .map(|s| {
-                                                            s < PHYSICAL_FALLBACK_IDLE_GUARD_SECS
-                                                        })
-                                                        .unwrap_or(false)
-                                                    {
-                                                        Ok(cu_driver::ActionResult {
-                                                            success: false,
-                                                            duration_ms: started
-                                                                .elapsed()
-                                                                .as_millis()
-                                                                as u64,
-                                                            detail: Some("HUMAN_TAKEOVER".into()),
-                                                        })
-                                                    } else {
-                                                        // Req 3a: warp the real cursor
-                                                        // through the shared batch token.
-                                                        // Audit G: stamp the synthetic
-                                                        // event BEFORE the warp — the
-                                                        // human can grab DURING the warp,
-                                                        // and the interrupt-latency chain
-                                                        // measures the gap from this
-                                                        // stamp to that grab.
-                                                        // Audit: switch the ghost cursor
-                                                        // into the physical-fallback
-                                                        // visual state while the real
-                                                        // cursor is borrowed (this state
-                                                        // was previously unreachable);
-                                                        // it is restored below.
-                                                        session
-                                                            .virtual_pointer
-                                                            .lock()
-                                                            .unwrap()
-                                                            .set_mode(
-                                                                PointerMode::PhysicalFallback,
-                                                            );
-                                                        let _ = self
-                                                            .driver
-                                                            .pointer_visualized(
-                                                                bp.x,
-                                                                bp.y,
-                                                                display_id,
-                                                                PointerMode::PhysicalFallback,
-                                                            )
-                                                            .await;
-                                                        stamp_synthetic(human);
-                                                        let warp = self
-                                                            .driver
-                                                            .execute_with_cancel(
-                                                                &cu_driver::ResolvedAction::Move {
-                                                                    from: bp,
-                                                                    to: cu_core::Point::new(*x, *y),
-                                                                    duration_ms: None,
-                                                                },
-                                                                token.clone(),
-                                                            )
-                                                            .await;
-                                                        if !matches!(warp, Ok(ar) if ar.success) {
-                                                            // The warp was interrupted
-                                                            // (human grabbed the mouse).
-                                                            // Do NOT click.
-                                                            Ok(cu_driver::ActionResult {
-                                                                success: false,
-                                                                duration_ms: started
-                                                                    .elapsed()
-                                                                    .as_millis()
-                                                                    as u64,
-                                                                detail: Some(
-                                                                    "cancelled by user takeover"
-                                                                        .into(),
-                                                                ),
-                                                            })
-                                                        } else {
-                                                            // The click is a synchronous
-                                                            // CGEvent post (microseconds).
-                                                            let phys = self
-                                                                .driver
-                                                                .physical_click_at(*button, *x, *y)
-                                                                .await;
-                                                            // Audit: visible click-ripple
-                                                            // confirmation at the click
-                                                            // point (previously
-                                                            // unreachable).
-                                                            let _ = self
-                                                                .driver
-                                                                .pointer_click_ripple(*x, *y)
-                                                                .await;
-                                                            // Req 4: did the user touch
-                                                            // anything mid-flight?
-                                                            let human_touched = match (
-                                                                generation_before,
-                                                                human.map(|h| {
-                                                                    h.human_event_generation()
-                                                                }),
-                                                            ) {
-                                                                (Some(b), Some(a)) => a != b,
-                                                                _ => false,
-                                                            };
-                                                            if human_touched {
-                                                                // NEVER yank the cursor
-                                                                // back. The queue's next
-                                                                // consume_real_takeover
-                                                                // transitions to
-                                                                // UserTakeover.
-                                                                // Audit: the user took over —
-                                                                // reflect it in the ghost
-                                                                // mode and hide the overlay
-                                                                // (the real cursor is in
-                                                                // their hands).
-                                                                session
-                                                                    .virtual_pointer
-                                                                    .lock()
-                                                                    .unwrap()
-                                                                    .set_mode(
-                                                                        PointerMode::UserTakeover,
-                                                                    );
-                                                                let _ = self
-                                                                    .driver
-                                                                    .pointer_hidden()
-                                                                    .await;
-                                                                // Audit G: the interrupt
-                                                                // latency is REAL — measured
-                                                                // from the warp stamp to the
-                                                                // grab — and rides the action
-                                                                // result into the trace.
-                                                                let interrupt_latency =
-                                                                    human.and_then(|h| {
-                                                                        h.human_interrupt_latency_ms()
-                                                                    });
-                                                                let mut detail =
-                                                                    "pointer_backend:physical;isolated:false;physical_cursor_moved:true;physical_cursor_restored:false;human_input_during_fallback:true"
-                                                                        .to_string();
-                                                                if let Some(lat) = interrupt_latency
-                                                                {
-                                                                    detail.push_str(&format!(
-                                                                        ";human_interrupt_latency_ms:{lat}"
-                                                                    ));
-                                                                }
-                                                                phys.map(|ok| {
-                                                                    cu_driver::ActionResult {
-                                                                        success: ok,
-                                                                        duration_ms: started
-                                                                            .elapsed()
-                                                                            .as_millis()
-                                                                            as u64,
-                                                                        detail: Some(detail),
-                                                                    }
-                                                                })
-                                                            } else {
-                                                                // Req 3b: restore through
-                                                                // the SAME token (a grab
-                                                                // during restore aborts).
-                                                                let _ = self
-                                                                    .driver
-                                                                    .execute_with_cancel(
-                                                                        &cu_driver::ResolvedAction::Move {
-                                                                            from: cu_core::Point::new(
-                                                                                *x, *y,
-                                                                            ),
-                                                                            to: bp,
-                                                                            duration_ms: None,
-                                                                        },
-                                                                        token.clone(),
-                                                                    )
-                                                                    .await;
-                                                                // Audit: the fallback ended
-                                                                // without a grab — restore
-                                                                // the ghost mode + re-show
-                                                                // the overlay at the home
-                                                                // position.
-                                                                session
-                                                                    .virtual_pointer
-                                                                    .lock()
-                                                                    .unwrap()
-                                                                    .set_mode(
-                                                                        PointerMode::Isolated,
-                                                                    );
-                                                                let _ = self
-                                                                    .driver
-                                                                    .pointer_visualized(
-                                                                        bp.x,
-                                                                        bp.y,
-                                                                        display_id,
-                                                                        PointerMode::Isolated,
-                                                                    )
-                                                                    .await;
-                                                                phys.map(|ok| {
-                                                                    cu_driver::ActionResult {
-                                                                        success: ok,
-                                                                        duration_ms: started
-                                                                            .elapsed()
-                                                                            .as_millis()
-                                                                            as u64,
-                                                                        detail: Some(
-                                                                            "pointer_backend:physical;isolated:false;physical_cursor_moved:true;physical_cursor_restored:true;human_input_during_fallback:false"
-                                                                                .into(),
-                                                                        ),
-                                                                    }
-                                                                })
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                None => Ok(cu_driver::ActionResult {
-                                                    success: false,
-                                                    duration_ms: 0,
-                                                    detail: Some(
-                                                        "ISOLATED_POINTER_UNAVAILABLE".into(),
-                                                    ),
-                                                }),
-                                            };
-                                            be
+                                            // The full interruptible physical
+                                            // transaction lives in
+                                            // `physical_fallback_click` (P0-2,
+                                            // P0-5, P1): cursor snapshot + idle
+                                            // guard + human-grab checks before
+                                            // AND after the warp and after the
+                                            // click, a DRIVER-confirmed restore,
+                                            // and the P0-4 interrupt telemetry.
+                                            self.physical_fallback_click(
+                                                session,
+                                                token.clone(),
+                                                human,
+                                                display_id,
+                                                *button,
+                                                *x,
+                                                *y,
+                                                false,
+                                                started,
+                                            )
+                                            .await
                                         } else {
                                             // isolated_only / isolated_preferred
                                             // with no explicit physical -> fail.
@@ -685,7 +497,7 @@ impl<'a> ActionQueue<'a> {
                                 let _ = session.transition(cu_core::SessionState::UserTakeover);
                                 session.sync_pointer_mode(cu_core::SessionState::UserTakeover);
                                 h.mark_takeover_started();
-                                h.mark_input_stopped();
+                                // P0-4: no force-mark of input-stop (see above).
                                 let _ = self.driver.pointer_hidden().await;
                                 wait_interrupted = true;
                                 break;
@@ -786,9 +598,11 @@ impl<'a> ActionQueue<'a> {
                     result_json["error"] = serde_json::json!(detail);
                 }
                 // Audit G: the pointer-execution result (backend, isolation,
-                // cursor deltas, and the REAL human_interrupt_latency_ms) is
-                // recorded into the trace so benchmark / latency analysis can
-                // read it without re-deriving it from the action type.
+                // cursor deltas, and the REAL P0-4 interrupt telemetry —
+                // event_detection_latency_ms / human_to_takeover_ms /
+                // human_to_input_stop_ms) is recorded into the trace so
+                // benchmark / latency analysis can read it without re-deriving
+                // it from the action type.
                 if let Some(pointer) = reports.last().and_then(|r| r.pointer.clone()) {
                     result_json["pointer"] = serde_json::to_value(&pointer).unwrap_or_default();
                 }
@@ -833,6 +647,200 @@ impl<'a> ActionQueue<'a> {
         }
 
         Ok(reports)
+    }
+
+    /// Round 9 / P0-2 + P0-5 + P1: the PHYSICAL fallback is a REAL
+    /// interruptible transaction. EVERY stage re-checks the batch token AND
+    /// the human-event generation before proceeding:
+    ///
+    /// 1. snapshot cursor + generation BEFORE borrowing the cursor;
+    /// 2. refuse to start while the user is actively operating
+    ///    (HUMAN_TAKEOVER);
+    /// 3. warp the real cursor (shared token);
+    ///    → human during/after warp: DO NOT CLICK, DO NOT RESTORE;
+    /// 4. click (synchronous CGEvent post); `double == true` posts the
+    ///    state-1 pair then the state-2 pair via
+    ///    [`ComputerDriver::physical_double_click_at`] so the OS treats it as
+    ///    a real double-click — NEVER two single clicks, and never a single
+    ///    AXPress (P1);
+    ///    → human after click: DO NOT RESTORE;
+    /// 5. restore ONLY when no human input occurred at ANY stage; the restore
+    ///    success is the DRIVER's real result, never assumed.
+    #[allow(clippy::too_many_arguments)] // one coherent transaction boundary
+    async fn physical_fallback_click(
+        &self,
+        session: &SharedSession,
+        token: CancellationToken,
+        human: Option<&HumanInputMonitor>,
+        display_id: &str,
+        button: MouseButton,
+        x: f64,
+        y: f64,
+        double: bool,
+        started: Instant,
+    ) -> Result<cu_driver::ActionResult, CuError> {
+        let before = self
+            .driver
+            .pointer_location()
+            .await
+            .ok()
+            .map(|p| p.location);
+        let generation_before = human.map(|h| h.human_event_generation());
+        let be = match before {
+            Some(bp) => {
+                // Req 2: the user is at the mouse right now — do not borrow it.
+                if human
+                    .and_then(|h| h.idle_secs())
+                    .map(|s| s < PHYSICAL_FALLBACK_IDLE_GUARD_SECS)
+                    .unwrap_or(false)
+                {
+                    Ok(cu_driver::ActionResult {
+                        success: false,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        detail: Some("HUMAN_TAKEOVER".into()),
+                    })
+                } else if human_grabbed(&token, generation_before, human) {
+                    // P0-5: the user grabbed between the snapshot and the
+                    // warp — never borrow the cursor.
+                    Ok(cu_driver::ActionResult {
+                        success: false,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        detail: Some("cancelled by user takeover".into()),
+                    })
+                } else {
+                    // Req 3a: warp the real cursor through the shared batch
+                    // token. Audit G: stamp the synthetic event BEFORE the
+                    // warp — the human can grab DURING the warp, and the
+                    // interrupt chain measures the gap from this stamp to
+                    // that grab. The ghost cursor switches to the
+                    // physical-fallback state while the real cursor is
+                    // borrowed (restored below).
+                    session
+                        .virtual_pointer
+                        .lock()
+                        .unwrap()
+                        .set_mode(PointerMode::PhysicalFallback);
+                    let _ = self
+                        .driver
+                        .pointer_visualized(bp.x, bp.y, display_id, PointerMode::PhysicalFallback)
+                        .await;
+                    stamp_synthetic(human);
+                    let warp = self
+                        .driver
+                        .execute_with_cancel(
+                            &cu_driver::ResolvedAction::Move {
+                                from: bp,
+                                to: cu_core::Point::new(x, y),
+                                duration_ms: None,
+                            },
+                            token.clone(),
+                        )
+                        .await;
+                    if !matches!(warp, Ok(ar) if ar.success)
+                        || human_grabbed(&token, generation_before, human)
+                    {
+                        // P0-5: the warp was interrupted OR the user grabbed
+                        // during/after it. DO NOT CLICK, DO NOT RESTORE.
+                        // Reflect the takeover in the ghost mode + hide the
+                        // overlay (the real cursor is in the user's hands).
+                        session
+                            .virtual_pointer
+                            .lock()
+                            .unwrap()
+                            .set_mode(PointerMode::UserTakeover);
+                        let _ = self.driver.pointer_hidden().await;
+                        // P0-4: the interrupt telemetry rides the failure
+                        // detail so the interrupt is never lost.
+                        let mut detail = "cancelled by user takeover".to_string();
+                        detail.push_str(&interrupt_telemetry_suffix(human));
+                        Ok(cu_driver::ActionResult {
+                            success: false,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            detail: Some(detail),
+                        })
+                    } else {
+                        // The click is a synchronous CGEvent post
+                        // (microseconds). Audit G (P0-4): the click is itself
+                        // real machine input — stamp before posting. P1: a
+                        // double-click posts the state-1 pair then the
+                        // state-2 pair — the physical backend preserves
+                        // double-click semantics, never a single click.
+                        stamp_synthetic(human);
+                        let phys = if double {
+                            self.driver.physical_double_click_at(button, x, y).await
+                        } else {
+                            self.driver.physical_click_at(button, x, y).await
+                        };
+                        // Audit: visible click-ripple confirmation at the
+                        // click point.
+                        let _ = self.driver.pointer_click_ripple(x, y).await;
+                        if human_grabbed(&token, generation_before, human) {
+                            // P0-5: the user grabbed after the click — DO NOT
+                            // RESTORE (never yank the cursor back).
+                            session
+                                .virtual_pointer
+                                .lock()
+                                .unwrap()
+                                .set_mode(PointerMode::UserTakeover);
+                            let _ = self.driver.pointer_hidden().await;
+                            // Audit G (P0-4): the interrupt telemetry is REAL
+                            // and rides the action result into the trace.
+                            let mut detail =
+                                "pointer_backend:physical;isolated:false;physical_cursor_moved:true;physical_cursor_restored:false;human_input_during_fallback:true"
+                                    .to_string();
+                            detail.push_str(&interrupt_telemetry_suffix(human));
+                            phys.map(|ok| cu_driver::ActionResult {
+                                success: ok,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                detail: Some(detail),
+                            })
+                        } else {
+                            // Req 3b: restore through the SAME token (a grab
+                            // during restore aborts). P0-5: the restore's
+                            // success is the DRIVER's real result, never
+                            // assumed.
+                            let restore = self
+                                .driver
+                                .execute_with_cancel(
+                                    &cu_driver::ResolvedAction::Move {
+                                        from: cu_core::Point::new(x, y),
+                                        to: bp,
+                                        duration_ms: None,
+                                    },
+                                    token.clone(),
+                                )
+                                .await;
+                            let restore_ok = matches!(restore, Ok(ar) if ar.success);
+                            // Audit: the fallback ended without a grab —
+                            // restore the ghost mode + re-show the overlay at
+                            // the home position.
+                            session
+                                .virtual_pointer
+                                .lock()
+                                .unwrap()
+                                .set_mode(PointerMode::Isolated);
+                            let _ = self
+                                .driver
+                                .pointer_visualized(bp.x, bp.y, display_id, PointerMode::Isolated)
+                                .await;
+                            phys.map(|ok| cu_driver::ActionResult {
+                                success: ok,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                detail: Some(format!(
+                                    "pointer_backend:physical;isolated:false;physical_cursor_moved:true;physical_cursor_restored:{restore_ok};human_input_during_fallback:false"
+                                )),
+                            })
+                        }
+                    }
+                }
+            }
+            None => Ok(cu_driver::ActionResult {
+                success: false,
+                duration_ms: 0,
+                detail: Some("ISOLATED_POINTER_UNAVAILABLE".into()),
+            }),
+        };
+        be
     }
 
     /// Convert a wire action into a driver action in global points.
@@ -977,6 +985,40 @@ fn stamp_synthetic(human: Option<&HumanInputMonitor>) {
     }
 }
 
+/// P0-4: build the `;key:value` interrupt-telemetry suffix for a physical
+/// fallback detail string from the monitor's REAL measurements. Only fields
+/// that have a value are appended; a grab with nothing measurable stays empty.
+fn interrupt_telemetry_suffix(human: Option<&HumanInputMonitor>) -> String {
+    let mut s = String::new();
+    if let Some(d) = human.and_then(|h| h.event_detection_latency_ms()) {
+        s.push_str(&format!(";event_detection_latency_ms:{d}"));
+    }
+    if let Some(t) = human.and_then(|h| h.event_to_takeover_ms()) {
+        s.push_str(&format!(";human_to_takeover_ms:{t}"));
+    }
+    if let Some(st) = human.and_then(|h| h.human_to_input_stop_ms()) {
+        s.push_str(&format!(";human_to_input_stop_ms:{st}"));
+    }
+    s
+}
+
+/// P0-5: did the user grab the machine since the transaction snapshot? The
+/// batch token firing (cancel / stop — the human-event hook cancels the batch
+/// AT EVENT TIME) OR a real human event (the generation moved past the
+/// snapshot) both mean the user is in control. EVERY physical fallback stage
+/// re-checks this before proceeding.
+fn human_grabbed(
+    token: &CancellationToken,
+    generation_before: Option<u64>,
+    human: Option<&HumanInputMonitor>,
+) -> bool {
+    token.is_cancelled()
+        || match (generation_before, human.map(|h| h.human_event_generation())) {
+            (Some(b), Some(a)) => a != b,
+            _ => false,
+        }
+}
+
 /// Whether an action relocates the pointer by design (so its own movement is
 /// never mistaken for a human grab).
 /// The global location (if any) an action will act on, for target-bound checks.
@@ -1054,7 +1096,9 @@ fn parse_pointer_detail(detail: &str) -> Option<cu_core::PointerExecutionResult>
     let mut delta_px = 0.0f64;
     let mut restored = None;
     let mut human_during_fallback = None;
-    let mut interrupt_latency = None;
+    let mut event_detection_latency_ms = None;
+    let mut human_to_takeover_ms = None;
+    let mut human_to_input_stop_ms = None;
     for part in detail.split(';') {
         let mut kv = part.splitn(2, ':');
         let (k, v) = (kv.next()?, kv.next()?);
@@ -1065,7 +1109,9 @@ fn parse_pointer_detail(detail: &str) -> Option<cu_core::PointerExecutionResult>
             "physical_cursor_delta_px" => delta_px = v.parse().unwrap_or(0.0),
             "physical_cursor_restored" => restored = v.parse::<bool>().ok(),
             "human_input_during_fallback" => human_during_fallback = v.parse::<bool>().ok(),
-            "human_interrupt_latency_ms" => interrupt_latency = v.parse::<u64>().ok(),
+            "event_detection_latency_ms" => event_detection_latency_ms = v.parse::<u64>().ok(),
+            "human_to_takeover_ms" => human_to_takeover_ms = v.parse::<u64>().ok(),
+            "human_to_input_stop_ms" => human_to_input_stop_ms = v.parse::<u64>().ok(),
             _ => {}
         }
     }
@@ -1076,7 +1122,9 @@ fn parse_pointer_detail(detail: &str) -> Option<cu_core::PointerExecutionResult>
         physical_cursor_delta_px: delta_px,
         physical_cursor_restored: restored,
         human_input_during_fallback: human_during_fallback,
-        human_interrupt_latency_ms: interrupt_latency,
+        event_detection_latency_ms,
+        human_to_takeover_ms,
+        human_to_input_stop_ms,
     })
 }
 
@@ -1146,9 +1194,23 @@ mod tests {
     struct PhysicalFallbackDriver {
         /// Moves executed (warp + optional restore), in order.
         moves: std::sync::Mutex<Vec<cu_core::Point>>,
+        /// Physical SINGLE clicks posted (P0-5: human during warp must
+        /// suppress the click entirely; assertable as clicks == 0).
+        clicks: std::sync::atomic::AtomicUsize,
+        /// Physical DOUBLE-clicks posted via `physical_double_click_at` (P1:
+        /// a double-click's physical fallback must be a real click-click, not
+        /// two single clicks — assertable as clicks == 0 && double_clicks == 1).
+        double_clicks: std::sync::atomic::AtomicUsize,
+        /// AXPress attempts (P1: a double-click must NEVER reach the single
+        /// AXPress backend — assertable as ax_calls == 0).
+        ax_calls: std::sync::atomic::AtomicUsize,
         /// When true, the first Move (the warp) fires a real human event
         /// mid-path — simulating the user grabbing the mouse during the warp.
         human_grab_during_warp: std::sync::atomic::AtomicBool,
+        /// When true, the physical click fires a real human event AFTER the
+        /// click posts — simulating the user grabbing the mouse right after
+        /// the click (P0-5: must suppress the restore, not the click).
+        human_grab_at_click: std::sync::atomic::AtomicBool,
         /// The human monitor the warp reports into (for the grab simulation).
         human: std::sync::Mutex<Option<std::sync::Arc<HumanInputMonitor>>>,
         /// Current physical pointer (what `pointer_location` reports).
@@ -1159,7 +1221,11 @@ mod tests {
         fn default() -> Self {
             Self {
                 moves: std::sync::Mutex::new(Vec::new()),
+                clicks: std::sync::atomic::AtomicUsize::new(0),
+                double_clicks: std::sync::atomic::AtomicUsize::new(0),
+                ax_calls: std::sync::atomic::AtomicUsize::new(0),
                 human_grab_during_warp: std::sync::atomic::AtomicBool::new(false),
+                human_grab_at_click: std::sync::atomic::AtomicBool::new(false),
                 human: std::sync::Mutex::new(None),
                 pointer: std::sync::Mutex::new(cu_core::Point::new(10.0, 10.0)),
             }
@@ -1223,6 +1289,29 @@ mod tests {
             _x: f64,
             _y: f64,
         ) -> Result<bool, CuError> {
+            // P0-5 case 3: simulate the user grabbing the mouse AFTER the click
+            // posts — before the restore would run.
+            if self
+                .human_grab_at_click
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(h) = self.human.lock().unwrap().clone() {
+                    h.record_human_event(std::time::Instant::now());
+                }
+            }
+            self.clicks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn physical_double_click_at(
+            &self,
+            _button: MouseButton,
+            _x: f64,
+            _y: f64,
+        ) -> Result<bool, CuError> {
+            self.double_clicks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(true)
         }
 
@@ -1232,6 +1321,9 @@ mod tests {
             _x: f64,
             _y: f64,
         ) -> Result<bool, CuError> {
+            // P1: a double-click must NEVER reach the single AXPress backend.
+            self.ax_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(false) // unavailable -> forces the physical fallback
         }
 
@@ -1344,6 +1436,73 @@ mod tests {
         (session, runs)
     }
 
+    /// Run a single DoubleClick through the queue under a given pointer policy
+    /// (P1): a double-click whose Direct CG path fails must skip the single
+    /// AXPress backend entirely and reach the physical double-click only under
+    /// `PhysicalAllowed`, or fail closed with AX_UNSUPPORTED_FOR_DOUBLE_CLICK.
+    async fn run_double_click_with_policy(
+        fake: &dyn ComputerDriver,
+        human: Option<&HumanInputMonitor>,
+        policy: PointerPolicy,
+    ) -> (std::sync::Arc<Session>, Vec<ActionRun>) {
+        let queue = ActionQueue::new(fake);
+        let session = std::sync::Arc::new(Session::new(
+            "s".into(),
+            "1".into(),
+            "test".into(),
+            None,
+            cu_core::SecretTokenHash::from_token(&cu_core::generate_control_token()),
+            cu_core::SecretTokenHash::from_token(&cu_core::generate_observation_token()),
+            None,
+        ));
+        session.set_pointer_policy(policy);
+        session.set_target(Some(SessionTarget {
+            bundle_id: None,
+            pid: Some(42),
+            window_id: None,
+        }));
+        let geometry = ImageGeometry {
+            image_width_px: 1280,
+            image_height_px: 800,
+            display_bounds: cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1280.0,
+                height: 800.0,
+            },
+        };
+        let actions = vec![ComputerAction::DoubleClick {
+            x: 1000.0,
+            y: 800.0,
+            button: MouseButton::Left,
+            coordinate_space: CoordinateSpace::Normalized1000,
+        }];
+        let token = CancellationToken::new();
+        let mut takeover = TakeoverDetector {
+            policy: TakeoverPolicy::AutoPause,
+            ..Default::default()
+        };
+        let runs = queue
+            .run(
+                &session,
+                &actions,
+                &geometry,
+                token,
+                &mut takeover,
+                human,
+                None,
+                None,
+                "f",
+                "1",
+                None,
+                (),
+                Some("active"),
+            )
+            .await
+            .unwrap();
+        (session, runs)
+    }
+
     #[tokio::test]
     async fn physical_fallback_restores_when_no_human_input() {
         let fake = Arc::new(PhysicalFallbackDriver::default());
@@ -1369,7 +1528,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn physical_fallback_never_yanks_cursor_when_human_input_during_fallback() {
+    async fn physical_fallback_does_not_click_when_human_grabs_during_warp() {
+        // P0-5: the user grabbed the mouse DURING the warp. The click must NOT
+        // be posted (human after warp → DO NOT CLICK) and the cursor must NOT
+        // be restored (only the warp move happened).
         let fake = Arc::new(PhysicalFallbackDriver::default());
         let human = Arc::new(HumanInputMonitor::new());
         // The warp itself triggers a real human event mid-path (user grab).
@@ -1378,46 +1540,97 @@ mod tests {
         *fake.human.lock().unwrap() = Some(human.clone());
         let runs = run_physical_click(fake.as_ref(), Some(human.as_ref())).await;
         assert_eq!(runs.len(), 1);
-        let p = runs[0].pointer.clone().unwrap();
-        assert_eq!(p.backend, "physical");
-        // The cursor was NEVER restored (only the warp move happened).
+        assert_eq!(runs[0].status, "failed");
         assert_eq!(
             fake.moves.lock().unwrap().len(),
             1,
-            "a human grab during the fallback must suppress the restore"
+            "only the warp — no restore after a grab"
         );
-        assert_eq!(p.physical_cursor_restored, Some(false));
-        assert_eq!(p.human_input_during_fallback, Some(true));
-        // Audit G: the interrupt latency is REAL (measured from the warp stamp
-        // to the grab), never a fabricated 0 or None.
+        assert_eq!(
+            fake.clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "human after warp → DO NOT CLICK"
+        );
+        // P0-4: the real interrupt telemetry rides the failure detail so the
+        // interrupt is never lost.
+        let err = runs[0]
+            .error
+            .as_deref()
+            .expect("a failed action carries an error");
+        assert!(err.contains("cancelled by user takeover"), "got: {err}");
         assert!(
-            p.human_interrupt_latency_ms.is_some(),
-            "a human interrupt during a physical fallback must carry a real latency"
+            err.contains("event_detection_latency_ms:"),
+            "detection latency lost from the failure detail: {err}"
         );
-        // Audit G: the backends stamped synthetic events (synthetic_count > 0).
+        assert!(
+            err.contains("human_to_input_stop_ms:"),
+            "input-stop latency lost from the failure detail: {err}"
+        );
+        // Audit G: the physical fallback stamped synthetic events (the warp).
         assert!(
             human.synthetic_count() > 0,
-            "the click backends must stamp synthetic input events"
+            "the physical fallback must stamp synthetic input events"
         );
     }
 
     #[tokio::test]
-    async fn human_interrupt_latency_is_real_number_when_grab_follows_input() {
-        // Directly exercise the metric the detail string carries: a synthetic
-        // input stamp followed by a real human event yields a real latency,
-        // and a human event with NO preceding synthetic stamp yields None.
+    async fn physical_fallback_never_restores_when_human_grabs_after_click() {
+        // P0-5: the click landed, THEN the user grabbed the mouse. The click
+        // is reported (it did happen), but the cursor must NEVER be yanked
+        // back — no restore (human after click → DO NOT RESTORE).
+        let fake = Arc::new(PhysicalFallbackDriver::default());
+        let human = Arc::new(HumanInputMonitor::new());
+        fake.human_grab_at_click
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *fake.human.lock().unwrap() = Some(human.clone());
+        let runs = run_physical_click(fake.as_ref(), Some(human.as_ref())).await;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "success", "the click did land");
+        assert_eq!(
+            fake.clicks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the click was posted"
+        );
+        assert_eq!(
+            fake.moves.lock().unwrap().len(),
+            1,
+            "warp only — no restore after a grab"
+        );
+        let p = runs[0].pointer.clone().unwrap();
+        assert_eq!(p.backend, "physical");
+        assert_eq!(p.physical_cursor_restored, Some(false));
+        assert_eq!(p.human_input_during_fallback, Some(true));
+        // P0-4: the KPI is real — the click stamp preceded the grab, so the
+        // agent had already stopped: 0. Detection latency is carried too.
+        assert_eq!(p.human_to_input_stop_ms, Some(0));
+        assert!(
+            p.event_detection_latency_ms.is_some(),
+            "a human interrupt must carry detection latency"
+        );
+    }
+
+    #[tokio::test]
+    async fn human_to_input_stop_is_real_number_when_synthetic_follows_human() {
+        // Directly exercise the P0-4 KPI the detail string carries: a real
+        // human event followed by a LATE synthetic stamp yields a positive
+        // `human_to_input_stop_ms` (how long after the user's input the agent's
+        // LAST input landed). A human event with NO synthetic after it yields
+        // exactly 0 — never None, never negative.
         let m = HumanInputMonitor::new();
-        assert_eq!(m.human_interrupt_latency_ms(), None);
-        m.record_synthetic_event(std::time::Instant::now());
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(m.human_to_input_stop_ms(), None);
         m.record_human_event(std::time::Instant::now());
-        let lat = m.human_interrupt_latency_ms();
-        assert!(lat.is_some(), "grab after input must carry a latency");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        m.record_synthetic_event(std::time::Instant::now());
+        let lat = m.human_to_input_stop_ms();
+        assert!(
+            lat.is_some(),
+            "a late synthetic after the grab must carry a stop latency"
+        );
         assert!(lat.unwrap() >= 1, "a 2ms gap must not read as 0ms");
-        // A purely human-initiated interrupt (no synthetic input first): None.
+        // A human event with no synthetic after it: exactly 0.
         let m2 = HumanInputMonitor::new();
         m2.record_human_event(std::time::Instant::now());
-        assert_eq!(m2.human_interrupt_latency_ms(), None);
+        assert_eq!(m2.human_to_input_stop_ms(), Some(0));
     }
 
     #[tokio::test]
@@ -1607,7 +1820,8 @@ mod tests {
             "a clean physical fallback must restore the ghost to the isolated state"
         );
 
-        // Interrupted fallback (human grabs during the warp): UserTakeover.
+        // Interrupted fallback (human grabs during the warp): P0-5 — no click,
+        // no restore, and the ghost stays in the takeover state.
         let fake2 = Arc::new(PhysicalFallbackDriver::default());
         let human2 = Arc::new(HumanInputMonitor::new());
         fake2
@@ -1616,11 +1830,101 @@ mod tests {
         *fake2.human.lock().unwrap() = Some(human2.clone());
         let (session2, runs2) =
             run_physical_click_with_session(fake2.as_ref(), Some(human2.as_ref())).await;
-        assert_eq!(runs2[0].status, "success"); // the click still posted
+        assert_eq!(runs2[0].status, "failed"); // no click was posted
         assert_eq!(
             session2.pointer_mode(),
             cu_core::PointerMode::UserTakeover,
             "a human interrupt must leave the ghost in the takeover state"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // P1: DoubleClick fallback keeps double-click semantics
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn double_click_physical_fallback_preserves_semantics() {
+        // P1: a double-click whose Direct CG path failed must NEVER be degraded
+        // to a single AXPress. The physical fallback (under physical_allowed)
+        // is a real click-click — the driver's `physical_double_click_at`
+        // posts the state-1 pair then the state-2 pair.
+        let fake = Arc::new(PhysicalFallbackDriver::default());
+        let human = Arc::new(HumanInputMonitor::new());
+        let (session, runs) = run_double_click_with_policy(
+            fake.as_ref(),
+            Some(human.as_ref()),
+            PointerPolicy::PhysicalAllowed,
+        )
+        .await;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].status, "success",
+            "the physical double-click landed"
+        );
+        assert_eq!(
+            fake.ax_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a double-click must NEVER be degraded to a single AXPress"
+        );
+        assert_eq!(
+            fake.clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the physical fallback must NOT post two single clicks"
+        );
+        assert_eq!(
+            fake.double_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the physical fallback posts ONE click-click pair (state 1 then 2)"
+        );
+        assert_eq!(
+            fake.moves.lock().unwrap().len(),
+            2,
+            "warp + restore: the cursor must return to its origin"
+        );
+        let p = runs[0].pointer.clone().unwrap();
+        assert_eq!(p.backend, "physical");
+        assert!(!p.isolated);
+        assert!(p.physical_cursor_moved);
+        assert_eq!(p.physical_cursor_restored, Some(true));
+        assert_eq!(p.human_input_during_fallback, Some(false));
+        assert_eq!(
+            session.pointer_mode(),
+            cu_core::PointerMode::Isolated,
+            "a clean physical double-click restores the ghost to isolated"
+        );
+    }
+
+    #[tokio::test]
+    async fn double_click_fails_closed_when_physical_not_allowed() {
+        // P1: without `physical_allowed`, the double-click fails CLOSED with
+        // the explicit AX_UNSUPPORTED_FOR_DOUBLE_CLICK — it is never silently
+        // degraded to a single AXPress or a single physical click.
+        let fake = Arc::new(PhysicalFallbackDriver::default());
+        let runs =
+            run_double_click_with_policy(fake.as_ref(), None, PointerPolicy::IsolatedPreferred)
+                .await
+                .1;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(
+            runs[0].error.as_deref(),
+            Some("AX_UNSUPPORTED_FOR_DOUBLE_CLICK")
+        );
+        assert_eq!(
+            fake.ax_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "never a single AXPress, even when failing closed"
+        );
+        assert_eq!(
+            fake.double_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no physical input without physical_allowed"
+        );
+        assert_eq!(
+            fake.clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no single click either"
+        );
+        assert_eq!(fake.moves.lock().unwrap().len(), 0, "no cursor borrowed");
     }
 }

@@ -104,17 +104,31 @@ pub(crate) async fn serve_with(
     // touch a real macOS Event Tap.
     if config.enable_human_input {
         let monitor = runtime.human_input.clone();
-        let started = driver.start_human_input_monitor(Box::new(move |latency_ms| {
+        driver.start_human_input_monitor(Box::new(move |latency_ms| {
             monitor.on_human_event(latency_ms);
         }));
-        if started {
-            tracing::info!(event_tap = true, "human-input monitor active");
-        } else {
-            tracing::warn!(
-                event_tap = false,
-                state = driver.human_input_monitor_state().unwrap_or_default().as_str(),
-                "HUMAN_INPUT_MONITOR_UNAVAILABLE — Event Tap is not running; pointer-delta heuristic will be used as fallback"
-            );
+        // P1: the log word matches the monitor's LIVE state — "starting"
+        // while Starting, "active" only when Active, "unavailable" when
+        // Failed. The tap becomes live on its own thread shortly after start,
+        // so the snapshot taken here is a honest point-in-time observation.
+        match driver.human_input_monitor_state().as_deref() {
+            Some("active") => {
+                tracing::info!(event_tap = true, "human-input monitor active");
+            }
+            Some("starting") => {
+                tracing::info!(
+                    event_tap = true,
+                    state = "starting",
+                    "human-input monitor starting (not yet live)"
+                );
+            }
+            state => {
+                tracing::warn!(
+                    event_tap = false,
+                    state = state.unwrap_or("unavailable"),
+                    "HUMAN_INPUT_MONITOR_UNAVAILABLE — Event Tap is not running; pointer-delta heuristic will be used as fallback"
+                );
+            }
         }
     }
 

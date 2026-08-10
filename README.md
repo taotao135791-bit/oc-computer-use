@@ -74,6 +74,37 @@ and a character count, never the text itself. To log full text (e.g. a
 development environment you trust), run the daemon with dev mode on — see
 [Trace redaction](#trace-redaction).
 
+## Validation Focus
+
+The current round is the **Pointer Isolation closing phase**: no new
+architecture, no new benchmark tasks, no new product capabilities. The
+identified implementation issues (Swift crop leak, crop-size math,
+observe/inspect target refresh, human-interrupt telemetry, physical-fallback
+races, drag/scroll cancellation, double-click semantics) are fixed and
+tested; the priority is **real macOS acceptance** of these exact behaviors,
+in order:
+
+1. **Pointer Isolation** — agent clicks/moves never move the user's system
+   cursor (DirectPositionEvent), the ghost cursor is excluded from captures,
+   and the physical fallback preserves and restores the user's cursor. See
+   [docs/pointer-isolation.md](docs/pointer-isolation.md).
+2. **Click Accuracy** — ≥32px target hit rate on the Browser and Native
+   target boards ([benchmarks/target-boards](benchmarks/target-boards)).
+3. **Human Interrupt** — Human Always Wins: a real hardware event stops the
+   agent immediately, the cursor is never yanked back, and the P0-4 KPIs
+   (`event_detection_latency_ms`, `human_to_takeover_ms`,
+   `human_to_input_stop_ms`) are real measured numbers.
+4. **Window Isolation** — captures are scoped to the session target window
+   (including windows wider than `max_width` and windows that moved), with
+   zero stale or cross-app captures.
+5. **Keyboard Safety** — the strict focus guard re-checks bundle + pid +
+   window live before every key/type/clipboard event; nothing is ever sent
+   to an unfocused app.
+
+Real-machine acceptance (sections A–D + double-click) and honest
+NOT VERIFIED statuses are recorded in
+[docs/acceptance-manual.md](docs/acceptance-manual.md).
+
 ## The four tools (any agent)
 
 | Tool | Purpose |
@@ -188,7 +219,13 @@ the trace cannot be recorded), or `disabled` (no recorder).
 └── daemon.log
 ```
 
-## Benchmark
+## Experimental / Frozen Task Benchmark
+
+> **STATUS: EXPERIMENTAL / FROZEN.** The 30-task `cu-bench` suite is
+> **frozen**: its tasks, runner, fixtures, and schema are kept, but **no new
+> tasks or evaluators are added**. It remains a reference for regression
+> comparisons — it is **not** the current validation focus (see
+> [Validation Focus](#validation-focus)).
 
 A repeatable macOS desktop task benchmark (`cu-bench`, 30 tasks across
 TextEdit / Finder / System Settings / Calculator / Safari / cross-app) runs a

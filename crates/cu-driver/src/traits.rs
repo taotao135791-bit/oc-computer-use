@@ -147,6 +147,22 @@ pub trait ComputerDriver: Send + Sync {
         Ok(false)
     }
 
+    /// Round 9 / P1: a PHYSICAL DOUBLE-click (warp the real cursor + down/up
+    /// with click state 1, then down/up with click state 2) at a global point.
+    /// The second pair carries click state 2 so the OS treats it as a real
+    /// double-click, NEVER two single clicks. Like [`physical_click_at`], it
+    /// DOES move the user's cursor and must only be used under
+    /// `physical_allowed`. Returns `Ok(false)` when not supported (test/fake
+    /// drivers).
+    async fn physical_double_click_at(
+        &self,
+        _button: MouseButton,
+        _x: f64,
+        _y: f64,
+    ) -> Result<bool, CuError> {
+        Ok(false)
+    }
+
     /// Round 9 / P0-7: attempt an Accessibility `AXPress` click at a global
     /// point for `pid`'s application. This is an isolated actuator (the real
     /// system cursor is never moved). Returns:
@@ -159,10 +175,11 @@ pub trait ComputerDriver: Send + Sync {
     }
 
     /// Round 9 / P0-8: human-input detection health. Returns the monitor
-    /// state string: `"active" | "starting" | "failed" | "stopped"`, or
-    /// `None` when no hardware event monitor exists (e.g. test/fake drivers
-    /// or a platform without an Event Tap). When `Some("active")`, the
-    /// runtime disables the pointer-delta heuristic (real hardware events are
+    /// state string: `"active" | "starting" | "unavailable" | "stopped"` (P1:
+    /// a failed tap reports `"unavailable"`, never `"failed"`), or `None`
+    /// when no hardware event monitor exists (e.g. test/fake drivers or a
+    /// platform without an Event Tap). When `Some("active")`, the runtime
+    /// disables the pointer-delta heuristic (real hardware events are
     /// authoritative); otherwise the heuristic fallback may run.
     fn human_input_monitor_state(&self) -> Option<String> {
         None

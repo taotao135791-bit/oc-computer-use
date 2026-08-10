@@ -10,6 +10,7 @@ pub mod types;
 
 pub use traits::{ActionResult, ComputerDriver, ResolvedAction};
 pub use types::{
-    ApplicationInfo, CaptureRegion, CaptureRequest, CapturedFrame, DesktopLayout, DisplayInfo,
-    PermissionStatus, PointerInfo, QuickSnapshot, ResolvedSessionTarget,
+    expected_crop_output_size, ApplicationInfo, CaptureRegion, CaptureRequest, CapturedFrame,
+    DesktopLayout, DisplayInfo, PermissionStatus, PointerInfo, QuickSnapshot,
+    ResolvedSessionTarget,
 };

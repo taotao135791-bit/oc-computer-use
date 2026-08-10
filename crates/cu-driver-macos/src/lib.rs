@@ -547,14 +547,13 @@ impl ComputerDriver for MacosDriver {
         // async in the sense that the tap becomes live on the thread shortly
         // after; health is visible via `human_input_state()`.
         self.event_tap.start(sink);
-        // Return true ONLY when the monitor is genuinely live. If the thread
-        // failed to spawn or the tap failed to create (e.g. Accessibility not
-        // granted), `state()` will be `Failed` and this returns false — no
-        // fake success.
-        matches!(
-            self.event_tap.state(),
-            event_tap::EventTapState::Active | event_tap::EventTapState::Starting
-        )
+        // P1: report live ONLY when the monitor is genuinely `Active`.
+        // `Starting` is pending — the tap thread is still setting up — so it
+        // must NOT be reported as active. If the thread failed to spawn or
+        // the tap failed to create (e.g. Accessibility not granted),
+        // `state()` is `Failed`/`Stopped` and this returns false — no fake
+        // success either way.
+        self.event_tap.state().is_live()
     }
 
     fn human_input_monitor_state(&self) -> Option<String> {
@@ -570,6 +569,20 @@ impl ComputerDriver for MacosDriver {
     ) -> Result<bool, CuError> {
         // Synchronous CGEvent post; the async wrapper is just for the trait.
         crate::mouse::click(button, x, y);
+        Ok(true)
+    }
+
+    /// Round 9 / P1: physical DOUBLE-click = warp cursor + state-1 pair +
+    /// state-2 pair (`mouse::double_click` posts the down/up with click state
+    /// 1 then down/up with click state 2, so the system treats it as a real
+    /// double-click, never two single clicks).
+    async fn physical_double_click_at(
+        &self,
+        button: MouseButton,
+        x: f64,
+        y: f64,
+    ) -> Result<bool, CuError> {
+        crate::mouse::double_click(button, x, y);
         Ok(true)
     }
 

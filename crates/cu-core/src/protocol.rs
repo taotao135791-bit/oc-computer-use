@@ -242,11 +242,20 @@ pub struct PointerExecutionResult {
     /// when no physical fallback ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_input_during_fallback: Option<bool>,
-    /// Human interrupt latency (ms) measured from the hardware event to the
-    /// last synthetic input event. Present when a human interrupt occurred
-    /// during or near this action.
+    /// P0-4: human-interrupt telemetry, present when a real human input
+    /// occurred during or near this action. `human_to_input_stop_ms` is THE
+    /// Human Interrupt KPI — hardware event → LAST runtime synthetic input;
+    /// 0 when the agent had already stopped. `event_detection_latency_ms` is
+    /// hardware event → Event Tap callback; `human_to_takeover_ms` is hardware
+    /// event → takeover applied. The inverse `synthetic → human` direction is
+    /// intentionally NOT exposed here (it must never be labelled as interrupt
+    /// latency).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub human_interrupt_latency_ms: Option<u64>,
+    pub event_detection_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_to_takeover_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_to_input_stop_ms: Option<u64>,
 }
 
 /// Result of one action inside a batch.
