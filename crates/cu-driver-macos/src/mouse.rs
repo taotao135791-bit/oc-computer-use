@@ -36,18 +36,51 @@ pub async fn move_pointer_smooth(
     to: cu_core::Point,
     duration_ms: Option<u64>,
 ) {
+    let _ = move_pointer_smooth_cancel(from, to, duration_ms, None).await;
+}
+
+/// Cancel-aware variant: returns `false` when cancelled mid-path.
+pub async fn move_pointer_smooth_cancel(
+    from: cu_core::Point,
+    to: cu_core::Point,
+    duration_ms: Option<u64>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
     let duration = duration_ms.unwrap_or(0).min(5000);
     if duration == 0 {
+        if let Some(c) = cancel {
+            if c.is_cancelled() {
+                return false;
+            }
+        }
         move_pointer(to.x, to.y);
-        return;
+        return true;
     }
     let path = coordinates::move_path(from, to, duration);
     for (p, wait) in &path {
+        if let Some(c) = cancel {
+            if c.is_cancelled() {
+                return false;
+            }
+        }
         move_pointer(p.x, p.y);
         if *wait > 0 {
-            sleep(Duration::from_millis(*wait)).await;
+            let wait_ok = match cancel {
+                Some(c) => tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(*wait)) => true,
+                    () = c.cancelled() => false,
+                },
+                None => {
+                    sleep(Duration::from_millis(*wait)).await;
+                    true
+                }
+            };
+            if !wait_ok {
+                return false;
+            }
         }
     }
+    true
 }
 
 /// Press/release a mouse button at a global point.

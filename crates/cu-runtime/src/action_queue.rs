@@ -129,6 +129,9 @@ impl<'a> ActionQueue<'a> {
                     session.sync_pointer_mode(cu_core::SessionState::UserTakeover);
                     h.mark_takeover_started();
                     h.mark_input_stopped();
+                    // P0-1: ghost cursor must be hidden immediately — the user
+                    // is back in control.
+                    let _ = self.driver.pointer_hidden().await;
                     self.fill_cancelled(&mut reports, i, actions.len());
                     break;
                 }
@@ -233,7 +236,23 @@ impl<'a> ActionQueue<'a> {
             // Target Isolation (round 8): if the session is scoped to a target
             // window, every location-bearing action's coordinate must land
             // inside that window's bounds. Outside -> TARGET_OUTSIDE_SESSION.
+            // Locationless scroll in a target session -> TARGET_COORDINATE_REQUIRED
+            // (P0-4): the scroll would land at the current pointer, which may
+            // be in a different app.
             if let Some(bounds) = session.get_target_bounds() {
+                // Block locationless scroll
+                if matches!(
+                    action,
+                    ComputerAction::Scroll {
+                        x: None,
+                        y: None,
+                        ..
+                    }
+                ) {
+                    reports.push(ActionRun::failed(i, 0, "TARGET_COORDINATE_REQUIRED".into()));
+                    self.fill_cancelled(&mut reports, i + 1, actions.len());
+                    break;
+                }
                 if let Some(p) = resolved_location(&resolved) {
                     if !bounds.contains_global(p) {
                         reports.push(ActionRun::failed(i, 0, "TARGET_OUTSIDE_SESSION".into()));
@@ -438,6 +457,7 @@ impl<'a> ActionQueue<'a> {
                                 session.sync_pointer_mode(cu_core::SessionState::UserTakeover);
                                 h.mark_takeover_started();
                                 h.mark_input_stopped();
+                                let _ = self.driver.pointer_hidden().await;
                                 wait_interrupted = true;
                                 break;
                             }
@@ -549,7 +569,12 @@ impl<'a> ActionQueue<'a> {
             // it was left at after actions that do not move it by design.
             // The agent's own position bookkeeping (last_pointer) always uses
             // the session's virtual pointer, never the physical cursor.
-            if !action_moves_pointer(action) {
+            //
+            // P0-1 / P0-8: the post-action pointer-delta heuristic is gated on
+            // Event Tap state. When the hardware Event Tap is active and
+            // authoritative, only the pre-action real-takeover check runs; this
+            // heuristic probe is suppressed (no need for a redundant fallback).
+            if human_monitor_state != Some("active") && !action_moves_pointer(action) {
                 if let Ok(pi) = self.driver.pointer_location().await {
                     let dx = pi.location.x - last_pointer.x;
                     let dy = pi.location.y - last_pointer.y;
@@ -559,7 +584,7 @@ impl<'a> ActionQueue<'a> {
                         break;
                     }
                 }
-            } else {
+            } else if action_moves_pointer(action) {
                 last_pointer = session.virtual_pointer.lock().unwrap().location();
             }
         }
@@ -773,6 +798,7 @@ fn parse_pointer_detail(detail: &str) -> Option<cu_core::PointerExecutionResult>
         physical_cursor_moved: moved?,
         physical_cursor_delta_px: delta_px,
         physical_cursor_restored: restored,
+        human_interrupt_latency_ms: None,
     })
 }
 

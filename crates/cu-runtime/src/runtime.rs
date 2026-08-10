@@ -180,6 +180,7 @@ impl Runtime {
                 accessibility: false,
             }
         });
+        let human_monitor = self.driver.human_input_monitor_state();
         Ok(serde_json::json!({
             "version": cu_core::config::RUNTIME_VERSION,
             "ready": permissions.all_granted(),
@@ -187,6 +188,7 @@ impl Runtime {
             "active_sessions": self.active_session_count(),
             "uptime_secs": self.uptime_secs(),
             "frame_cache": self.frames.lock().unwrap().len(),
+            "human_input_monitor": human_monitor,
         }))
     }
 
@@ -544,6 +546,9 @@ impl Runtime {
         let session = self.get_session(session_id)?;
         self.verify_mutating(&session, control_token)?;
         session.transition(SessionState::UserTakeover)?;
+        // P0-1: ghost cursor must hide immediately on takeover — the user is
+        // back in control and the agent's overlay must not linger.
+        let _ = self.driver.pointer_hidden().await;
         if let Some(t) = session.trace.as_ref() {
             let _ = t
                 .record_event("session.takeover", serde_json::json!({}))

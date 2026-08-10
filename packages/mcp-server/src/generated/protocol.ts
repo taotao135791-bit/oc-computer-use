@@ -156,7 +156,9 @@ export type ErrorCode =
   | "INPUT_FOCUS_MISMATCH"
   | "ISOLATED_POINTER_UNAVAILABLE"
   | "ISOLATED_DRAG_UNAVAILABLE"
-  | "PHYSICAL_FALLBACK_NOT_ALLOWED";
+  | "PHYSICAL_FALLBACK_NOT_ALLOWED"
+  | "TARGET_COORDINATE_REQUIRED"
+  | "PHYSICAL_FALLBACK_REQUIRED";
 /**
  * How strictly keyboard focus is validated before `type`/`key`/`shortcut`.
  *
@@ -586,6 +588,10 @@ export interface PointerExecutionResult {
    */
   backend: string;
   /**
+   * Human interrupt latency (ms) measured from the hardware event to the last synthetic input event. Present when a human interrupt occurred during or near this action.
+   */
+  human_interrupt_latency_ms?: number;
+  /**
    * True when the action executed without touching the real system cursor.
    */
   isolated: boolean;
@@ -816,6 +822,10 @@ export interface PointerExecutionResult1 {
    * The actuator that actually realized the action: `"virtual" | "direct_cg_event" | "accessibility" | "physical"`.
    */
   backend: string;
+  /**
+   * Human interrupt latency (ms) measured from the hardware event to the last synthetic input event. Present when a human interrupt occurred during or near this action.
+   */
+  human_interrupt_latency_ms?: number;
   /**
    * True when the action executed without touching the real system cursor.
    */

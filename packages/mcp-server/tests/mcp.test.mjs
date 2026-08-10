@@ -320,7 +320,7 @@ test("computer_act and computer_inspect expose structured JSON schemas", { timeo
       "action array items must carry a discriminated union schema",
     );
     assert.equal(act.inputSchema.properties.actions.minItems, 1);
-    assert.equal(act.inputSchema.properties.actions.maxItems, 50);
+    assert.equal(act.inputSchema.properties.actions.maxItems, 64);
     const inspect = tools.find((t) => t.name === "computer_inspect");
     assert.equal(inspect.inputSchema.properties.region.type, "object");
     assert.equal(inspect.inputSchema.properties.region.properties.width.minimum, 1);

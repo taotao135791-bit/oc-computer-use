@@ -103,7 +103,15 @@ pub(crate) async fn serve_with(
         let started = driver.start_human_input_monitor(Box::new(move |latency_ms| {
             monitor.on_human_event(latency_ms);
         }));
-        tracing::info!(event_tap = started, "human-input monitor state");
+        if started {
+            tracing::info!(event_tap = true, "human-input monitor active");
+        } else {
+            tracing::warn!(
+                event_tap = false,
+                state = driver.human_input_monitor_state().unwrap_or_default().as_str(),
+                "HUMAN_INPUT_MONITOR_UNAVAILABLE — Event Tap is not running; pointer-delta heuristic will be used as fallback"
+            );
+        }
     }
 
     // Prune trace files older than the retention window on startup.

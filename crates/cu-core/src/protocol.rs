@@ -224,6 +224,11 @@ pub struct PointerExecutionResult {
     /// physical fallback transaction (absent when never borrowed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_cursor_restored: Option<bool>,
+    /// Human interrupt latency (ms) measured from the hardware event to the
+    /// last synthetic input event. Present when a human interrupt occurred
+    /// during or near this action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_interrupt_latency_ms: Option<u64>,
 }
 
 /// Result of one action inside a batch.

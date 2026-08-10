@@ -18,6 +18,7 @@
     "test": "pnpm -r test",
     "ci": "pnpm check:protocol && pnpm build && pnpm typecheck && pnpm lint && pnpm test",
     "scan:secrets": "gitleaks detect --source . --config .gitleaks.toml --no-banner",
+    "smoke:full": "bash scripts/smoke.sh",
     "release:build": "bash scripts/release-build.sh"
   },
   "engines": {

@@ -418,7 +418,7 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
     name: "computer_act",
     label: "Execute computer actions",
     description:
-      "Execute a batch of 1-50 actions on the frame referenced by frame_id (the most " +
+      "Execute a batch of 1-64 actions on the frame referenced by frame_id (the most " +
       "recent computer_observe). Each action is an object with `type` in " +
       "[click, double_click, move, type, key, scroll, drag, wait] plus its fields: " +
       "click/double_click need x, y (button optional, default left); move needs x, y; " +
@@ -435,7 +435,7 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
       frame_id: Type.String({ description: "frame_id from the most recent computer_observe" }),
       actions: Type.Array(actionSchema, {
         minItems: 1,
-        maxItems: 50,
+        maxItems: 64,
         description: "Ordered action batch, executed in sequence",
       }),
       wait_policy: Type.Optional(waitPolicy),

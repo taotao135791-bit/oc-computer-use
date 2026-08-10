@@ -472,7 +472,7 @@ export function createComputerUseServer(
     {
       title: "Execute computer actions",
       description:
-        "Execute a batch of 1-50 actions on the frame described by frame_id. Each action is " +
+        "Execute a batch of 1-64 actions on the frame described by frame_id. Each action is " +
         "a structured object discriminated on `type`: click, double_click, move, type (with " +
         "text), key (with keys), scroll (delta_x/delta_y), drag (from/to), wait (duration_ms). " +
         "Coordinates are in normalized_1000 by default (the image treated as a 1000x1000 " +
@@ -484,7 +484,7 @@ export function createComputerUseServer(
         actions: z
           .array(actionUnion)
           .min(1)
-          .max(50)
+          .max(64)
           .describe("Ordered action batch, executed in sequence"),
         wait_policy: z.enum(["none", "fixed", "until_stable"]).optional(),
         fixed_wait_ms: z.number().int().min(0).optional(),

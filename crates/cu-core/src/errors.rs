@@ -93,6 +93,16 @@ pub enum ErrorCode {
     /// Physical fallback is not allowed by the session's pointer policy or
     /// the caller did not explicitly permit it for this action.
     PhysicalFallbackNotAllowed,
+    /// A located scroll (x, y) was requested without coordinates in a
+    /// target-scoped session. Target sessions always require explicit scroll
+    /// coordinates; a locationless scroll would land at the current pointer,
+    /// which may be in a different app.
+    TargetCoordinateRequired,
+    /// Both isolated backends (Direct CG + AX) failed for this action, and
+    /// physical fallback was not explicitly permitted by the caller. The
+    /// caller must either set `allow_physical_fallback: true` on the action
+    /// or the session's pointer policy must include `physical_allowed`.
+    PhysicalFallbackRequired,
 }
 
 impl ErrorCode {
@@ -140,6 +150,8 @@ impl ErrorCode {
             IsolatedPointerUnavailable => -32032,
             IsolatedDragUnavailable => -32033,
             PhysicalFallbackNotAllowed => -32034,
+            TargetCoordinateRequired => -32035,
+            PhysicalFallbackRequired => -32036,
         }
     }
 
@@ -185,6 +197,8 @@ impl ErrorCode {
             IsolatedPointerUnavailable => "ISOLATED_POINTER_UNAVAILABLE",
             IsolatedDragUnavailable => "ISOLATED_DRAG_UNAVAILABLE",
             PhysicalFallbackNotAllowed => "PHYSICAL_FALLBACK_NOT_ALLOWED",
+            TargetCoordinateRequired => "TARGET_COORDINATE_REQUIRED",
+            PhysicalFallbackRequired => "PHYSICAL_FALLBACK_REQUIRED",
         }
     }
 }
@@ -347,6 +361,12 @@ pub enum CuError {
     /// Physical fallback is not allowed by policy or caller.
     #[error("physical fallback is not allowed by the session pointer policy")]
     PhysicalFallbackNotAllowed,
+    /// A scroll action in a target-scoped session requires explicit x,y coordinates.
+    #[error("target session requires explicit scroll coordinates; locationless scroll may land in another app")]
+    TargetCoordinateRequired,
+    /// Isolated backends failed and physical fallback requires explicit caller permission.
+    #[error("both isolated backends failed; the caller must set allow_physical_fallback: true to use the physical cursor")]
+    PhysicalFallbackRequired,
 }
 
 impl CuError {
@@ -392,6 +412,8 @@ impl CuError {
             IsolatedPointerUnavailable => ErrorCode::IsolatedPointerUnavailable,
             IsolatedDragUnavailable => ErrorCode::IsolatedDragUnavailable,
             PhysicalFallbackNotAllowed => ErrorCode::PhysicalFallbackNotAllowed,
+            TargetCoordinateRequired => ErrorCode::TargetCoordinateRequired,
+            PhysicalFallbackRequired => ErrorCode::PhysicalFallbackRequired,
         }
     }
 

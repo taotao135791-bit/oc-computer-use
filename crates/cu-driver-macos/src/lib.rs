@@ -291,8 +291,12 @@ impl ComputerDriver for MacosDriver {
                 to,
                 duration_ms,
             } => {
-                mouse::move_pointer_smooth(*from, *to, *duration_ms).await;
-                Ok(())
+                if mouse::move_pointer_smooth_cancel(*from, *to, *duration_ms, Some(&cancel)).await
+                {
+                    Ok(())
+                } else {
+                    Err(CuError::Cancelled)
+                }
             }
             ResolvedAction::TypeText { text, method } => match method {
                 TextInputMethod::Keyboard => {
@@ -514,9 +518,14 @@ impl ComputerDriver for MacosDriver {
         // async in the sense that the tap becomes live on the thread shortly
         // after; health is visible via `human_input_state()`.
         self.event_tap.start(sink);
-        // Return whether registration was accepted (the thread was spawned).
-        // The caller can check `human_input_state()` afterwards for `active`.
-        true
+        // Return true ONLY when the monitor is genuinely live. If the thread
+        // failed to spawn or the tap failed to create (e.g. Accessibility not
+        // granted), `state()` will be `Failed` and this returns false — no
+        // fake success.
+        matches!(
+            self.event_tap.state(),
+            event_tap::EventTapState::Active | event_tap::EventTapState::Starting
+        )
     }
 
     fn human_input_monitor_state(&self) -> Option<String> {

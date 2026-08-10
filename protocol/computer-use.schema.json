@@ -693,6 +693,20 @@
             "PHYSICAL_FALLBACK_NOT_ALLOWED"
           ],
           "type": "string"
+        },
+        {
+          "description": "A located scroll (x, y) was requested without coordinates in a target-scoped session. Target sessions always require explicit scroll coordinates; a locationless scroll would land at the current pointer, which may be in a different app.",
+          "enum": [
+            "TARGET_COORDINATE_REQUIRED"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Both isolated backends (Direct CG + AX) failed for this action, and physical fallback was not explicitly permitted by the caller. The caller must either set `allow_physical_fallback: true` on the action or the session's pointer policy must include `physical_allowed`.",
+          "enum": [
+            "PHYSICAL_FALLBACK_REQUIRED"
+          ],
+          "type": "string"
         }
       ]
     },
@@ -1149,6 +1163,12 @@
         "backend": {
           "description": "The actuator that actually realized the action: `\"virtual\" | \"direct_cg_event\" | \"accessibility\" | \"physical\"`.",
           "type": "string"
+        },
+        "human_interrupt_latency_ms": {
+          "description": "Human interrupt latency (ms) measured from the hardware event to the last synthetic input event. Present when a human interrupt occurred during or near this action.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
         },
         "isolated": {
           "description": "True when the action executed without touching the real system cursor.",
