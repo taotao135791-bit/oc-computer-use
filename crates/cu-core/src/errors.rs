@@ -103,6 +103,15 @@ pub enum ErrorCode {
     /// caller must either set `allow_physical_fallback: true` on the action
     /// or the session's pointer policy must include `physical_allowed`.
     PhysicalFallbackRequired,
+    /// Round 8 / P0-1 (occlusion guard): the requested coordinate belongs to
+    /// the scoped target's geometry, but the target window is NOT the
+    /// currently interactable topmost owner of that point (another window —
+    /// same app or other app — covers it), and no isolated actuator could
+    /// safely complete the action. Direct CG is forbidden, AX could not
+    /// complete it, and the runtime refuses the physical fallback because it
+    /// would click the covering window. Never a generic ACTION_FAILED: the
+    /// agent should expose the target, re-observe, or retry.
+    TargetOccluded,
 }
 
 impl ErrorCode {
@@ -152,6 +161,7 @@ impl ErrorCode {
             PhysicalFallbackNotAllowed => -32034,
             TargetCoordinateRequired => -32035,
             PhysicalFallbackRequired => -32036,
+            TargetOccluded => -32037,
         }
     }
 
@@ -199,6 +209,7 @@ impl ErrorCode {
             PhysicalFallbackNotAllowed => "PHYSICAL_FALLBACK_NOT_ALLOWED",
             TargetCoordinateRequired => "TARGET_COORDINATE_REQUIRED",
             PhysicalFallbackRequired => "PHYSICAL_FALLBACK_REQUIRED",
+            TargetOccluded => "TARGET_OCCLUDED",
         }
     }
 }
@@ -367,6 +378,10 @@ pub enum CuError {
     /// Isolated backends failed and physical fallback requires explicit caller permission.
     #[error("both isolated backends failed; the caller must set allow_physical_fallback: true to use the physical cursor")]
     PhysicalFallbackRequired,
+    /// Round 8 / P0-1: the coordinate is inside the target's geometry, but the
+    /// target is not the topmost interactive window at that point.
+    #[error("target window is occluded at the requested coordinate (another window is topmost); expose the target or re-observe before retrying")]
+    TargetOccluded,
 }
 
 impl CuError {
@@ -414,6 +429,7 @@ impl CuError {
             PhysicalFallbackNotAllowed => ErrorCode::PhysicalFallbackNotAllowed,
             TargetCoordinateRequired => ErrorCode::TargetCoordinateRequired,
             PhysicalFallbackRequired => ErrorCode::PhysicalFallbackRequired,
+            TargetOccluded => ErrorCode::TargetOccluded,
         }
     }
 
@@ -597,5 +613,18 @@ mod tests {
                 "code {code} outside range"
             );
         }
+    }
+
+    #[test]
+    fn target_occluded_has_stable_code_and_detail() {
+        assert_eq!(ErrorCode::TargetOccluded.as_str(), "TARGET_OCCLUDED");
+        assert_eq!(ErrorCode::TargetOccluded.jsonrpc_code(), -32037);
+        let err = CuError::TargetOccluded;
+        assert_eq!(err.code(), ErrorCode::TargetOccluded);
+        assert_eq!(err.to_error_data()["code"], "TARGET_OCCLUDED");
+        assert!(
+            err.to_string().contains("occluded"),
+            "the error message must tell the agent the target is covered: {err}"
+        );
     }
 }

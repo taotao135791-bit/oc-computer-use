@@ -640,6 +640,60 @@ func resolveTarget(_ params: [String: Any]) -> [String: Any] {
     return ["found": false, "reason": "no_target_specified"]
 }
 
+// MARK: - Hit test (round 8 / P0-1)
+
+/// Topmost interactive window at a global point, in CGWindowList z-order
+/// (back-to-front), so the FIRST normal window whose bounds contain the point
+/// is the one that would receive a Direct CG click there. Rules mirror
+/// `resolveTarget`'s `isNormal`: layer == 0, alpha > 0, wdt > 0, hgt > 0 —
+/// overlay/menu-bar windows (layer > 0) and zero-size stubs never count.
+/// Returns `["found": false, "reason": "no_window_at_point"]` when no normal
+/// window contains the point.
+func windowAtPoint(_ params: [String: Any]) -> [String: Any] {
+    guard let x = params["x"] as? Double, let y = params["y"] as? Double else {
+        return ["found": false, "reason": "requires x and y (Doubles)"]
+    }
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+        return ["found": false, "reason": "window list unavailable"]
+    }
+    func isNormal(_ w: [String: Any]) -> Bool {
+        let layer = (w[kCGWindowLayer as String] as? Int) ?? Int.max
+        let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 0.0
+        let bounds = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
+        let wdt = (bounds["Width"] as? Double) ?? 0
+        let hgt = (bounds["Height"] as? Double) ?? 0
+        return layer == 0 && alpha > 0.0 && wdt > 0 && hgt > 0
+    }
+    for w in list {
+        guard isNormal(w) else { continue }
+        let bounds = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
+        guard let wx = bounds["X"] as? Double,
+              let wy = bounds["Y"] as? Double,
+              let wdt = bounds["Width"] as? Double,
+              let hgt = bounds["Height"] as? Double else {
+            continue
+        }
+        // The point is inside this window's bounds. Same coordinate space as
+        // the bounds that `resolve_target` returns (global logical points), so
+        // the runtime can compare hit-test results against the target window.
+        if x >= wx && x < wx + wdt && y >= wy && y < wy + hgt {
+            let ownerPID = (w[kCGWindowOwnerPID as String] as? Int) ?? 0
+            let num = (w[kCGWindowNumber as String] as? Int) ?? 0
+            let bundleID = NSRunningApplication(processIdentifier: pid_t(ownerPID))?.bundleIdentifier
+            return [
+                "found": true,
+                "window": [
+                    "window_id": num,
+                    "pid": ownerPID,
+                    "bundle_id": bundleID ?? "unknown",
+                ],
+            ]
+        }
+    }
+    return ["found": false, "reason": "no_window_at_point"]
+}
+
 // MARK: - Permissions
 
 func permissionStatus() -> [String: Any] {
@@ -702,6 +756,8 @@ func handle(_ method: String, _ params: [String: Any], id: Any) -> String {
         return ok(id, activeAppInfo())
     case "resolve_target":
         return ok(id, resolveTarget(params))
+    case "window_at_point":
+        return ok(id, windowAtPoint(params))
     case "permissions":
         return ok(id, permissionStatus())
     case "clipboard_get":

@@ -312,9 +312,18 @@ impl HumanInputMonitor {
 impl HumanInputSink for HumanInputMonitor {
     fn on_human_event(&self, latency_ms: u64) {
         let now = Instant::now();
+        // P0-3: `human_event_at` must be the HARDWARE event's timestamp in
+        // monotonic space, NOT the callback time. The Event Tap measured
+        // `latency_ms` from the event's own `CGEventGetTimestamp` to this
+        // callback, so the event happened `latency_ms` before now. Using
+        // `Instant::now()` here would understate `human_to_input_stop_ms` by
+        // the entire detection latency.
+        let event_at = now
+            .checked_sub(Duration::from_millis(latency_ms))
+            .unwrap_or(now);
         *self.last_human.lock().unwrap() = Some(now);
         *self.last_latency_ms.lock().unwrap() = Some(latency_ms);
-        *self.human_event_at.lock().unwrap() = Some(now);
+        *self.human_event_at.lock().unwrap() = Some(event_at);
         // P0-4: the Event Tap callback time — the far end of
         // `event_detection_latency_ms` (event → callback).
         *self.event_callback_at.lock().unwrap() = Some(now);
@@ -506,5 +515,39 @@ mod tests {
         // A fresh monitor with no human event yet has no KPI.
         let m2 = HumanInputMonitor::new();
         assert_eq!(m2.human_to_input_stop_ms(), None);
+    }
+
+    /// P0-3: `on_human_event(latency_ms)` must place `human_event_at` at the
+    /// HARDWARE event's timestamp (monotonic space, `now - latency_ms`), NOT at
+    /// the Event Tap callback time. If it used the callback time, a synthetic
+    /// stamped right after the callback would read ~0 ms of input-stop latency
+    /// — understating the KPI by the whole detection latency.
+    #[test]
+    fn sink_event_at_is_hardware_time_not_callback_time() {
+        let m = HumanInputMonitor::new();
+        let sink: &dyn HumanInputSink = &m;
+        // A real event measured 50 ms from its own CGEventGetTimestamp to this
+        // callback. The event therefore happened 50 ms before the callback.
+        sink.on_human_event(50);
+        assert_eq!(m.event_detection_latency_ms(), Some(50));
+        // A synthetic posted IMMEDIATELY after the callback. If `human_event_at`
+        // were the callback time, input-stop would read ~0; with the true
+        // hardware timestamp it must read ~50.
+        m.record_synthetic_event(Instant::now());
+        let stop = m.human_to_input_stop_ms().expect("the KPI must exist");
+        assert!(
+            stop >= 50,
+            "human_to_input_stop_ms must include the detection latency: {stop}"
+        );
+        // Control: a zero-latency event (hardware == callback) reads ~0.
+        let m2 = HumanInputMonitor::new();
+        let sink2: &dyn HumanInputSink = &m2;
+        sink2.on_human_event(0);
+        m2.record_synthetic_event(Instant::now());
+        let stop0 = m2.human_to_input_stop_ms().expect("the KPI must exist");
+        assert!(
+            stop0 < 50,
+            "a zero-latency event must not invent latency: {stop0}"
+        );
     }
 }

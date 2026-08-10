@@ -122,16 +122,118 @@ pub fn click(button: MouseButton, x: f64, y: f64) {
 /// visible cursor is unchanged by `button_down`/`button_up` themselves (only
 /// `EVENT_MOUSE_MOVED` relocates it).
 pub fn click_direct(button: MouseButton, x: f64, y: f64) {
-    button_down(button, x, y, 1);
-    button_up(button, x, y, 1);
+    click_direct_core(button, x, y, &post_op);
+}
+
+/// [`click_direct`] with an injected poster (P0-3): tests capture the exact
+/// down/up sequence without posting to CoreGraphics.
+fn click_direct_core(button: MouseButton, x: f64, y: f64, post: &(dyn Fn(MouseOp) + Sync)) {
+    post(MouseOp::Down {
+        button,
+        x,
+        y,
+        click_state: 1,
+    });
+    post(MouseOp::Up {
+        button,
+        x,
+        y,
+        click_state: 1,
+    });
 }
 
 /// Direct double-click without warping the system cursor.
 pub fn double_click_direct(button: MouseButton, x: f64, y: f64) {
-    button_down(button, x, y, 1);
-    button_up(button, x, y, 1);
-    button_down(button, x, y, 2);
-    button_up(button, x, y, 2);
+    double_click_direct_core(button, x, y, &post_op);
+}
+
+/// [`double_click_direct`] with an injected poster (P0-3).
+fn double_click_direct_core(button: MouseButton, x: f64, y: f64, post: &(dyn Fn(MouseOp) + Sync)) {
+    post(MouseOp::Down {
+        button,
+        x,
+        y,
+        click_state: 1,
+    });
+    post(MouseOp::Up {
+        button,
+        x,
+        y,
+        click_state: 1,
+    });
+    post(MouseOp::Down {
+        button,
+        x,
+        y,
+        click_state: 2,
+    });
+    post(MouseOp::Up {
+        button,
+        x,
+        y,
+        click_state: 2,
+    });
+}
+
+/// Direct double-click without warping the system cursor, with P0-3 cancel
+/// checks before the state-1 pair AND between the two pairs:
+///   - a token that fired BEFORE any emit suppresses the whole double-click
+///     (nothing posts — symmetric with the single-click path in lib.rs);
+///   - a token that fires BETWEEN the pairs: the state-1 pair has already
+///     landed (a real single click, not un-postable), so it stands, but the
+///     state-2 completion pair is DROPPED — the double-click completion never
+///     fires after a human event.
+///
+/// Returns `false` when any pair was suppressed.
+pub fn double_click_direct_cancel(
+    button: MouseButton,
+    x: f64,
+    y: f64,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    double_click_direct_cancel_core(button, x, y, cancel, &post_op)
+}
+
+/// [`double_click_direct_cancel`] with an injected poster (P0-3): tests verify
+/// the suppression without posting to CoreGraphics.
+fn double_click_direct_cancel_core(
+    button: MouseButton,
+    x: f64,
+    y: f64,
+    cancel: &tokio_util::sync::CancellationToken,
+    post: &(dyn Fn(MouseOp) + Sync),
+) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    post(MouseOp::Down {
+        button,
+        x,
+        y,
+        click_state: 1,
+    });
+    post(MouseOp::Up {
+        button,
+        x,
+        y,
+        click_state: 1,
+    });
+    if cancel.is_cancelled() {
+        return false;
+    }
+    post(MouseOp::Down {
+        button,
+        x,
+        y,
+        click_state: 2,
+    });
+    post(MouseOp::Up {
+        button,
+        x,
+        y,
+        click_state: 2,
+    });
+    true
 }
 
 /// A double-click at a global point. The second down/up pair carries click
@@ -150,19 +252,48 @@ pub fn double_click(button: MouseButton, x: f64, y: f64) {
 /// CoreGraphics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MouseOp {
-    Move { x: f64, y: f64 },
-    Down { x: f64, y: f64, click_state: i64 },
-    Up { x: f64, y: f64, click_state: i64 },
-    Dragged { x: f64, y: f64 },
-    ScrollWheel { x: i32, y: i32 },
+    Move {
+        x: f64,
+        y: f64,
+    },
+    Down {
+        button: MouseButton,
+        x: f64,
+        y: f64,
+        click_state: i64,
+    },
+    Up {
+        button: MouseButton,
+        x: f64,
+        y: f64,
+        click_state: i64,
+    },
+    Dragged {
+        x: f64,
+        y: f64,
+    },
+    ScrollWheel {
+        x: i32,
+        y: i32,
+    },
 }
 
 /// Production poster: forward a [`MouseOp`] to CoreGraphics.
 fn post_op(op: MouseOp) {
     match op {
         MouseOp::Move { x, y } => move_pointer(x, y),
-        MouseOp::Down { x, y, click_state } => button_down(MouseButton::Left, x, y, click_state),
-        MouseOp::Up { x, y, click_state } => button_up(MouseButton::Left, x, y, click_state),
+        MouseOp::Down {
+            button,
+            x,
+            y,
+            click_state,
+        } => button_down(button, x, y, click_state),
+        MouseOp::Up {
+            button,
+            x,
+            y,
+            click_state,
+        } => button_up(button, x, y, click_state),
         MouseOp::Dragged { x, y } => {
             // Drag is left-button only; the mapping stays live for the
             // right/middle cases the FFI still exposes.
@@ -225,6 +356,7 @@ async fn drag_core(
         return false;
     }
     post(MouseOp::Down {
+        button: MouseButton::Left,
         x: from.x,
         y: from.y,
         click_state: 1,
@@ -264,6 +396,7 @@ async fn drag_core(
     // actual drag point; completed → up exactly at `to`.
     let up = drag_up_position(aborted, to, last_actual);
     post(MouseOp::Up {
+        button: MouseButton::Left,
         x: up.x,
         y: up.y,
         click_state: 1,
@@ -476,6 +609,7 @@ mod tests {
         assert!(matches!(
             ops[1],
             MouseOp::Down {
+                button: MouseButton::Left,
                 x: 10.0,
                 y: 10.0,
                 click_state: 1
@@ -491,6 +625,7 @@ mod tests {
             .expect("at least one dragged step");
         match ops.last().unwrap() {
             MouseOp::Up {
+                button: MouseButton::Left,
                 x,
                 y,
                 click_state: 1,
@@ -561,5 +696,119 @@ mod tests {
             "the move may post, but no scroll event may follow: {ops:?}"
         );
         assert!(matches!(ops[0], MouseOp::Move { x: 10.0, y: 10.0 }));
+    }
+
+    /// P0-3: a double-click whose token fired BEFORE any emit posts NOTHING —
+    /// the whole double-click is suppressed (symmetric with the single-click
+    /// pre-check in lib.rs).
+    #[test]
+    fn double_click_cancelled_before_any_emit_posts_nothing() {
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let posted: std::sync::Arc<std::sync::Mutex<Vec<MouseOp>>> = Default::default();
+        let posted2 = posted.clone();
+        let post = move |op| posted2.lock().unwrap().push(op);
+        let ok = double_click_direct_cancel_core(MouseButton::Left, 100.0, 100.0, &token, &post);
+        assert!(!ok);
+        assert!(
+            posted.lock().unwrap().is_empty(),
+            "a cancelled double-click must emit nothing"
+        );
+    }
+
+    /// P0-3: a token that fires BETWEEN the pairs (a human grabbed mid-click)
+    /// leaves the state-1 pair standing but DROPS the state-2 completion — the
+    /// double-click never completes after a human event.
+    #[test]
+    fn double_click_cancel_between_pairs_drops_state2_pair() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let posted: std::sync::Arc<std::sync::Mutex<Vec<MouseOp>>> = Default::default();
+        let posted2 = posted.clone();
+        let token2 = token.clone();
+        let post = move |op: MouseOp| {
+            // A human grab lands right after the state-1 up posts.
+            if matches!(op, MouseOp::Up { click_state: 1, .. }) {
+                token2.cancel();
+            }
+            posted2.lock().unwrap().push(op);
+        };
+        let ok = double_click_direct_cancel_core(MouseButton::Left, 100.0, 100.0, &token, &post);
+        assert!(!ok, "the state-2 pair was suppressed");
+        let ops = posted.lock().unwrap();
+        assert_eq!(
+            ops.len(),
+            2,
+            "only the state-1 pair (down+up) may stand: {ops:?}"
+        );
+        assert!(matches!(
+            ops[0],
+            MouseOp::Down {
+                button: MouseButton::Left,
+                x: 100.0,
+                y: 100.0,
+                click_state: 1
+            }
+        ));
+        assert!(matches!(
+            ops[1],
+            MouseOp::Up {
+                button: MouseButton::Left,
+                x: 100.0,
+                y: 100.0,
+                click_state: 1
+            }
+        ));
+    }
+
+    /// P0-3: with a live token both pairs post (down/up state-1, down/up
+    /// state-2) and the completion is reported.
+    #[test]
+    fn double_click_cancel_completes_both_pairs_when_token_live() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let posted: std::sync::Arc<std::sync::Mutex<Vec<MouseOp>>> = Default::default();
+        let posted2 = posted.clone();
+        let post = move |op| posted2.lock().unwrap().push(op);
+        let ok = double_click_direct_cancel_core(MouseButton::Left, 100.0, 100.0, &token, &post);
+        assert!(ok);
+        let ops = posted.lock().unwrap();
+        assert_eq!(ops.len(), 4, "both pairs must post: {ops:?}");
+        let states: Vec<i64> = ops
+            .iter()
+            .filter_map(|op| match op {
+                MouseOp::Down { click_state, .. } => Some(*click_state),
+                MouseOp::Up { click_state, .. } => Some(*click_state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, vec![1, 1, 2, 2]);
+    }
+
+    /// P0-3: the Direct CG SINGLE click posts exactly one down/up pair.
+    #[test]
+    fn click_direct_posts_single_down_up_pair() {
+        let posted: std::sync::Arc<std::sync::Mutex<Vec<MouseOp>>> = Default::default();
+        let posted2 = posted.clone();
+        let post = move |op| posted2.lock().unwrap().push(op);
+        click_direct_core(MouseButton::Left, 100.0, 100.0, &post);
+        let ops = posted.lock().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(
+            ops[0],
+            MouseOp::Down {
+                button: MouseButton::Left,
+                x: 100.0,
+                y: 100.0,
+                click_state: 1
+            }
+        ));
+        assert!(matches!(
+            ops[1],
+            MouseOp::Up {
+                button: MouseButton::Left,
+                x: 100.0,
+                y: 100.0,
+                click_state: 1
+            }
+        ));
     }
 }

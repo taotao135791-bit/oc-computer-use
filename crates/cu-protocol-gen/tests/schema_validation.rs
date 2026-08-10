@@ -256,6 +256,7 @@ fn every_error_code_is_in_the_schema_and_nothing_more() {
         ErrorCode::PhysicalFallbackNotAllowed.as_str(),
         ErrorCode::TargetCoordinateRequired.as_str(),
         ErrorCode::PhysicalFallbackRequired.as_str(),
+        ErrorCode::TargetOccluded.as_str(),
     ];
     assert_eq!(
         expected.len(),

@@ -12,5 +12,5 @@ pub use traits::{ActionResult, ComputerDriver, ResolvedAction};
 pub use types::{
     expected_crop_output_size, ApplicationInfo, CaptureRegion, CaptureRequest, CapturedFrame,
     DesktopLayout, DisplayInfo, PermissionStatus, PointerInfo, QuickSnapshot,
-    ResolvedSessionTarget,
+    ResolvedSessionTarget, WindowAtPoint,
 };

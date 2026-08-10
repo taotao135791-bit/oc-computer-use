@@ -158,7 +158,8 @@ export type ErrorCode =
   | "ISOLATED_DRAG_UNAVAILABLE"
   | "PHYSICAL_FALLBACK_NOT_ALLOWED"
   | "TARGET_COORDINATE_REQUIRED"
-  | "PHYSICAL_FALLBACK_REQUIRED";
+  | "PHYSICAL_FALLBACK_REQUIRED"
+  | "TARGET_OCCLUDED";
 /**
  * How strictly keyboard focus is validated before `type`/`key`/`shortcut`.
  *

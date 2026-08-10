@@ -74,9 +74,16 @@ impl<'a> Stabilizer<'a> {
     /// snapshot; `token` (usually the session's in-flight batch token) aborts
     /// the wait immediately when cancelled (pause/takeover/stop) with
     /// `CuError::Cancelled`.
+    ///
+    /// Round 8 / P0-2: `region` (pixel space, relative to the display's
+    /// top-left) makes the stabilizer sample the target WINDOW CROP for
+    /// target-scoped sessions — the baseline and every sample share the same
+    /// region, and changes anywhere else on the desktop never count toward
+    /// "unstable". `None` samples the full display (the pre-P0-2 behaviour).
     pub async fn until_stable(
         &self,
         display_id: &str,
+        region: Option<cu_driver::CaptureRegion>,
         initial: &QuickSnapshot,
         token: &CancellationToken,
     ) -> Result<StabilizeOutcome, CuError> {
@@ -122,7 +129,16 @@ impl<'a> Stabilizer<'a> {
             if token.is_cancelled() {
                 return Err(CuError::Cancelled);
             }
-            let cur = self.driver.quick_snapshot(display_id).await?;
+            // Round 8 / P0-2: sample the target window crop when a region is
+            // given, so other-app changes on the desktop never count toward
+            // instability (and the crop matches the baseline snapshot).
+            let cur = if let Some(r) = region {
+                self.driver
+                    .quick_snapshot_region(display_id, Some(r))
+                    .await?
+            } else {
+                self.driver.quick_snapshot(display_id).await?
+            };
             let score = cu_core::ScreenSnapshot::from(prev.clone())
                 .change_score(&cur.clone().into())
                 .unwrap_or(1.0);
@@ -283,7 +299,7 @@ mod tests {
         let s = Stabilizer::new(driver.as_ref(), config());
         let token = CancellationToken::new();
         let outcome = s
-            .until_stable("1", &snapshot(black()), &token)
+            .until_stable("1", None, &snapshot(black()), &token)
             .await
             .unwrap();
         assert_eq!(
@@ -305,7 +321,7 @@ mod tests {
         let s = Stabilizer::new(driver.as_ref(), config());
         let token = CancellationToken::new();
         let outcome = s
-            .until_stable("1", &snapshot(black()), &token)
+            .until_stable("1", None, &snapshot(black()), &token)
             .await
             .unwrap();
         match outcome {
@@ -337,7 +353,7 @@ mod tests {
         let s = Stabilizer::new(driver.as_ref(), config());
         let token = CancellationToken::new();
         let outcome = s
-            .until_stable("1", &snapshot(black()), &token)
+            .until_stable("1", None, &snapshot(black()), &token)
             .await
             .unwrap();
         match outcome {
@@ -364,7 +380,7 @@ mod tests {
         let s = Stabilizer::new(driver.as_ref(), config());
         let token = CancellationToken::new();
         let outcome = s
-            .until_stable("1", &snapshot(black()), &token)
+            .until_stable("1", None, &snapshot(black()), &token)
             .await
             .unwrap();
         match outcome {
@@ -400,7 +416,10 @@ mod tests {
         let driver = Arc::new(FakeStabilizeDriver::new(vec![wobble]));
         let s = Stabilizer::new(driver.as_ref(), config());
         let token = CancellationToken::new();
-        let outcome = s.until_stable("1", &snapshot(base), &token).await.unwrap();
+        let outcome = s
+            .until_stable("1", None, &snapshot(base), &token)
+            .await
+            .unwrap();
         assert!(
             matches!(outcome, StabilizeOutcome::Stable { .. }),
             "wobble below threshold counts as quiet — got {outcome:?}"
@@ -421,7 +440,7 @@ mod tests {
             let s = Stabilizer::new(driver.as_ref(), cfg);
             let started = Instant::now();
             let r = s
-                .until_stable("1", &snapshot(black()), &token_in_task)
+                .until_stable("1", None, &snapshot(black()), &token_in_task)
                 .await;
             (r, started.elapsed())
         });

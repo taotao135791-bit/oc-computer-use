@@ -735,6 +735,13 @@
             "PHYSICAL_FALLBACK_REQUIRED"
           ],
           "type": "string"
+        },
+        {
+          "description": "Round 8 / P0-1 (occlusion guard): the requested coordinate belongs to the scoped target's geometry, but the target window is NOT the currently interactable topmost owner of that point (another window — same app or other app — covers it), and no isolated actuator could safely complete the action. Direct CG is forbidden, AX could not complete it, and the runtime refuses the physical fallback because it would click the covering window. Never a generic ACTION_FAILED: the agent should expose the target, re-observe, or retry.",
+          "enum": [
+            "TARGET_OCCLUDED"
+          ],
+          "type": "string"
         }
       ]
     },

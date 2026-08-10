@@ -72,6 +72,42 @@ impl ActionRun {
     }
 }
 
+/// Round 8 / P0-1: what the `window_at_point` hit-test found at a global point
+/// in a target-scoped session. Direct CG is ONLY permitted for
+/// [`Clear`](OcclusionVerdict::Clear) (and non-target sessions, where there is
+/// nothing to be occluded against).
+#[derive(Debug, Clone, PartialEq)]
+enum OcclusionVerdict {
+    /// No session target → Direct CG is permitted (nothing to occlude it).
+    NotTargetScoped,
+    /// The topmost window at the point IS the session target (window_id + pid,
+    /// bundle auxiliary) → Direct CG is permitted.
+    Clear,
+    /// The topmost window at the point is a DIFFERENT window → the target is
+    /// occluded → Direct CG is forbidden.
+    Blocked(cu_driver::WindowAtPoint),
+    /// No normal window contains the point → Direct CG is forbidden (fail
+    /// closed: a click into the void is never sent).
+    NoWindow,
+    /// The hit-test could not be answered (driver error) → Direct CG is
+    /// forbidden (fail closed).
+    Unverifiable,
+}
+
+impl OcclusionVerdict {
+    /// Short stable label recorded in action detail so the trace shows WHY the
+    /// Direct CG path was bypassed.
+    fn label(&self) -> &'static str {
+        match self {
+            OcclusionVerdict::NotTargetScoped => "not_target_scoped",
+            OcclusionVerdict::Clear => "clear",
+            OcclusionVerdict::Blocked(_) => "blocked",
+            OcclusionVerdict::NoWindow => "no_window_at_point",
+            OcclusionVerdict::Unverifiable => "hit_test_unavailable",
+        }
+    }
+}
+
 /// Executes one batch against the driver. A fresh instance is created per batch
 /// so the takeover detector never carries state across calls.
 pub struct ActionQueue<'a> {
@@ -314,109 +350,304 @@ impl<'a> ActionQueue<'a> {
                     double,
                 } => {
                     let policy = session.get_pointer_policy();
-                    let target_pid = session
-                        .get_resolved_target()
+                    // P0-3: snapshot the human-event generation at the top of
+                    // the click so every pre-emit check below (occlusion
+                    // hit-test, Direct CG down/up, AXPress) can detect a grab
+                    // that happened DURING this action's setup — not just one
+                    // taken at the last instant.
+                    let generation_before = human.map(|h| h.human_event_generation());
+                    let resolved_target = session.get_resolved_target();
+                    let target_pid = resolved_target
+                        .as_ref()
                         .map(|r| r.pid)
                         .or_else(|| session.get_target().and_then(|t| t.pid).map(|p| p as i32));
-                    // Backend 1: Direct CG isolated click. Audit G: stamp the
-                    // synthetic event before the click is posted (a click is
-                    // real machine input even though it never moves the cursor).
-                    stamp_synthetic(human);
-                    let direct = self
-                        .driver
-                        .execute_with_cancel(&resolved, token.clone())
-                        .await;
-                    match direct {
-                        Ok(ar) if ar.success => {
-                            // Direct CGEvent isolated click succeeded. The
-                            // real system cursor was NOT moved. Audit: play
-                            // the click-ripple visual confirmation.
-                            let _ = self.driver.pointer_click_ripple(*x, *y).await;
+
+                    // Round 8 / P0-1 — occlusion guard. In a target-scoped
+                    // session, a Direct CG click at (x,y) is ONLY permitted
+                    // when the topmost window at that point IS the session
+                    // target. A point inside the target's bounds but covered
+                    // by another window must never receive a Direct CG click —
+                    // it would land on the covering window. Non-target
+                    // sessions are never occluded (there is nothing to compare
+                    // against). Fail closed whenever the hit-test cannot
+                    // confirm the target is topmost.
+                    let occlusion = self.occlusion_verdict(session, *x, *y).await;
+                    let occluded = !matches!(
+                        occlusion,
+                        OcclusionVerdict::NotTargetScoped | OcclusionVerdict::Clear
+                    );
+
+                    if occluded {
+                        // Direct CG forbidden → fail closed with
+                        // TARGET_OCCLUDED. Only a CONFIRMED different topmost
+                        // window (`Blocked`) may retry via the isolated AX
+                        // fallback: a target-PID-scoped AXPress can realize a
+                        // SINGLE click without moving the cursor. `NoWindow` and
+                        // `Unverifiable` fail closed immediately — when the
+                        // target's topmost-ness is NOT verifiable, no input is
+                        // emitted at all.
+                        //   - a double-click NEVER degrades to a single AXPress
+                        //     (AX cannot express a double-press, P1);
+                        //   - the PHYSICAL fallback NEVER runs under occlusion,
+                        //     even under `physical_allowed` (section 九) —
+                        //     warping the real cursor to click through the
+                        //     covering window is exactly the cross-app action
+                        //     this guard exists to forbid.
+                        let occlusion_label = occlusion.label().to_string();
+                        let fail_occluded = || {
                             Ok(cu_driver::ActionResult {
-                                success: true,
-                                duration_ms: started.elapsed().as_millis() as u64,
-                                detail: Some(
-                                    "pointer_backend:direct_cg_event;isolated:true;physical_cursor_moved:false;physical_cursor_delta_px:0"
-                                        .into(),
-                                ),
+                                success: false,
+                                duration_ms: 0,
+                                detail: Some("TARGET_OCCLUDED".into()),
                             })
+                        };
+                        match occlusion {
+                            OcclusionVerdict::Blocked(_) if !*double => match target_pid {
+                                Some(pid) => {
+                                    // P0-3: never emit AX input if the human
+                                    // grabbed during the occlusion hit-test
+                                    // (checked against the click-arm snapshot).
+                                    if human_grabbed(&token, generation_before, human) {
+                                        let mut detail = "cancelled by user takeover".to_string();
+                                        detail.push_str(&interrupt_telemetry_suffix(human));
+                                        Ok(cu_driver::ActionResult {
+                                            success: false,
+                                            duration_ms: started.elapsed().as_millis() as u64,
+                                            detail: Some(detail),
+                                        })
+                                    } else {
+                                        match self.driver.click_via_accessibility(pid, *x, *y).await
+                                        {
+                                            Ok(true) => {
+                                                // P0-3: the synthetic timestamp is
+                                                // updated AFTER the real AX emit
+                                                // (never before), so
+                                                // human_to_input_stop_ms measures
+                                                // the actual input landing.
+                                                stamp_synthetic(human);
+                                                let _ =
+                                                    self.driver.pointer_click_ripple(*x, *y).await;
+                                                Ok(cu_driver::ActionResult {
+                                                    success: true,
+                                                    duration_ms: started.elapsed().as_millis()
+                                                        as u64,
+                                                    detail: Some(format!(
+                                                        "pointer_backend:accessibility;isolated:true;physical_cursor_moved:false;physical_cursor_delta_px:0;occlusion:{occlusion_label}"
+                                                    )),
+                                                })
+                                            }
+                                            Ok(false) => fail_occluded(),
+                                            Err(e) => Ok(cu_driver::ActionResult {
+                                                success: false,
+                                                duration_ms: 0,
+                                                detail: Some(format!(
+                                                    "TARGET_OCCLUDED;ax_error:{e}"
+                                                )),
+                                            }),
+                                        }
+                                    }
+                                }
+                                None => fail_occluded(),
+                            },
+                            _ => fail_occluded(),
                         }
-                        Ok(_) => {
-                            // Direct CG explicitly failed (rare — click_direct
-                            // is synchronous).
-                            //
-                            // Backend 2: AXPress, isolated — EXCEPT for
-                            // double-clicks (P1). AX cannot express a
-                            // double-press, so a double-click is NEVER degraded
-                            // to a single AXPress: it skips the AX backend
-                            // entirely and goes straight to the physical
-                            // double-click (only under `physical_allowed`), or
-                            // fails closed with AX_UNSUPPORTED_FOR_DOUBLE_CLICK.
-                            if *double {
-                                if matches!(policy, PointerPolicy::PhysicalAllowed) {
-                                    self.physical_fallback_click(
-                                        session,
-                                        token.clone(),
-                                        human,
-                                        display_id,
-                                        *button,
-                                        *x,
-                                        *y,
-                                        true,
-                                        started,
-                                    )
-                                    .await
-                                } else {
+                    } else {
+                        // Direct CG permitted: the topmost window at (x,y) is
+                        // the target (or the session is not target-scoped).
+                        //
+                        // Backend 1: Direct CG isolated click. P0-3: never
+                        // emit the down/up if the human grabbed during the
+                        // occlusion hit-test / setup — a click is real machine
+                        // input even though it never moves the cursor.
+                        if human_grabbed(&token, generation_before, human) {
+                            let mut detail = "cancelled by user takeover".to_string();
+                            detail.push_str(&interrupt_telemetry_suffix(human));
+                            Ok(cu_driver::ActionResult {
+                                success: false,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                detail: Some(detail),
+                            })
+                        } else {
+                            let direct = self
+                                .driver
+                                .execute_with_cancel(&resolved, token.clone())
+                                .await;
+                            match direct {
+                                Ok(ar) if ar.success => {
+                                    // P0-3: the synthetic timestamp is updated
+                                    // AFTER the real CG emit (never before), so
+                                    // human_to_input_stop_ms measures the actual
+                                    // input landing.
+                                    stamp_synthetic(human);
+                                    // Direct CGEvent isolated click succeeded.
+                                    // The real system cursor was NOT moved.
+                                    // Audit: play the click-ripple visual
+                                    // confirmation.
+                                    let _ = self.driver.pointer_click_ripple(*x, *y).await;
                                     Ok(cu_driver::ActionResult {
-                                        success: false,
-                                        duration_ms: 0,
-                                        detail: Some("AX_UNSUPPORTED_FOR_DOUBLE_CLICK".into()),
+                                        success: true,
+                                        duration_ms: started.elapsed().as_millis() as u64,
+                                        detail: Some(
+                                            "pointer_backend:direct_cg_event;isolated:true;physical_cursor_moved:false;physical_cursor_delta_px:0"
+                                                .into(),
+                                        ),
                                     })
                                 }
-                            } else if let Some(pid) = target_pid {
-                                // Audit G: AXPress is also real machine input.
-                                stamp_synthetic(human);
-                                match self.driver.click_via_accessibility(pid, *x, *y).await {
-                                    Ok(true) => {
-                                        // Audit: AXPress realized the click —
-                                        // play the ripple confirmation.
-                                        let _ = self.driver.pointer_click_ripple(*x, *y).await;
+                                Ok(_) => {
+                                    // Direct CG explicitly failed (rare —
+                                    // click_direct is synchronous) OR the batch
+                                    // was cancelled at the emit point (P0-3):
+                                    // the down/up was suppressed, or for a
+                                    // double-click the state-1 pair landed and
+                                    // the state-2 pair was dropped. When the
+                                    // human grabbed / the token fired, NEVER
+                                    // fall back to AXPress / physical — that
+                                    // would emit input after the human event.
+                                    if human_grabbed(&token, generation_before, human) {
+                                        // A double-click's state-1 pair may have
+                                        // already landed — stamp so
+                                        // human_to_input_stop_ms records that
+                                        // real input.
+                                        if *double {
+                                            stamp_synthetic(human);
+                                        }
+                                        let mut detail = "cancelled by user takeover".to_string();
+                                        detail.push_str(&interrupt_telemetry_suffix(human));
                                         Ok(cu_driver::ActionResult {
-                                            success: true,
+                                            success: false,
                                             duration_ms: started.elapsed().as_millis() as u64,
-                                            detail: Some(
-                                                "pointer_backend:accessibility;isolated:true;physical_cursor_moved:false;physical_cursor_delta_px:0"
-                                                    .into(),
-                                            ),
+                                            detail: Some(detail),
                                         })
-                                    }
-                                    Ok(false) => {
-                                        // Backend 3: physical fallback ONLY
-                                        // when explicitly allowed.
-                                        if matches!(policy, PointerPolicy::PhysicalAllowed) {
-                                            // The full interruptible physical
-                                            // transaction lives in
-                                            // `physical_fallback_click` (P0-2,
-                                            // P0-5, P1): cursor snapshot + idle
-                                            // guard + human-grab checks before
-                                            // AND after the warp and after the
-                                            // click, a DRIVER-confirmed restore,
-                                            // and the P0-4 interrupt telemetry.
-                                            self.physical_fallback_click(
-                                                session,
-                                                token.clone(),
-                                                human,
-                                                display_id,
-                                                *button,
-                                                *x,
-                                                *y,
-                                                false,
-                                                started,
-                                            )
-                                            .await
+                                    } else {
+                                        // Backend 2: AXPress, isolated — EXCEPT
+                                        // for double-clicks (P1). AX cannot
+                                        // express a double-press, so a
+                                        // double-click is NEVER degraded to a
+                                        // single AXPress: it skips the AX backend
+                                        // entirely and goes straight to the
+                                        // physical double-click (only under
+                                        // `physical_allowed`), or fails closed
+                                        // with AX_UNSUPPORTED_FOR_DOUBLE_CLICK.
+                                        if *double {
+                                            if matches!(policy, PointerPolicy::PhysicalAllowed) {
+                                                self.physical_fallback_click(
+                                                    session,
+                                                    token.clone(),
+                                                    human,
+                                                    display_id,
+                                                    *button,
+                                                    *x,
+                                                    *y,
+                                                    true,
+                                                    started,
+                                                )
+                                                .await
+                                            } else {
+                                                Ok(cu_driver::ActionResult {
+                                                    success: false,
+                                                    duration_ms: 0,
+                                                    detail: Some(
+                                                        "AX_UNSUPPORTED_FOR_DOUBLE_CLICK".into(),
+                                                    ),
+                                                })
+                                            }
+                                        } else if let Some(pid) = target_pid {
+                                            // P0-3: never emit AX input if the
+                                            // human grabbed since the last check.
+                                            if human_grabbed(&token, generation_before, human) {
+                                                let mut detail =
+                                                    "cancelled by user takeover".to_string();
+                                                detail.push_str(&interrupt_telemetry_suffix(human));
+                                                Ok(cu_driver::ActionResult {
+                                                    success: false,
+                                                    duration_ms: started.elapsed().as_millis()
+                                                        as u64,
+                                                    detail: Some(detail),
+                                                })
+                                            } else {
+                                                match self
+                                                    .driver
+                                                    .click_via_accessibility(pid, *x, *y)
+                                                    .await
+                                                {
+                                                    Ok(true) => {
+                                                        // P0-3: the synthetic
+                                                        // timestamp is updated
+                                                        // AFTER the real AX emit.
+                                                        stamp_synthetic(human);
+                                                        // Audit: AXPress realized
+                                                        // the click — play the
+                                                        // ripple confirmation.
+                                                        let _ = self
+                                                            .driver
+                                                            .pointer_click_ripple(*x, *y)
+                                                            .await;
+                                                        Ok(cu_driver::ActionResult {
+                                                            success: true,
+                                                            duration_ms: started.elapsed().as_millis()
+                                                                as u64,
+                                                            detail: Some(
+                                                                "pointer_backend:accessibility;isolated:true;physical_cursor_moved:false;physical_cursor_delta_px:0"
+                                                                    .into(),
+                                                            ),
+                                                        })
+                                                    }
+                                                    Ok(false) => {
+                                                        // Backend 3: physical
+                                                        // fallback ONLY when
+                                                        // explicitly allowed.
+                                                        if matches!(
+                                                            policy,
+                                                            PointerPolicy::PhysicalAllowed
+                                                        ) {
+                                                            // The full interruptible
+                                                            // physical transaction
+                                                            // lives in
+                                                            // `physical_fallback_click`
+                                                            // (P0-2, P0-5, P1):
+                                                            // cursor snapshot +
+                                                            // idle guard + human-grab
+                                                            // checks before AND
+                                                            // after the warp and
+                                                            // after the click, a
+                                                            // DRIVER-confirmed
+                                                            // restore, and the P0-4
+                                                            // interrupt telemetry.
+                                                            self.physical_fallback_click(
+                                                                session,
+                                                                token.clone(),
+                                                                human,
+                                                                display_id,
+                                                                *button,
+                                                                *x,
+                                                                *y,
+                                                                false,
+                                                                started,
+                                                            )
+                                                            .await
+                                                        } else {
+                                                            // isolated_only /
+                                                            // isolated_preferred with
+                                                            // no explicit physical ->
+                                                            // fail.
+                                                            Ok(cu_driver::ActionResult {
+                                                                success: false,
+                                                                duration_ms: 0,
+                                                                detail: Some(
+                                                                    "ISOLATED_POINTER_UNAVAILABLE"
+                                                                        .into(),
+                                                                ),
+                                                            })
+                                                        }
+                                                    }
+                                                    Err(e) => Ok(cu_driver::ActionResult {
+                                                        success: false,
+                                                        duration_ms: 0,
+                                                        detail: Some(e.to_string()),
+                                                    }),
+                                                }
+                                            }
                                         } else {
-                                            // isolated_only / isolated_preferred
-                                            // with no explicit physical -> fail.
                                             Ok(cu_driver::ActionResult {
                                                 success: false,
                                                 duration_ms: 0,
@@ -424,29 +655,20 @@ impl<'a> ActionQueue<'a> {
                                             })
                                         }
                                     }
-                                    Err(e) => Ok(cu_driver::ActionResult {
-                                        success: false,
-                                        duration_ms: 0,
-                                        detail: Some(e.to_string()),
-                                    }),
                                 }
-                            } else {
-                                Ok(cu_driver::ActionResult {
-                                    success: false,
-                                    duration_ms: 0,
-                                    detail: Some("ISOLATED_POINTER_UNAVAILABLE".into()),
-                                })
+                                Err(e) => {
+                                    // A real driver failure (permission, bridge,
+                                    // or an injected test failure) is surfaced
+                                    // as the action failure — never silently
+                                    // downgraded to a fallback. No event was
+                                    // emitted, so no synthetic stamp.
+                                    Ok(cu_driver::ActionResult {
+                                        success: false,
+                                        duration_ms: started.elapsed().as_millis() as u64,
+                                        detail: Some(e.to_string()),
+                                    })
+                                }
                             }
-                        }
-                        Err(e) => {
-                            // A real driver failure (permission, bridge, or an
-                            // injected test failure) is surfaced as the action
-                            // failure — never silently downgraded to a fallback.
-                            Ok(cu_driver::ActionResult {
-                                success: false,
-                                duration_ms: started.elapsed().as_millis() as u64,
-                                detail: Some(e.to_string()),
-                            })
                         }
                     }
                 }
@@ -841,6 +1063,36 @@ impl<'a> ActionQueue<'a> {
             }),
         };
         be
+    }
+
+    /// Round 8 / P0-1: before a Direct CG click, in a target-scoped session,
+    /// verify the coordinate's topmost window IS the session target. The
+    /// identity comparison is window_id + pid (the primary signal), with the
+    /// bundle as an auxiliary consistency check — a window whose owner PID is
+    /// the target's PID and whose window id equals the target's window id IS
+    /// the target, so a bundle mismatch between two known bundles is treated
+    /// as a block (fail closed, never click through a possibly-recycled id).
+    /// `Ok(None)` from the hit-test and driver errors both fail closed: Direct
+    /// CG is NEVER attempted when the target's topmost-ness is unverifiable.
+    async fn occlusion_verdict(&self, session: &SharedSession, x: f64, y: f64) -> OcclusionVerdict {
+        let Some(target) = session.get_resolved_target() else {
+            return OcclusionVerdict::NotTargetScoped;
+        };
+        match self.driver.window_at_point(x, y).await {
+            Ok(Some(top)) => {
+                let identity_matches = top.window_id == target.window_id && top.pid == target.pid;
+                let bundle_consistent = top.bundle_id == "unknown"
+                    || target.bundle_id == "unknown"
+                    || top.bundle_id == target.bundle_id;
+                if identity_matches && bundle_consistent {
+                    OcclusionVerdict::Clear
+                } else {
+                    OcclusionVerdict::Blocked(top)
+                }
+            }
+            Ok(None) => OcclusionVerdict::NoWindow,
+            Err(_) => OcclusionVerdict::Unverifiable,
+        }
     }
 
     /// Convert a wire action into a driver action in global points.
@@ -1363,6 +1615,201 @@ mod tests {
         }
     }
 
+    /// Fake driver that exercises the P0-1 occlusion guard. `window_at_point`
+    /// returns a configurable topmost window (or none / an error), and the
+    /// Direct CG click / AXPress / physical backends are counted so a test can
+    /// assert which backend actually ran — a blocked click must never reach
+    /// Direct CG, and an occluded double-click must never reach AX or physical.
+    struct OcclusionDriver {
+        /// What `window_at_point` reports as topmost. None = no window at point.
+        topmost: std::sync::Mutex<Option<cu_driver::WindowAtPoint>>,
+        /// When true, `window_at_point` fails (driver error) → unverifiable.
+        hit_test_fails: std::sync::atomic::AtomicBool,
+        /// Whether the Direct CG click reports success (when it is reached).
+        direct_click_succeeds: std::sync::atomic::AtomicBool,
+        /// Direct CG clicks attempted (the exact thing occlusion must prevent).
+        direct_clicks: std::sync::atomic::AtomicUsize,
+        /// AXPress attempts (occluded singles may retry via AX).
+        ax_calls: std::sync::atomic::AtomicUsize,
+        /// Whether AXPress reports success.
+        ax_succeeds: std::sync::atomic::AtomicBool,
+        /// Physical clicks attempted (must stay 0 under occlusion).
+        physical_clicks: std::sync::atomic::AtomicUsize,
+        /// P0-3: the human monitor the fake reports into.
+        human: std::sync::Mutex<Option<std::sync::Arc<HumanInputMonitor>>>,
+        /// P0-3: when true, `window_at_point` fires a REAL human event mid
+        /// hit-test — the grab lands after the click-arm generation snapshot
+        /// but before the Direct CG / AX emit, exercising the pre-emit
+        /// `human_grabbed` checks.
+        human_grab_in_hit_test: std::sync::atomic::AtomicBool,
+        /// P0-3: when true, the Direct CG `execute_with_cancel` fires a REAL
+        /// human event — the grab lands DURING the emit itself, so the
+        /// `Ok(_)` fallback arm must NOT degrade to AXPress.
+        human_grab_at_direct: std::sync::atomic::AtomicBool,
+    }
+
+    impl Default for OcclusionDriver {
+        fn default() -> Self {
+            Self {
+                topmost: std::sync::Mutex::new(None),
+                hit_test_fails: std::sync::atomic::AtomicBool::new(false),
+                direct_click_succeeds: std::sync::atomic::AtomicBool::new(true),
+                direct_clicks: std::sync::atomic::AtomicUsize::new(0),
+                ax_calls: std::sync::atomic::AtomicUsize::new(0),
+                ax_succeeds: std::sync::atomic::AtomicBool::new(true),
+                physical_clicks: std::sync::atomic::AtomicUsize::new(0),
+                human: std::sync::Mutex::new(None),
+                human_grab_in_hit_test: std::sync::atomic::AtomicBool::new(false),
+                human_grab_at_direct: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ComputerDriver for OcclusionDriver {
+        async fn execute_with_cancel(
+            &self,
+            action: &ResolvedAction,
+            _cancel: CancellationToken,
+        ) -> Result<cu_driver::ActionResult, CuError> {
+            match action {
+                ResolvedAction::Click { .. } => {
+                    // P0-3: simulate the user grabbing the mouse DURING the
+                    // Direct CG emit — the runtime's `Ok(_)` arm must see the
+                    // grab and NOT degrade to AXPress / physical.
+                    if self
+                        .human_grab_at_direct
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        if let Some(h) = self.human.lock().unwrap().clone() {
+                            h.record_human_event(std::time::Instant::now());
+                        }
+                    }
+                    self.direct_clicks
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(cu_driver::ActionResult {
+                        success: self
+                            .direct_click_succeeds
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                        duration_ms: 1,
+                        detail: None,
+                    })
+                }
+                ResolvedAction::Move { .. } => Ok(cu_driver::ActionResult {
+                    success: true,
+                    duration_ms: 1,
+                    detail: None,
+                }),
+                _ => Ok(cu_driver::ActionResult {
+                    success: true,
+                    duration_ms: 1,
+                    detail: None,
+                }),
+            }
+        }
+
+        async fn execute(
+            &self,
+            action: &ResolvedAction,
+        ) -> Result<cu_driver::ActionResult, CuError> {
+            self.execute_with_cancel(action, CancellationToken::new())
+                .await
+        }
+
+        async fn window_at_point(
+            &self,
+            _x: f64,
+            _y: f64,
+        ) -> Result<Option<cu_driver::WindowAtPoint>, CuError> {
+            // P0-3: simulate the user grabbing the mouse DURING the hit-test —
+            // the grab lands after the click-arm generation snapshot but before
+            // any emit.
+            if self
+                .human_grab_in_hit_test
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(h) = self.human.lock().unwrap().clone() {
+                    h.record_human_event(std::time::Instant::now());
+                }
+            }
+            if self
+                .hit_test_fails
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CuError::Driver("hit-test failed".into()));
+            }
+            Ok(self.topmost.lock().unwrap().clone())
+        }
+
+        async fn click_via_accessibility(
+            &self,
+            _pid: i32,
+            _x: f64,
+            _y: f64,
+        ) -> Result<bool, CuError> {
+            self.ax_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.ax_succeeds.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
+        async fn physical_click_at(
+            &self,
+            _button: MouseButton,
+            _x: f64,
+            _y: f64,
+        ) -> Result<bool, CuError> {
+            self.physical_clicks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn physical_double_click_at(
+            &self,
+            _button: MouseButton,
+            _x: f64,
+            _y: f64,
+        ) -> Result<bool, CuError> {
+            self.physical_clicks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn pointer_location(&self) -> Result<cu_driver::PointerInfo, CuError> {
+            Ok(cu_driver::PointerInfo {
+                location: cu_core::Point::new(10.0, 10.0),
+                display_id: None,
+            })
+        }
+
+        async fn list_displays(&self) -> Result<Vec<cu_driver::DisplayInfo>, CuError> {
+            unimplemented!()
+        }
+        async fn desktop_layout(&self) -> Result<cu_driver::DesktopLayout, CuError> {
+            unimplemented!()
+        }
+        async fn capture(
+            &self,
+            _request: cu_driver::CaptureRequest,
+        ) -> Result<cu_driver::CapturedFrame, CuError> {
+            unimplemented!()
+        }
+        async fn quick_snapshot(
+            &self,
+            _display_id: &str,
+        ) -> Result<cu_driver::QuickSnapshot, CuError> {
+            unimplemented!()
+        }
+        async fn permission_status(&self) -> Result<cu_driver::PermissionStatus, CuError> {
+            unimplemented!()
+        }
+        async fn active_application(&self) -> Result<Option<cu_driver::ApplicationInfo>, CuError> {
+            unimplemented!()
+        }
+        async fn shutdown(&self) -> Result<(), CuError> {
+            Ok(())
+        }
+    }
+
     /// Run a single Click through the queue under `physical_allowed`.
     async fn run_physical_click(
         fake: &dyn ComputerDriver,
@@ -1707,6 +2154,561 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // Round 8 / P0-1: Target Occlusion Guard (window_at_point hit-test)
+    // ------------------------------------------------------------------
+
+    /// The resolved target window every occlusion test clicks inside
+    /// (bounds (0,0,400,300) contains the normalized (100,100) → (128,80)).
+    fn occlusion_target() -> Option<cu_driver::ResolvedSessionTarget> {
+        Some(cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 42,
+            window_id: 7,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 400.0,
+                height: 300.0,
+            }),
+        })
+    }
+
+    /// P0-1: run action(s) through a target-scoped session under
+    /// `physical_allowed` — the strictest occlusion case, because the physical
+    /// fallback must NOT run even when it is explicitly permitted.
+    async fn run_occlusion(
+        fake: &dyn ComputerDriver,
+        resolved: Option<cu_driver::ResolvedSessionTarget>,
+        actions: Vec<ComputerAction>,
+        human: Option<&HumanInputMonitor>,
+    ) -> Vec<ActionRun> {
+        let queue = ActionQueue::new(fake);
+        let session = std::sync::Arc::new(Session::new(
+            "s".into(),
+            "1".into(),
+            "test".into(),
+            None,
+            cu_core::SecretTokenHash::from_token(&cu_core::generate_control_token()),
+            cu_core::SecretTokenHash::from_token(&cu_core::generate_observation_token()),
+            None,
+        ));
+        session.set_pointer_policy(PointerPolicy::PhysicalAllowed);
+        session.set_resolved_target(resolved);
+        let geometry = ImageGeometry {
+            image_width_px: 1280,
+            image_height_px: 800,
+            display_bounds: cu_core::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1280.0,
+                height: 800.0,
+            },
+        };
+        let token = CancellationToken::new();
+        let mut takeover = TakeoverDetector {
+            policy: TakeoverPolicy::AutoPause,
+            ..Default::default()
+        };
+        queue
+            .run(
+                &session,
+                &actions,
+                &geometry,
+                token,
+                &mut takeover,
+                human,
+                None,
+                None,
+                "f",
+                "1",
+                None,
+                (),
+                Some("active"),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn occlusion_click() -> ComputerAction {
+        ComputerAction::Click {
+            x: 100.0,
+            y: 100.0,
+            button: MouseButton::Left,
+            coordinate_space: CoordinateSpace::Normalized1000,
+        }
+    }
+
+    fn occlusion_double_click() -> ComputerAction {
+        ComputerAction::DoubleClick {
+            x: 100.0,
+            y: 100.0,
+            button: MouseButton::Left,
+            coordinate_space: CoordinateSpace::Normalized1000,
+        }
+    }
+
+    /// Case A: the target IS the topmost window at the point → Direct CG is
+    /// permitted and used.
+    #[tokio::test]
+    async fn occlusion_case_a_target_topmost_allows_direct_cg() {
+        let fake = Arc::new(OcclusionDriver::default());
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 7,
+            pid: 42,
+            bundle_id: "com.example.Target".into(),
+        });
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_click()],
+            None,
+        )
+        .await;
+        assert_eq!(runs[0].status, "success");
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Case A: the target IS topmost → Direct CG click permitted"
+        );
+        assert_eq!(fake.ax_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            fake.physical_clicks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let p = runs[0].pointer.clone().unwrap();
+        assert_eq!(p.backend, "direct_cg_event");
+    }
+
+    /// Case B: another window covers the target at the point → Direct CG is
+    /// forbidden; a single click retries a target-PID-scoped AXPress; when AX
+    /// cannot realize it, the action fails closed with TARGET_OCCLUDED.
+    #[tokio::test]
+    async fn occlusion_case_b_occluded_single_ax_fails_closes() {
+        let fake = Arc::new(OcclusionDriver::default());
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 99,
+            pid: 9,
+            bundle_id: "com.other.Window".into(),
+        });
+        fake.ax_succeeds
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_click()],
+            None,
+        )
+        .await;
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].error.as_deref(), Some("TARGET_OCCLUDED"));
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "occluded → Direct CG forbidden, even though the point is inside the target's bounds"
+        );
+        assert_eq!(
+            fake.ax_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "occluded single click retries target-pid AXPress"
+        );
+        assert_eq!(
+            fake.physical_clicks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "physical fallback NEVER runs under occlusion, even under physical_allowed"
+        );
+    }
+
+    /// Case B2: occluded single click where AX CAN realize it → success via
+    /// the accessibility backend (isolated, no cursor movement, no Direct CG).
+    #[tokio::test]
+    async fn occlusion_case_b2_occluded_single_ax_succeeds() {
+        let fake = Arc::new(OcclusionDriver::default());
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 99,
+            pid: 9,
+            bundle_id: "com.other.Window".into(),
+        });
+        fake.ax_succeeds
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_click()],
+            None,
+        )
+        .await;
+        assert_eq!(runs[0].status, "success");
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "occluded → Direct CG never used even when AX succeeds"
+        );
+        assert_eq!(fake.ax_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let p = runs[0].pointer.clone().unwrap();
+        assert_eq!(p.backend, "accessibility");
+    }
+
+    /// Case C: an occluded DOUBLE-click never degrades to a single AXPress and
+    /// never reaches the physical backend — even under `physical_allowed` — and
+    /// fails closed with TARGET_OCCLUDED.
+    #[tokio::test]
+    async fn occlusion_case_c_occluded_double_click_never_degrades_never_physical() {
+        let fake = Arc::new(OcclusionDriver::default());
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 99,
+            pid: 9,
+            bundle_id: "com.other.Window".into(),
+        });
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_double_click()],
+            None,
+        )
+        .await;
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].error.as_deref(), Some("TARGET_OCCLUDED"));
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            fake.ax_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a double-click is NEVER degraded to a single AXPress"
+        );
+        assert_eq!(
+            fake.physical_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "physical double-click NEVER runs when the target is occluded — even under physical_allowed"
+        );
+    }
+
+    /// Case D: no normal window at the point → Direct CG forbidden (fail
+    /// closed); the single-click AX retry still fails closed to TARGET_OCCLUDED.
+    #[tokio::test]
+    async fn occlusion_case_d_no_window_at_point_fails_closed() {
+        let fake = Arc::new(OcclusionDriver::default());
+        *fake.topmost.lock().unwrap() = None;
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_click()],
+            None,
+        )
+        .await;
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].error.as_deref(), Some("TARGET_OCCLUDED"));
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a click into the void is never sent as Direct CG"
+        );
+        assert_eq!(
+            fake.physical_clicks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    /// Case D2: the hit-test itself fails (driver error) → Direct CG forbidden
+    /// (fail closed); the target's topmost-ness is unverifiable.
+    #[tokio::test]
+    async fn occlusion_case_d2_hit_test_error_fails_closed() {
+        let fake = Arc::new(OcclusionDriver::default());
+        fake.hit_test_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_click()],
+            None,
+        )
+        .await;
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].error.as_deref(), Some("TARGET_OCCLUDED"));
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "unverifiable topmost-ness → never click through"
+        );
+    }
+
+    /// Case E: a NON-target session is never occluded — there is no window to
+    /// compare against, so Direct CG proceeds exactly as before.
+    #[tokio::test]
+    async fn occlusion_case_e_non_target_session_not_guarded() {
+        let fake = Arc::new(OcclusionDriver::default());
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 99,
+            pid: 9,
+            bundle_id: "com.other.Window".into(),
+        });
+        let runs = run_occlusion(fake.as_ref(), None, vec![occlusion_click()], None).await;
+        assert_eq!(runs[0].status, "success");
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "non-target session → Direct CG unaffected by the hit-test"
+        );
+        let p = runs[0].pointer.clone().unwrap();
+        assert_eq!(p.backend, "direct_cg_event");
+    }
+
+    /// Case F: window_id + pid match the target but the bundle differs — the
+    /// auxiliary bundle check blocks (fail closed) rather than clicking through.
+    #[tokio::test]
+    async fn occlusion_case_f_bundle_mismatch_blocks_even_with_matching_ids() {
+        let fake = Arc::new(OcclusionDriver::default());
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 7,
+            pid: 42,
+            bundle_id: "com.other.Window".into(),
+        });
+        fake.ax_succeeds
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_click()],
+            None,
+        )
+        .await;
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].error.as_deref(), Some("TARGET_OCCLUDED"));
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "auxiliary bundle mismatch blocks Direct CG even with matching window_id+pid"
+        );
+    }
+
+    /// P0-3: the user grabbed DURING the occlusion hit-test — before any emit.
+    /// The Direct CG down/up must NOT be posted (direct_clicks == 0), no
+    /// synthetic timestamp may be stamped (nothing was emitted), and the
+    /// action fails with the real interrupt telemetry.
+    #[tokio::test]
+    async fn p03_direct_cg_suppressed_when_human_grabs_before_emit() {
+        let fake = Arc::new(OcclusionDriver::default());
+        let human = Arc::new(HumanInputMonitor::new());
+        *fake.human.lock().unwrap() = Some(human.clone());
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 7,
+            pid: 42,
+            bundle_id: "com.example.Target".into(),
+        });
+        fake.human_grab_in_hit_test
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_click()],
+            Some(human.as_ref()),
+        )
+        .await;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "failed");
+        let err = runs[0]
+            .error
+            .as_deref()
+            .expect("a failed action carries an error");
+        assert!(err.contains("cancelled by user takeover"), "got: {err}");
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a Direct CG click must never be posted after a human grab"
+        );
+        assert_eq!(
+            fake.ax_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no fallback may run after a human grab"
+        );
+        assert_eq!(
+            human.synthetic_count(),
+            0,
+            "no real input was emitted → no synthetic stamp"
+        );
+    }
+
+    /// P0-3: under occlusion, a human grab during the hit-test must also
+    /// suppress the isolated AXPress retry — never emit input after a human
+    /// event through any backend.
+    #[tokio::test]
+    async fn p03_occluded_ax_suppressed_when_human_grabs_before_emit() {
+        let fake = Arc::new(OcclusionDriver::default());
+        let human = Arc::new(HumanInputMonitor::new());
+        *fake.human.lock().unwrap() = Some(human.clone());
+        // A DIFFERENT window is topmost → Blocked → single clicks may retry
+        // via the isolated AXPress backend.
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 99,
+            pid: 9,
+            bundle_id: "com.other.Window".into(),
+        });
+        fake.human_grab_in_hit_test
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_click()],
+            Some(human.as_ref()),
+        )
+        .await;
+        assert_eq!(runs[0].status, "failed");
+        let err = runs[0]
+            .error
+            .as_deref()
+            .expect("a failed action carries an error");
+        assert!(err.contains("cancelled by user takeover"), "got: {err}");
+        assert_eq!(
+            fake.ax_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "AXPress must never run after a human grab"
+        );
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Direct CG must never run under occlusion"
+        );
+    }
+
+    /// P0-3 core race fix: a Direct CG click that FAILED (or was cancelled)
+    /// DURING the emit — the human grabbed inside `execute_with_cancel` — must
+    /// NOT degrade to the AXPress fallback. The old code fell through to AX on
+    /// any `Ok(_)`, so a cancelled Direct CG click would emit AX input after
+    /// the human event.
+    #[tokio::test]
+    async fn p03_cancelled_direct_cg_does_not_degrade_to_axpress() {
+        let fake = Arc::new(OcclusionDriver::default());
+        let human = Arc::new(HumanInputMonitor::new());
+        *fake.human.lock().unwrap() = Some(human.clone());
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 7,
+            pid: 42,
+            bundle_id: "com.example.Target".into(),
+        });
+        fake.direct_click_succeeds
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        fake.human_grab_at_direct
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_click()],
+            Some(human.as_ref()),
+        )
+        .await;
+        assert_eq!(runs[0].status, "failed");
+        let err = runs[0]
+            .error
+            .as_deref()
+            .expect("a failed action carries an error");
+        assert!(err.contains("cancelled by user takeover"), "got: {err}");
+        assert_eq!(
+            fake.ax_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a cancelled Direct CG click must NOT fall through to AXPress"
+        );
+        assert_eq!(
+            fake.physical_clicks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a cancelled Direct CG click must NOT fall through to physical"
+        );
+        assert_eq!(
+            human.synthetic_count(),
+            0,
+            "single-click: nothing landed, so nothing is stamped"
+        );
+    }
+
+    /// P0-3: a DOUBLE-click cancelled during the emit (state-1 pair already
+    /// landed) stamps exactly ONE synthetic event — the real single click that
+    /// DID land — but never degrades to AX / physical.
+    #[tokio::test]
+    async fn p03_double_click_cancelled_after_state1_stamps_the_landed_click() {
+        let fake = Arc::new(OcclusionDriver::default());
+        let human = Arc::new(HumanInputMonitor::new());
+        *fake.human.lock().unwrap() = Some(human.clone());
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 7,
+            pid: 42,
+            bundle_id: "com.example.Target".into(),
+        });
+        fake.direct_click_succeeds
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        fake.human_grab_at_direct
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_double_click()],
+            Some(human.as_ref()),
+        )
+        .await;
+        assert_eq!(runs[0].status, "failed");
+        let err = runs[0]
+            .error
+            .as_deref()
+            .expect("a failed action carries an error");
+        assert!(err.contains("cancelled by user takeover"), "got: {err}");
+        assert_eq!(
+            fake.ax_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a double-click must NEVER degrade to single AXPress"
+        );
+        assert_eq!(
+            fake.physical_clicks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a cancelled double-click must not borrow the physical cursor"
+        );
+        assert_eq!(
+            human.synthetic_count(),
+            1,
+            "the state-1 single click that landed is stamped exactly once"
+        );
+    }
+
+    /// P0-3: a successful Direct CG click stamps exactly ONE synthetic event,
+    /// and the stamp happens AFTER the emit (the click landed).
+    #[tokio::test]
+    async fn p03_successful_direct_cg_stamps_one_synthetic_after_emit() {
+        let fake = Arc::new(OcclusionDriver::default());
+        let human = Arc::new(HumanInputMonitor::new());
+        *fake.human.lock().unwrap() = Some(human.clone());
+        *fake.topmost.lock().unwrap() = Some(cu_driver::WindowAtPoint {
+            window_id: 7,
+            pid: 42,
+            bundle_id: "com.example.Target".into(),
+        });
+        let runs = run_occlusion(
+            fake.as_ref(),
+            occlusion_target(),
+            vec![occlusion_click()],
+            Some(human.as_ref()),
+        )
+        .await;
+        assert_eq!(runs[0].status, "success");
+        assert_eq!(
+            fake.direct_clicks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the Direct CG click ran"
+        );
+        assert_eq!(
+            human.synthetic_count(),
+            1,
+            "exactly one synthetic stamp for one landed click"
+        );
+        assert!(
+            human.human_to_input_stop_ms().is_none() || human.human_to_input_stop_ms() == Some(0),
+            "with no human event, the KPI stays None/0"
+        );
     }
 
     /// P0-7a: a Drag whose START point is outside the target window is refused

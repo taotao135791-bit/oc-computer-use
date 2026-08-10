@@ -284,12 +284,29 @@ impl ComputerDriver for MacosDriver {
                 button,
                 double,
             } => {
+                // P0-3: cancel checks AT THE EMIT POINT. The runtime already
+                // checks before dispatching; this closes the last race:
+                //   - single click: never post the down/up if the token fired;
+                //   - double click: always post the state-1 pair, but suppress
+                //     the state-2 completion if the token fired between the
+                //     pairs (a double-click must never complete after a human
+                //     event). The suppressed case is still signalled as
+                //     cancelled so the runtime never falls back to AXPress /
+                //     physical.
                 if *double {
-                    mouse::double_click_direct(*button, *x, *y);
+                    if !mouse::double_click_direct_cancel(*button, *x, *y, &cancel) {
+                        Err(CuError::Cancelled)
+                    } else {
+                        Ok(())
+                    }
                 } else {
-                    mouse::click_direct(*button, *x, *y);
+                    if cancel.is_cancelled() {
+                        Err(CuError::Cancelled)
+                    } else {
+                        mouse::click_direct(*button, *x, *y);
+                        Ok(())
+                    }
                 }
-                Ok(())
             }
             ResolvedAction::Move {
                 from,
@@ -639,6 +656,71 @@ impl ComputerDriver for MacosDriver {
             })
         }))
     }
+
+    /// Round 8 / P0-1: the topmost interactive window at a global point via
+    /// the Swift bridge's `window_at_point` (CGWindowListCopyWindowInfo,
+    /// first normal window whose bounds contain the point — the window that
+    /// Direct CG would actually click).
+    async fn window_at_point(
+        &self,
+        x: f64,
+        y: f64,
+    ) -> Result<Option<cu_driver::WindowAtPoint>, CuError> {
+        let data = self
+            .bridge
+            .request("window_at_point", serde_json::json!({ "x": x, "y": y }))?;
+        Ok(parse_window_at_point(&data))
+    }
+
+    /// Round 8 / P0-2: cheap low-res snapshot of a display REGION (pixel
+    /// space) — the target-scoped fingerprint source. The `region` is passed
+    /// straight into the capture so the thumbnail comes from the target WINDOW
+    /// CROP, never the full desktop. `region == None` delegates to
+    /// [`quick_snapshot`](Self::quick_snapshot) (full display).
+    async fn quick_snapshot_region(
+        &self,
+        display_id: &str,
+        region: Option<cu_driver::CaptureRegion>,
+    ) -> Result<QuickSnapshot, CuError> {
+        let Some(region) = region else {
+            return self.quick_snapshot(display_id).await;
+        };
+        self.resolve_display(display_id)?;
+        let tmp_dir = std::env::temp_dir().join("computer-use-quick");
+        std::fs::create_dir_all(&tmp_dir).ok();
+        let path = tmp_dir.join(format!(
+            "quick-{display_id}-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let req = CaptureRequest {
+            display_id: display_id.to_string(),
+            output_path: path.clone(),
+            include_cursor: false,
+            max_width: 96,
+            format: "png".into(),
+            jpeg_quality: 70,
+            region: Some(region),
+        };
+        let frame = self.capture(req).await?;
+        let thumbnail = capture::to_grayscale_thumbnail(&frame.image_bytes, 64, 64)?;
+        let _ = std::fs::remove_file(&path);
+        Ok(QuickSnapshot {
+            thumbnail,
+            thumb_width: 64,
+            thumb_height: 64,
+            display_id: display_id.to_string(),
+            // P0-2: target-scoped snapshots must NEVER fire app-change staleness.
+            // The runtime overrides `active_application` with the target's own
+            // bundle after this call; here we keep the frontmost app for the
+            // full-display fallback (unchanged behavior).
+            active_application: self.active_application().await?,
+            captured_at: chrono::Utc::now(),
+        })
+    }
 }
 
 /// Parse the bridge's `resolve_target` response into a resolved session
@@ -683,6 +765,28 @@ fn parse_resolved_target(
         window_id,
         bounds,
     }))
+}
+
+/// Parse the bridge's `window_at_point` response into a [`cu_driver::WindowAtPoint`].
+/// `["found": false]` (no normal window at the point) → `None`. A window that
+/// cannot be fully identified (missing fields / `"unknown"` bundle) is still
+/// returned — the RUNTIME decides how to treat a hit whose identity is not
+/// comparable to the target (it must fail closed, never click through).
+/// Extracted so the parsing contract is testable without a live Swift bridge.
+fn parse_window_at_point(data: &Value) -> Option<cu_driver::WindowAtPoint> {
+    if data.get("found").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let w = data.get("window")?;
+    Some(cu_driver::WindowAtPoint {
+        window_id: w.get("window_id").and_then(Value::as_i64)? as u32,
+        pid: w.get("pid").and_then(Value::as_i64)? as i32,
+        bundle_id: w
+            .get("bundle_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".into()),
+    })
 }
 
 impl MacosDriver {
@@ -856,5 +960,37 @@ mod tests {
             .is_none(),
             "missing bundle -> None (cannot identify the window)"
         );
+    }
+
+    #[test]
+    fn window_at_point_parse_extracts_topmost_identity() {
+        // Round 8 / P0-1: the hit-test response carries the window_id + pid +
+        // bundle that the runtime compares against the session target.
+        let data = serde_json::json!({
+            "found": true,
+            "window": {"window_id": 7, "pid": 42, "bundle_id": "com.example.Target"}
+        });
+        let w = parse_window_at_point(&data).expect("a found hit parses");
+        assert_eq!(w.window_id, 7);
+        assert_eq!(w.pid, 42);
+        assert_eq!(w.bundle_id, "com.example.Target");
+    }
+
+    #[test]
+    fn window_at_point_parse_absent_hit_is_none() {
+        // Round 8 / P0-1: no normal window at the point -> None (the runtime
+        // treats a missing hit as fail-closed, never a click through).
+        assert!(parse_window_at_point(
+            &serde_json::json!({"found": false, "reason": "no_window_at_point"})
+        )
+        .is_none());
+        // A hit whose identity is incomplete is still returned — the RUNTIME
+        // decides what an incomparable hit means (it must fail closed).
+        let w = parse_window_at_point(&serde_json::json!({
+            "found": true,
+            "window": {"window_id": 7, "pid": 42, "bundle_id": "unknown"}
+        }))
+        .expect("a hit with an unknown bundle still parses");
+        assert_eq!(w.bundle_id, "unknown");
     }
 }

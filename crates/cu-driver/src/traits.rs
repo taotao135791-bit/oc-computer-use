@@ -207,6 +207,36 @@ pub trait ComputerDriver: Send + Sync {
     ) -> Result<Option<cu_core::DisplayBounds>, CuError> {
         Ok(None)
     }
+
+    /// Round 8 / P0-1: the topmost interactive window at a global logical
+    /// point (`window_at_point`). The runtime calls this BEFORE a Direct CG
+    /// click in a target-scoped session: only when the returned window matches
+    /// the session target (same `window_id` AND `pid`, bundle as an auxiliary
+    /// consistency check) may the click go through. `None` when no normal
+    /// window contains the point. Default implementations return `None` so
+    /// test/fake drivers (which never hit a real occlusion) keep working.
+    async fn window_at_point(
+        &self,
+        _x: f64,
+        _y: f64,
+    ) -> Result<Option<crate::types::WindowAtPoint>, CuError> {
+        Ok(None)
+    }
+
+    /// Round 8 / P0-2: a cheap low-res snapshot of a DISPLAY REGION (pixel
+    /// space, relative to the display's top-left) — used for target-scoped
+    /// stale-frame / fingerprint / stabilizer data, so the snapshot comes from
+    /// the target WINDOW CROP and never the full desktop. `region == None`
+    /// falls back to the full display (i.e. [`quick_snapshot`]). Default
+    /// implementation delegates to [`quick_snapshot`](Self::quick_snapshot)
+    /// so test/fake drivers keep working.
+    async fn quick_snapshot_region(
+        &self,
+        display_id: &str,
+        _region: Option<crate::types::CaptureRegion>,
+    ) -> Result<QuickSnapshot, CuError> {
+        self.quick_snapshot(display_id).await
+    }
 }
 
 pub use crate::types::ActionResult;

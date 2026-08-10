@@ -195,6 +195,19 @@ pub struct ResolvedSessionTarget {
     pub bounds: Option<cu_core::DisplayBounds>,
 }
 
+/// Round 8 / P0-1 (occlusion guard): the topmost interactive window at a
+/// global point, as resolved by `window_at_point`. The runtime compares
+/// `window_id` + `pid` (and, as an auxiliary consistency check, `bundle_id`)
+/// against the session target before permitting a Direct CG click — a point
+/// that is *inside* the target's bounds but covered by another window must
+/// never receive the click.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowAtPoint {
+    pub window_id: u32,
+    pub pid: i32,
+    pub bundle_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

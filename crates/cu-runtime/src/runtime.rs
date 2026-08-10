@@ -911,6 +911,69 @@ impl Runtime {
         Ok(resolved)
     }
 
+    /// Round 8 / P0-2: the pixel-space crop region (relative to the display's
+    /// top-left) that isolates the target window for snapshots. Returns
+    /// `Ok(None)` when the session is not target-scoped — callers then fall
+    /// back to a full-desktop fingerprint. Fails when the display cannot be
+    /// found, since no crop can be computed then.
+    async fn target_crop_region(
+        &self,
+        session: &Session,
+        bounds: &cu_core::DisplayBounds,
+    ) -> Result<Option<CaptureRegion>, CuError> {
+        if session.get_target().is_none() && session.get_resolved_target().is_none() {
+            return Ok(None);
+        }
+        let displays = self.driver.list_displays().await?;
+        let disp = displays
+            .iter()
+            .find(|d| d.id == session.display_id)
+            .ok_or_else(|| {
+                CuError::Driver(format!("act: display {} not found", session.display_id))
+            })?;
+        let s = disp.scale_factor.max(f64::EPSILON);
+        Ok(Some(CaptureRegion {
+            x: (bounds.x - disp.bounds.x) * s,
+            y: (bounds.y - disp.bounds.y) * s,
+            width: bounds.width * s,
+            height: bounds.height * s,
+        }))
+    }
+
+    /// Round 8 / P0-2: the stale-frame / fingerprint / stabilizer snapshot
+    /// for a session. Target-scoped sessions sample the TARGET WINDOW CROP
+    /// (never the full desktop) and pin `active_application` to the target's
+    /// OWN bundle — so an app change in another app can never trip staleness
+    /// (section 十二) and the target's own app change can never self-stale a
+    /// target frame (section 十三). Non-target sessions keep the full-desktop
+    /// snapshot with the live frontmost app (unchanged pre-P0-2 semantics).
+    async fn fingerprint_snapshot(
+        &self,
+        session: &Session,
+        region_px: Option<CaptureRegion>,
+    ) -> Result<cu_driver::QuickSnapshot, CuError> {
+        if region_px.is_some()
+            && (session.get_target().is_some() || session.get_resolved_target().is_some())
+        {
+            let mut q = self
+                .driver
+                .quick_snapshot_region(&session.display_id, region_px)
+                .await?;
+            if let Some(rt) = session.get_resolved_target() {
+                q.active_application = Some(cu_driver::ApplicationInfo {
+                    bundle_id: rt.bundle_id.clone(),
+                    name: rt.bundle_id.clone(),
+                    window_title: None,
+                    pid: Some(rt.pid),
+                    window_id: Some(rt.window_id),
+                });
+            }
+            Ok(q)
+        } else {
+            self.driver.quick_snapshot(&session.display_id).await
+        }
+    }
+
     /// The observe core, called while the session's busy lock is held (either
     /// by [`Runtime::observe`] or by `act`'s post-batch re-observe).
     async fn observe_inner(
@@ -1022,8 +1085,12 @@ impl Runtime {
         }
 
         // A cheap snapshot gives us the thumbnail + live app name for the
-        // stale-frame fingerprint of this frame.
-        let snapshot: ScreenSnapshot = self.driver.quick_snapshot(&display_id).await?.into();
+        // stale-frame fingerprint of this frame. Round 8 / P0-2: for a
+        // window-scoped session this comes from the TARGET WINDOW CROP (never
+        // the full desktop) with `active_application` pinned to the target's
+        // own bundle, so other-app changes never stale this frame and the
+        // target's own app change never self-stales it.
+        let snapshot: ScreenSnapshot = self.fingerprint_snapshot(session, region_px).await?.into();
 
         // P0-6: a window-scoped frame's geometry is WINDOW-relative — the
         // stored bounds are the window's global bounds so `act` maps model
@@ -1180,10 +1247,39 @@ impl Runtime {
             (geom, sf.snapshot.clone())
         };
 
-        // Stale-frame check against the *live* desktop.
+        // Round 8 / P0-2: refresh the target (identity + bounds) BEFORE the
+        // stale fingerprint, so the snapshot region comes from LIVE geometry.
+        // A moved/resized window changes the crop → STALE_FRAME (the old code
+        // compared against stale bounds); an identity change (the window closed
+        // and another took its place, or the pid/bundle changed) →
+        // TARGET_UNAVAILABLE. This replaces the old post-stale-check
+        // `resolve_target_bounds`, which only re-checked the window_id and ran
+        // after the stale comparison.
+        //
+        // Guarded on `get_resolved_target()`: every act follows an observe
+        // that populates it for a target-scoped session, and a session scoped
+        // after observe with no resolution keeps the pre-P0-2 act path (the
+        // focus guard and bounds checks still protect it).
+        if session.get_resolved_target().is_some() {
+            self.refresh_resolved_target(&session).await?;
+        }
+        let target_region: Option<CaptureRegion> = if session.get_resolved_target().is_some() {
+            match session.get_target_bounds() {
+                Some(b) => self.target_crop_region(&session, &b).await?,
+                // Off-screen / no bounds: fall back to a full-desktop
+                // fingerprint (there is no window crop to sample).
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        // Stale-frame check against the *live* desktop. Round 8 / P0-2: for a
+        // target-scoped session this is the TARGET WINDOW CROP (region +
+        // pinned app), never the full desktop — changes in other apps cannot
+        // stale the referenced frame.
         let before_q = self
-            .driver
-            .quick_snapshot(&session.display_id)
+            .fingerprint_snapshot(&session, target_region)
             .await
             .map_err(|e| {
                 CuError::StaleFrame(cu_core::StaleFrameDetail {
@@ -1228,26 +1324,6 @@ impl Runtime {
                     .await;
             }
             return Err(self.stale.to_error(&verdict));
-        }
-
-        // Round 9 / P0-4: refresh the session target's CURRENT bounds before
-        // any coordinate-bearing action. Windows move / resize / minimize /
-        // close / recreate; a stale bounds would let a click land outside the
-        // real window. If the target is gone -> TARGET_UNAVAILABLE. The
-        // bounds are refreshed here (not cached at batch start), then the
-        // per-action TARGET_OUTSIDE_SESSION check in the queue uses them.
-        if let Some(rt) = session.get_resolved_target() {
-            match self.driver.resolve_target_bounds(rt.window_id).await {
-                Ok(Some(b)) => {
-                    session.set_target_bounds(Some(b));
-                }
-                // Fail closed on EVERY failure mode: a vanished window and a
-                // resolver/bridge error both mean "no act". An isolation
-                // system does not act on stale bounds.
-                Ok(None) | Err(_) => {
-                    return Err(CuError::TargetUnavailable);
-                }
-            }
         }
 
         // Bounds pre-check: every location-bearing action must be on-screen
@@ -1320,7 +1396,7 @@ impl Runtime {
             WaitPolicy::UntilStable => {
                 let stabilizer = Stabilizer::new(self.driver.as_ref(), self.config.stabilizer);
                 let outcome = stabilizer
-                    .until_stable(&session.display_id, &before_q, &token)
+                    .until_stable(&session.display_id, target_region, &before_q, &token)
                     .await;
                 match outcome {
                     Ok(StabilizeOutcome::Stable {
@@ -1359,8 +1435,10 @@ impl Runtime {
             }
         }
 
-        // Post-batch snapshot → screen_changed / stable.
-        let after_q = self.driver.quick_snapshot(&session.display_id).await?;
+        // Post-batch snapshot → screen_changed / stable. Round 8 / P0-2: the
+        // same target-crop region as `before_q` (pinned app for target
+        // sessions) so the change comparison is apples-to-apples.
+        let after_q = self.fingerprint_snapshot(&session, target_region).await?;
         let after_screen: ScreenSnapshot = after_q.into();
         let change = before_screen.change_score(&after_screen).unwrap_or(1.0);
         let screen_changed = change > self.config.stale.threshold;
@@ -1850,6 +1928,18 @@ mod tests {
         /// Tests needing realistic display geometry set this to the display's
         /// logical bounds so a full-display observe yields a consistent frame.
         pub capture_bounds: std::sync::Mutex<Option<cu_core::DisplayBounds>>,
+        /// Round 8 / P0-2: pinned target-crop thumbnail returned by
+        /// `quick_snapshot_region` (None = derive from the region coordinates,
+        /// so a moved/resized target produces different crop pixels, like a
+        /// real capture of a moved window).
+        pub snapshot_region: std::sync::Mutex<Option<Vec<u8>>>,
+        /// Round 8 / P0-2: pinned full-desktop thumbnail returned by
+        /// `quick_snapshot` (None = all zeros, the pre-P0-2 default). Set to a
+        /// different value to simulate "another app changed the desktop".
+        pub snapshot_desktop: std::sync::Mutex<Option<Vec<u8>>>,
+        /// Round 8 / P0-2: the region passed to the last `quick_snapshot_region`
+        /// call — asserts the target-crop path (never the full desktop) is used.
+        pub last_region: std::sync::Mutex<Option<CaptureRegion>>,
     }
 
     #[async_trait::async_trait]
@@ -1932,7 +2022,40 @@ mod tests {
             display_id: &str,
         ) -> Result<cu_driver::QuickSnapshot, CuError> {
             Ok(cu_driver::QuickSnapshot {
-                thumbnail: vec![0u8; 64],
+                thumbnail: self
+                    .snapshot_desktop
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| vec![0u8; 64]),
+                thumb_width: 8,
+                thumb_height: 8,
+                display_id: display_id.to_string(),
+                active_application: None,
+                captured_at: chrono::Utc::now(),
+            })
+        }
+        /// Round 8 / P0-2: target-crop snapshots. Records the region (so tests
+        /// assert the crop path runs), and returns the pinned crop thumbnail —
+        /// or, when unpinned, a thumbnail derived from the region coordinates
+        /// so a moved/resized window yields different crop pixels.
+        async fn quick_snapshot_region(
+            &self,
+            display_id: &str,
+            region: Option<CaptureRegion>,
+        ) -> Result<cu_driver::QuickSnapshot, CuError> {
+            *self.last_region.lock().unwrap() = region;
+            let thumbnail = match region {
+                Some(r) => self
+                    .snapshot_region
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| vec![(r.x as u8).wrapping_add(r.y as u8); 64]),
+                None => vec![0u8; 64],
+            };
+            Ok(cu_driver::QuickSnapshot {
+                thumbnail,
                 thumb_width: 8,
                 thumb_height: 8,
                 display_id: display_id.to_string(),
@@ -3195,6 +3318,75 @@ mod tests {
         (s.session_id, token, obs.frame_id)
     }
 
+    /// Round 8 / P0-2 helper: start a target-scoped session (window 7 of
+    /// `com.example.Target`, logical bounds (100,50,300,200)) and observe a
+    /// WINDOW-CROP frame. `fake.resolve_result` is wired so the runtime's
+    /// pre-observe refresh resolves the very window the session is bound to.
+    async fn start_target_observed(
+        rt: &Arc<Runtime>,
+        fake: &Arc<FakeDriver>,
+    ) -> (String, cu_core::SecretToken, String) {
+        let s = rt
+            .session_start(None, test_client(), None, None, None)
+            .await
+            .unwrap();
+        let token = s
+            .control_token
+            .clone()
+            .expect("session start must issue the control token");
+        {
+            let sessions = rt.sessions.lock().unwrap();
+            let session = sessions.get(&s.session_id).unwrap();
+            session.set_target(Some(cu_core::SessionTarget {
+                bundle_id: Some("com.example.Target".into()),
+                pid: Some(42),
+                window_id: Some(7),
+            }));
+        }
+        *fake.resolve_result.lock().unwrap() = Some(cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 42,
+            window_id: 7,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 100.0,
+                y: 50.0,
+                width: 300.0,
+                height: 200.0,
+            }),
+        });
+        let obs = rt
+            .observe(
+                ObserveParams {
+                    session_id: Some(s.session_id.clone()),
+                    include_image: Some(false),
+                    control_token: Some(token.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        (s.session_id, token, obs.frame_id)
+    }
+
+    /// Round 8 / P0-2 helper: a harmless single-action act against a frame
+    /// (Wait — no coordinates, no focus guard), so only the stale check /
+    /// target refresh gates decide the outcome.
+    fn target_wait_params(sid: &str, frame: &str, token: &cu_core::SecretToken) -> ActParams {
+        ActParams {
+            session_id: sid.into(),
+            frame_id: frame.into(),
+            actions: vec![ComputerAction::Wait { duration_ms: 1 }],
+            wait_policy: None,
+            fixed_wait_ms: None,
+            return_screenshot: None,
+            risk_level: None,
+            requires_confirmation: None,
+            policy_context: None,
+            control_token: Some(token.clone()),
+        }
+    }
+
     #[tokio::test]
     async fn owner_with_token_can_operate() {
         let (rt, fake) = runtime_with_driver().await;
@@ -4084,6 +4276,170 @@ mod tests {
             "a moved window must be observed at its NEW position"
         );
         assert_eq!(obs2.width, 4, "the crop still matches the 2x2 window");
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// Round 8 / P0-2 — section 十四/十五: for a target-scoped session the
+    /// stale fingerprint comes from the TARGET WINDOW CROP (never the full
+    /// desktop), pinned to the target's OWN bundle. Changes in OTHER apps —
+    /// the full-desktop thumbnail AND the live frontmost app — must NOT stale
+    /// the referenced frame, and the act goes through. This is the regression
+    /// test for "other-app visual changes must not trigger stale" (十二) and
+    /// "active-app change must not auto-stale a target frame" (十三).
+    #[tokio::test]
+    async fn target_scoped_other_app_changes_never_stale_the_frame() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_target_observed(&rt, &fake).await;
+
+        // The observe fingerprint was the CROP (region x=200,y=100 for the
+        // window at logical (100,50) on the fake 2x display), never the full
+        // desktop. The derived crop thumbnail is [(200+100) as u8; 64] = [44].
+        assert!(
+            fake.last_region.lock().unwrap().is_some(),
+            "a target-scoped observe must snapshot the window crop, not the desktop"
+        );
+
+        // "Another app changed the desktop": the full-desktop thumbnail flips
+        // to all-white AND the live frontmost app becomes a different app.
+        *fake.snapshot_desktop.lock().unwrap() = Some(vec![255u8; 64]);
+        *fake.active_bundle.lock().unwrap() = Some("com.other.App".into());
+        // Prove the change is real: comparing the crop thumbnail to the
+        // desktop thumbnail scores well above the 0.12 stale threshold — a
+        // full-desktop fingerprint WOULD have flagged this.
+        let crop = cu_core::ScreenSnapshot {
+            thumbnail: vec![44u8; 64],
+            thumb_width: 8,
+            thumb_height: 8,
+            active_application: None,
+            active_window_title: None,
+            display_id: "1".into(),
+            captured_at: chrono::Utc::now(),
+        };
+        let desktop = cu_core::ScreenSnapshot {
+            thumbnail: vec![255u8; 64],
+            thumb_width: 8,
+            thumb_height: 8,
+            active_application: None,
+            active_window_title: None,
+            display_id: "1".into(),
+            captured_at: chrono::Utc::now(),
+        };
+        assert!(
+            crop.change_score(&desktop).unwrap() > 0.12,
+            "the desktop change would trip a full-desktop stale check"
+        );
+
+        let res = rt
+            .act(target_wait_params(&sid, &frame, &token), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            res.action_results[0].status, "success",
+            "other-app desktop changes must not stale a target frame"
+        );
+        assert!(
+            fake.last_region.lock().unwrap().is_some(),
+            "the act fingerprint must sample the window crop again — the full \
+             desktop was never sampled, which is why the change is invisible"
+        );
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// Round 8 / P0-2 — section 十五: a change INSIDE the target window (the
+    /// crop thumbnail differs from the referenced frame) IS stale. The target
+    /// frame only ever reflects the window's own content.
+    #[tokio::test]
+    async fn target_scoped_target_visual_change_is_stale() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_target_observed(&rt, &fake).await;
+
+        // The referenced crop is [44;64]; the target's content now changed.
+        *fake.snapshot_region.lock().unwrap() = Some(vec![255u8; 64]);
+
+        let err = rt
+            .act(target_wait_params(&sid, &frame, &token), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            ErrorCode::StaleFrame,
+            "a target-content change must stale the target frame"
+        );
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// Round 8 / P0-2 — section 二十: when the target window closes (the
+    /// resolver returns None), an act on a target-scoped session fails closed
+    /// with TARGET_UNAVAILABLE — never stale bounds, never a re-scope.
+    #[tokio::test]
+    async fn target_closed_is_target_unavailable_on_act() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_target_observed(&rt, &fake).await;
+
+        *fake.resolve_result.lock().unwrap() = None;
+
+        let err = rt
+            .act(target_wait_params(&sid, &frame, &token), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::TargetUnavailable);
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// Round 8 / P0-2 — section 二十: when the target window MOVES (its bounds
+    /// change), the act refreshes the LIVE geometry and the crop thumbnail now
+    /// differs from the referenced frame → STALE_FRAME. Old geometry is never
+    /// used: the frame is rejected, never silently acted on.
+    #[tokio::test]
+    async fn target_moved_fires_stale_frame_on_act() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_target_observed(&rt, &fake).await;
+
+        // Move the window: (100,50) → (140,50). The refreshed crop region
+        // becomes (280,100), deriving a different thumbnail than the
+        // referenced (200,100) crop — i.e. the moved window no longer matches
+        // what the frame captured.
+        *fake.resolve_result.lock().unwrap() = Some(cu_driver::ResolvedSessionTarget {
+            bundle_id: "com.example.Target".into(),
+            pid: 42,
+            window_id: 7,
+            bounds: Some(cu_core::DisplayBounds {
+                x: 140.0,
+                y: 50.0,
+                width: 300.0,
+                height: 200.0,
+            }),
+        });
+
+        let err = rt
+            .act(target_wait_params(&sid, &frame, &token), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            ErrorCode::StaleFrame,
+            "a moved target must stale the frame, never act on old geometry"
+        );
+        rt.session_stop(&sid, Some(&token)).await.unwrap();
+    }
+
+    /// Round 8 / P0-2 — section 十四: a NON-target session keeps the
+    /// full-desktop fingerprint (no region), so its stale checks still see the
+    /// whole desktop. Only target sessions switch to the window crop.
+    #[tokio::test]
+    async fn non_target_session_keeps_full_desktop_fingerprint() {
+        let (rt, fake) = runtime_with_driver().await;
+        let (sid, token, frame) = start_observed(&rt).await;
+
+        // Observe and act on a non-target session: no crop region ever reaches
+        // `quick_snapshot_region`.
+        rt.act(target_wait_params(&sid, &frame, &token), None)
+            .await
+            .unwrap();
+        assert!(
+            fake.last_region.lock().unwrap().is_none(),
+            "a non-target session must keep the full-desktop fingerprint"
+        );
         rt.session_stop(&sid, Some(&token)).await.unwrap();
     }
 
