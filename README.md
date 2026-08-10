@@ -103,7 +103,9 @@ in order:
 
 Real-machine acceptance (sections A–D + double-click) and honest
 NOT VERIFIED statuses are recorded in
-[docs/acceptance-manual.md](docs/acceptance-manual.md).
+[docs/acceptance-manual.md](docs/acceptance-manual.md) (Round 7 results)
+and the round's closing report in
+[docs/round7-acceptance-report.md](docs/round7-acceptance-report.md).
 
 ## The four tools (any agent)
 

@@ -215,6 +215,128 @@ failure). What *was* verified live against the real daemon this round:
 - `cu daemon stop` with a stale admin credential is refused (the CLI proves
   `daemon_instance_id` before shutting anything down).
 
+## Round 7 (2026-08-10) — Pointer Isolation closing phase, real-hardware acceptance
+
+Real macOS GUI session (WindowServer live; Screen Recording + Accessibility
+granted — `cu doctor` all checks pass), display 1512×982 @ scale 1.0, release
+`cu` + the P0-1-fixed `cubridge`, daemon running with the Event Tap genuinely
+`active` (log: `state="starting"` → `event tap active on dedicated thread`).
+
+> **Environment caveat recorded honestly:** the machine was in **continuous
+> active human use** for the entire run (real mouse input every <1 s; the
+> frontmost app kept changing under us, e.g. Chrome → 飞书, and Spaces kept
+> switching). Human Always Wins therefore fired constantly and *any* outcome
+> that needs the target app to stay frontmost for an interval was blocked by
+> the environment, not by the code. Each item below states exactly what was
+> and was not verified, with the exact commands.
+
+### Test A — window screenshot isolation: PASS
+
+Window-scoped observe returns exactly the target window's rect and only its
+content.
+
+| Check | Procedure | Result |
+|---|---|---|
+| Basic isolation | `cu session start --bundle-id com.apple.TextEdit --pointer-policy physical_allowed` → `cu observe` on a 656×422 window at (100,100) | capture **656×422** (== window bounds, px==pt at scale 1.0), `active_window: iso_test_doc.txt`; content matches the corresponding crop of an independent `screencapture` reference at **99.5%** (0.5% = JPEG text-edge noise) → no cross-app content |
+| Window > max_width | resize window to 1512×300 (> default `max_width` 1440) → `cu observe` | capture **1440×285** — exact `max_width` downscale; height floor-rounded, within the P0-2 ±1 px tolerance |
+| Moved window | move window to (500,200), same size → `cu observe` | still **656×422**; capture matches the **new** location's full-screen crop at **99.3%** vs **86.6%** at the old location → crop follows P0-3 refreshed bounds, never stale |
+| Fail-closed | close the target window / window identity changes (reopened with a new CGWindowNumber) → `cu observe` / `cu double-click` | refused with **`TARGET_UNAVAILABLE`** — never a stale-bounds capture (observed live, repeatedly) |
+
+### Test B — human conflict (≥20 trials): NOT VERIFIED
+
+The ≥20-trial protocol needs a **cooperating human operator** producing
+controlled conflict events; none was available, so the trials were not run.
+
+Incidental real-hardware confirmations of the mechanism were observed:
+a genuine human event flipped the session to `user_takeover` and `cu observe`
+was refused with `USER_TAKEOVER`; after `release`, the session re-flipped to
+`user_takeover` within ~300 ms of the next human event; an in-flight
+`cu double-click` was cancelled at event time by the human-interrupt hook
+(action `status: "cancelled"`).
+
+Manual acceptance step: with a human physically at the machine and the session
+targeted at a known app, repeat 20× — the operator moves the real mouse / types
+while the agent acts; assert each time the session flips to `user_takeover`,
+further acts are refused with `USER_TAKEOVER`, and no synthetic click happens
+after the last human event. Record the P0-4 KPIs
+(`event_detection_latency_ms`, `human_to_takeover_ms`, `human_to_input_stop_ms`)
+from the trace.
+
+### Test C — Browser board ≥50 clicks: NOT VERIFIED
+
+Requires the board page open and frontmost for ≥50 uninterrupted isolated
+clicks; the operator continuously switched the frontmost app / Space and the
+session kept re-flipping to `user_takeover`, so ≥50 consecutive accepted clicks
+were not possible in this session.
+
+Commands for manual acceptance:
+
+```bash
+node benchmarks/target-boards/browser/server.mjs 8765 &          # serves index.html + /api/record|stats|reset
+open -a "Google Chrome" "http://127.0.0.1:8765"                  # board on the visible space
+cu session start --bundle-id com.google.Chrome --pointer-policy isolated_only
+# then a script drives ≥50 cu click <x> <y> at the board's targets (from /api/record),
+# and /api/stats reports hit rate + p50 center_error_px
+```
+
+### Test D — Native board ≥30 clicks: NOT VERIFIABLE as specified
+
+No `benchmarks/target-boards/native/` board exists in the repo (only
+`browser/`). There is nothing to run the ≥30 native clicks against. Would-be
+command: same as C with a native board dir serving targets and recording hits.
+
+### DoubleClick real test: PARTIAL — success-outcome NOT VERIFIED
+
+**Verified on hardware:** `cu double-click` executes through the isolated
+Direct-CG path. 8 successful double-click actions were traced on the live
+machine, every one `backend: "direct_cg_event"`, `isolated: true`,
+`physical_cursor_delta_px: 0.0`, `physical_cursor_moved: false`. The driver's
+`double_click_direct` posts down/up with `click_state 1` then down/up with
+`click_state 2`, so the OS receives a **real double-click** (never two single
+clicks) and the real system cursor is never moved.
+
+**NOT VERIFIED:** the word-selection *outcome* (double-click a word in TextEdit
+→ the word becomes selected). The operator's continuous activity kept the
+frontmost app away from TextEdit (clicks landed on the frontmost app — Chrome /
+飞书), and when TextEdit was frontmost the window kept leaving the visible
+Space. The physical-fallback double-click path
+(`AX_UNSUPPORTED_FOR_DOUBLE_CLICK` → `physical_double_click_at` under
+`physical_allowed`) was not exercised on hardware either, because the isolated
+path succeeded; it is covered by the cu-runtime unit tests (102 tests).
+
+Manual acceptance step: quiet the machine, then:
+
+```bash
+open -a TextEdit /tmp/wordsel.txt
+osascript -e 'tell application "TextEdit" to activate'
+# find a word's center via AX (kAXBoundsForRangeParameterizedAttribute), e.g. (533, 238)
+cu session start --bundle-id com.apple.TextEdit --pointer-policy physical_allowed
+cu double-click 533 238
+# assert AXSelectedText == the word under the point
+```
+
+### Pointer Isolation (Validation Focus #1): PASS
+
+On the live machine every traced action (`move`, `click`, `double-click`)
+recorded `isolated: true`, `physical_cursor_delta_px: 0.0`,
+`physical_cursor_moved: false`. A `cu move 600 300` left the real system cursor
+bit-identical before and after (880,306 → 880,306). The ghost cursor is never
+the real cursor; the physical fallback (which does warp) is the only path that
+touches the real cursor and it is gated by `physical_allowed` + the human
+interrupt checks.
+
+### P1 Event Tap state: PASS
+
+On real hardware the daemon log shows `state="starting"` then
+`event tap active on dedicated thread`; `human_input_monitor_state()` reports
+`active`. The Starting ≠ Active distinction is real and observable.
+
+### P0-4 interrupt telemetry: PARTIAL
+
+The KPI suffix is emitted on the human-grab-during-fallback failure path
+(unit-tested). On this run the isolated path never fell back, so the suffix
+path was not hit on hardware; no KPI numbers are claimed from this session.
+
 ## Failure record (round 2)
 
 | Date | Step # | Observed | Root cause / fix |
