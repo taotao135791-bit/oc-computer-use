@@ -286,6 +286,7 @@ ScreenCaptureKit bridge), with the daemon-level trace verification that
 
 ## Documentation
 
+- [README.zh-CN.md](README.zh-CN.md) — 中文说明（Chinese README）
 - [docs/architecture.md](docs/architecture.md) — components, threads, data flow
 - [docs/protocol.md](docs/protocol.md) — JSON-RPC surface, methods, error codes, session behavior (auto-create, ownership, cancel, shutdown)
 - [docs/permissions.md](docs/permissions.md) — Screen Recording / Accessibility setup & troubleshooting
