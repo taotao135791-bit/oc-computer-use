@@ -9,6 +9,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::ffi::*;
 
@@ -100,6 +101,15 @@ pub const EVENT_MASK_HUMAN: u64 = (1 << EVENT_LEFT_MOUSE_DOWN)
     | (1 << EVENT_OTHER_MOUSE_DOWN)
     | (1 << EVENT_OTHER_MOUSE_UP);
 
+/// How long the tap thread may sit in `Starting` before the monitor reports
+/// `Failed`. A healthy tap reaches `Active` in well under a second; the grace
+/// is generous so a slow-but-working setup is never falsely marked failed. If
+/// the thread is still `Starting` after this, `CGEventTapCreate` has almost
+/// certainly BLOCKED (it does this on some macOS versions in a non-GUI launch
+/// context instead of returning NULL) — the daemon must not hang in "starting"
+/// forever, silently degrading to the pointer-delta heuristic.
+pub const TAP_START_GRACE: Duration = Duration::from_secs(3);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventTapState {
     Starting,
@@ -134,6 +144,9 @@ impl EventTapState {
 pub struct EventTapMonitor {
     stop: Arc<AtomicBool>,
     state: Arc<Mutex<EventTapState>>,
+    /// Monotonic instant `start()` was called. The watchdog in [`EventTapMonitor::state`]
+    /// uses it to resolve a hung `Starting` into `Failed` (see [`TAP_START_GRACE`]).
+    started_at: Mutex<Option<Instant>>,
     /// CFRunLoop pointer as usize so the handle is Send/Sync.
     runloop: Arc<AtomicUsize>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -153,6 +166,7 @@ impl EventTapMonitor {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(EventTapState::Stopped)),
+            started_at: Mutex::new(None),
             runloop: Arc::new(AtomicUsize::new(0)),
             thread: Mutex::new(None),
         }
@@ -167,6 +181,7 @@ impl EventTapMonitor {
             return;
         }
         *self.state.lock().unwrap() = EventTapState::Starting;
+        *self.started_at.lock().unwrap() = Some(Instant::now());
         self.stop.store(false, Ordering::SeqCst);
         let stop = self.stop.clone();
         let state = self.state.clone();
@@ -184,7 +199,27 @@ impl EventTapMonitor {
     }
 
     pub fn state(&self) -> EventTapState {
-        *self.state.lock().unwrap()
+        let st = *self.state.lock().unwrap();
+        // Watchdog: a tap thread stuck in `Starting` past the grace period has
+        // almost certainly BLOCKED in `CGEventTapCreate` (non-GUI launch
+        // context). Resolve it to `Failed` here so the daemon reports
+        // "unavailable" and degrades to the pointer-delta heuristic explicitly,
+        // instead of hanging in "starting" forever. If the thread later reaches
+        // `Active` (it was merely slow), it overwrites `Failed` back to `Active`
+        // on the next poll — a late-but-working tap is always preferred.
+        if st == EventTapState::Starting {
+            if let Some(t0) = *self.started_at.lock().unwrap() {
+                if t0.elapsed() >= TAP_START_GRACE {
+                    tracing::warn!(
+                        "event tap did not become active within {}s; reporting unavailable",
+                        TAP_START_GRACE.as_secs()
+                    );
+                    *self.state.lock().unwrap() = EventTapState::Failed;
+                    return EventTapState::Failed;
+                }
+            }
+        }
+        st
     }
 
     pub fn shutdown(&self) {
@@ -202,6 +237,7 @@ impl EventTapMonitor {
         }
         let _ = slot.take().map(JoinHandle::join);
         *self.state.lock().unwrap() = EventTapState::Stopped;
+        *self.started_at.lock().unwrap() = None;
     }
 }
 
@@ -370,6 +406,42 @@ mod tests {
     fn tap_not_started_is_stopped() {
         let m = EventTapMonitor::new();
         assert_eq!(m.state(), EventTapState::Stopped);
+    }
+
+    #[test]
+    fn watchdog_resolves_hung_starting_to_failed() {
+        // A tap thread stuck in `Starting` past the grace period (CGEventTapCreate
+        // blocked in a non-GUI launch context) must resolve to `Failed`
+        // ("unavailable"), never hang in "starting" forever. We drive the private
+        // fields directly — spawning the real thread would try to create an
+        // event tap and block in CI.
+        let m = EventTapMonitor::new();
+        *m.state.lock().unwrap() = EventTapState::Starting;
+        *m.started_at.lock().unwrap() = Some(Instant::now() - TAP_START_GRACE);
+        assert_eq!(m.state(), EventTapState::Failed);
+        // The resolution is sticky on subsequent reads.
+        assert_eq!(m.state(), EventTapState::Failed);
+    }
+
+    #[test]
+    fn watchdog_keeps_starting_within_grace() {
+        // A tap that just started (within the grace period) is still `Starting`
+        // — it must not be prematurely marked failed.
+        let m = EventTapMonitor::new();
+        *m.state.lock().unwrap() = EventTapState::Starting;
+        *m.started_at.lock().unwrap() = Some(Instant::now());
+        assert_eq!(m.state(), EventTapState::Starting);
+    }
+
+    #[test]
+    fn watchdog_does_not_overwrite_late_active() {
+        // A tap that reaches `Active` after the grace is still reported active
+        // (a late-but-working tap is preferred over the failed resolution). The
+        // watchdog only resolves `Starting`, never downgrades `Active`.
+        let m = EventTapMonitor::new();
+        *m.state.lock().unwrap() = EventTapState::Active;
+        *m.started_at.lock().unwrap() = Some(Instant::now() - TAP_START_GRACE);
+        assert_eq!(m.state(), EventTapState::Active);
     }
 
     #[test]

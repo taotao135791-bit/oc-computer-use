@@ -762,7 +762,16 @@ async fn run_daemon(args: DaemonArgs) -> Result<(), ClientError> {
             let subscriber = tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "cu_daemon=info,cu_runtime=warn".into()),
+                        // The driver's Event Tap health ("event tap active" /
+                        // "event tap create failed" / the startup watchdog) is
+                        // logged from `cu_driver_macos` — omit it and the daemon
+                        // log shows only "human-input monitor starting" forever,
+                        // silently hiding whether hardware human-input detection
+                        // is actually live. Include it at info so the operational
+                        // state is visible.
+                        .unwrap_or_else(|_| {
+                            "cu_daemon=info,cu_runtime=warn,cu_driver_macos=info".into()
+                        }),
                 )
                 .with_writer(std::io::stderr)
                 .finish();
