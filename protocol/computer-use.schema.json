@@ -14,7 +14,6 @@
           "type": "string"
         },
         "fixed_wait_ms": {
-          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -92,7 +91,6 @@
       "description": "Result of one action inside a batch.",
       "properties": {
         "duration_ms": {
-          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -100,7 +98,6 @@
           "type": "string"
         },
         "index": {
-          "format": "uint",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -126,21 +123,17 @@
           "type": "string"
         },
         "image_height": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "image_width": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "x": {
-          "format": "double",
           "type": "number"
         },
         "y": {
-          "format": "double",
           "type": "number"
         }
       },
@@ -265,11 +258,9 @@
               "type": "string"
             },
             "x": {
-              "format": "double",
               "type": "number"
             },
             "y": {
-              "format": "double",
               "type": "number"
             }
           },
@@ -297,11 +288,9 @@
               "type": "string"
             },
             "x": {
-              "format": "double",
               "type": "number"
             },
             "y": {
-              "format": "double",
               "type": "number"
             }
           },
@@ -320,7 +309,6 @@
               "$ref": "#/$defs/CoordinateSpace"
             },
             "duration_ms": {
-              "format": "uint64",
               "minimum": 0.0,
               "type": [
                 "integer",
@@ -334,11 +322,9 @@
               "type": "string"
             },
             "x": {
-              "format": "double",
               "type": "number"
             },
             "y": {
-              "format": "double",
               "type": "number"
             }
           },
@@ -400,12 +386,10 @@
             },
             "delta_x": {
               "default": 0.0,
-              "format": "double",
               "type": "number"
             },
             "delta_y": {
               "default": 0.0,
-              "format": "double",
               "type": "number"
             },
             "type": {
@@ -415,14 +399,12 @@
               "type": "string"
             },
             "x": {
-              "format": "double",
               "type": [
                 "number",
                 "null"
               ]
             },
             "y": {
-              "format": "double",
               "type": [
                 "number",
                 "null"
@@ -441,7 +423,6 @@
               "$ref": "#/$defs/CoordinateSpace"
             },
             "duration_ms": {
-              "format": "uint64",
               "minimum": 0.0,
               "type": [
                 "integer",
@@ -472,7 +453,6 @@
         {
           "properties": {
             "duration_ms": {
-              "format": "uint64",
               "minimum": 0.0,
               "type": "integer"
             },
@@ -537,19 +517,15 @@
       "description": "Logical bounds of a display in global desktop coordinates.\n\nOn macOS the origin can be negative (a secondary display to the left/above the primary one). Width/height are logical points; the backing store is `width * scale_factor` pixels.",
       "properties": {
         "height": {
-          "format": "double",
           "type": "number"
         },
         "width": {
-          "format": "double",
           "type": "number"
         },
         "x": {
-          "format": "double",
           "type": "number"
         },
         "y": {
-          "format": "double",
           "type": "number"
         }
       },
@@ -774,11 +750,9 @@
           "minItems": 2,
           "prefixItems": [
             {
-              "format": "double",
               "type": "number"
             },
             {
-              "format": "double",
               "type": "number"
             }
           ],
@@ -791,11 +765,9 @@
           "minItems": 2,
           "prefixItems": [
             {
-              "format": "double",
               "type": "number"
             },
             {
-              "format": "double",
               "type": "number"
             }
           ],
@@ -831,7 +803,6 @@
               "$ref": "#/$defs/Region"
             },
             "scale": {
-              "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
@@ -859,7 +830,6 @@
               "$ref": "#/$defs/Region"
             },
             "scale": {
-              "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
@@ -888,7 +858,6 @@
           "$ref": "#/$defs/Region"
         },
         "scale": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -910,7 +879,6 @@
           "type": "string"
         },
         "height": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -927,7 +895,6 @@
           "type": "string"
         },
         "width": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         }
@@ -974,12 +941,10 @@
               "type": "boolean"
             },
             "jpeg_quality": {
-              "format": "uint8",
               "minimum": 0.0,
               "type": "integer"
             },
             "max_width": {
-              "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
@@ -1018,12 +983,10 @@
               "type": "boolean"
             },
             "jpeg_quality": {
-              "format": "uint8",
               "minimum": 0.0,
               "type": "integer"
             },
             "max_width": {
-              "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
@@ -1063,12 +1026,10 @@
           "type": "boolean"
         },
         "jpeg_quality": {
-          "format": "uint8",
           "minimum": 0.0,
           "type": "integer"
         },
         "max_width": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -1109,7 +1070,6 @@
           "type": "string"
         },
         "height": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -1125,7 +1085,6 @@
           "type": "string"
         },
         "scale_factor": {
-          "format": "double",
           "type": "number"
         },
         "session_id": {
@@ -1136,13 +1095,11 @@
           "description": "P0-6: when the session is scoped to a target window, the image is a CROP of that window and this is its global logical bounds (the caller maps window coords → screen via this). `None` = full-display observe."
         },
         "width": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "window_id": {
           "description": "P0-6: the observed window's id, when the session is window-scoped.",
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         }
@@ -1192,11 +1149,9 @@
       "description": "A 2D point in some coordinate space.",
       "properties": {
         "x": {
-          "format": "double",
           "type": "number"
         },
         "y": {
-          "format": "double",
           "type": "number"
         }
       },
@@ -1215,7 +1170,6 @@
         },
         "event_detection_latency_ms": {
           "description": "P0-4: human-interrupt telemetry, present when a real human input occurred during or near this action. `human_to_input_stop_ms` is THE Human Interrupt KPI — hardware event → LAST runtime synthetic input; 0 when the agent had already stopped. `event_detection_latency_ms` is hardware event → Event Tap callback; `human_to_takeover_ms` is hardware event → takeover applied. The inverse `synthetic → human` direction is intentionally NOT exposed here (it must never be labelled as interrupt latency).",
-          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -1224,12 +1178,10 @@
           "type": "boolean"
         },
         "human_to_input_stop_ms": {
-          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
         "human_to_takeover_ms": {
-          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -1239,7 +1191,6 @@
         },
         "physical_cursor_delta_px": {
           "description": "Distance the system cursor moved (logical px); 0 for isolated actions.",
-          "format": "double",
           "type": "number"
         },
         "physical_cursor_moved": {
@@ -1289,7 +1240,6 @@
       "description": "Redacted description of a `type` action used in traces and logs by default.",
       "properties": {
         "character_count": {
-          "format": "uint",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -1310,19 +1260,15 @@
           "$ref": "#/$defs/CoordinateSpace"
         },
         "height": {
-          "format": "double",
           "type": "number"
         },
         "width": {
-          "format": "double",
           "type": "number"
         },
         "x": {
-          "format": "double",
           "type": "number"
         },
         "y": {
-          "format": "double",
           "type": "number"
         }
       },
@@ -1338,7 +1284,6 @@
     "RpcError": {
       "properties": {
         "code": {
-          "format": "int64",
           "type": "integer"
         },
         "data": true,
@@ -1395,13 +1340,11 @@
           "type": "string"
         },
         "maximum_client_protocol_version": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "minimum_client_protocol_version": {
           "description": "Inclusive lower bound of the client protocol versions this daemon accepts. A client below this (or above `maximum_client_protocol_version`) gets `PROTOCOL_VERSION_MISMATCH`.",
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -1409,7 +1352,6 @@
           "type": "string"
         },
         "protocol_version": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -1792,11 +1734,9 @@
           "type": "string"
         },
         "pid": {
-          "format": "int64",
           "type": "integer"
         },
         "window_id": {
-          "format": "int64",
           "type": "integer"
         }
       },
@@ -1819,11 +1759,9 @@
       "description": "Outcome of the post-batch stabilization wait (`WaitPolicy::UntilStable`). `change_score` is the **last measured** thumbnail difference — on timeout it carries the real score (never a fabricated 0), so the caller can tell a screen that nearly settled from one that kept animating.",
       "properties": {
         "change_score": {
-          "format": "double",
           "type": "number"
         },
         "elapsed_ms": {
-          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -1831,7 +1769,6 @@
           "type": "string"
         },
         "samples": {
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         }
@@ -1847,7 +1784,6 @@
       "description": "Detail attached to a [`CuError::StaleFrame`].",
       "properties": {
         "change_score": {
-          "format": "double",
           "type": "number"
         },
         "current_frame_id": {
@@ -1904,7 +1840,6 @@
         },
         "limit": {
           "description": "Maximum entries to return (newest first). Absent = all.",
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         }
@@ -1922,14 +1857,12 @@
           "type": "string"
         },
         "change_score": {
-          "format": "double",
           "type": "number"
         },
         "display_id": {
           "type": "string"
         },
         "duration_ms": {
-          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -1951,7 +1884,6 @@
           "type": "string"
         },
         "seq": {
-          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -2052,7 +1984,6 @@
           "type": "string"
         },
         "size_bytes": {
-          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -2134,7 +2065,6 @@
             },
             "limit": {
               "description": "Maximum entries to return (newest first). Absent = all.",
-              "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
@@ -2156,7 +2086,6 @@
             },
             "limit": {
               "description": "Maximum entries to return (newest first). Absent = all.",
-              "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
@@ -2179,7 +2108,6 @@
         },
         "limit": {
           "description": "Maximum entries to return (newest first). Absent = all.",
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -2307,7 +2235,6 @@
             },
             "limit": {
               "description": "Maximum entries to return (newest first). Absent = all.",
-              "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
@@ -2329,7 +2256,6 @@
             },
             "limit": {
               "description": "Maximum entries to return (newest first). Absent = all.",
-              "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
@@ -2352,7 +2278,6 @@
         },
         "limit": {
           "description": "Maximum entries to return (newest first). Absent = all.",
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -2376,7 +2301,6 @@
           "type": "string"
         },
         "event_count": {
-          "format": "uint",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -2384,7 +2308,6 @@
           "type": "string"
         },
         "size_bytes": {
-          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },

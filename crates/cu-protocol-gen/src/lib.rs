@@ -305,6 +305,40 @@ fn fixup_def(def_name: &str, v: &mut Value) {
     assert_capability_requirements(def_name, map);
 }
 
+/// schemars annotates every numeric field with a non-standard `format` string
+/// (`uint`, `uint8`, `uint32`, `uint64`, `int64`, `double`, …). JSON Schema's
+/// `format` is an *annotation*, not a constraint, and these particular values
+/// are not in any validator's registry — so downstream tooling (ajv, IDEs,
+/// codegen) prints "unknown format … ignored" and gains nothing. The
+/// constraint already lives in `type` + `minimum: 0` (schemars emits
+/// `minimum: 0` for unsigned integers), so the numeric `format` is pure noise.
+/// Strip it to keep the committed schema standard-compliant; keep meaningful
+/// string formats (`date-time`, `uri`, …) untouched.
+fn strip_redundant_numeric_formats(v: &mut Value) {
+    const NUMERIC_FORMATS: &[&str] = &[
+        "uint", "uint8", "uint16", "uint32", "uint64", "int8", "int16", "int32", "int64", "float",
+        "double", "byte",
+    ];
+    match v {
+        Value::Object(map) => {
+            if let Some(Value::String(f)) = map.get("format") {
+                if NUMERIC_FORMATS.contains(&f.as_str()) {
+                    map.remove("format");
+                }
+            }
+            for val in map.values_mut() {
+                strip_redundant_numeric_formats(val);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                strip_redundant_numeric_formats(val);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// schemars 0.8 emits draft-07 tuple form (`items: [s1, s2]`) even under
 /// 2019-09 settings; 2019-09 requires `prefixItems` + `items: false` for a
 /// fixed-length tuple. Rewrite those nodes so the emitted document is valid
@@ -434,5 +468,9 @@ pub fn build_protocol_schema() -> Value {
         fixup_def(name, def);
         fixup_tuple_items(def);
     }
+    // Standard-compliant schema: drop the numeric `format` annotations schemars
+    // emits (`uint64`, `double`, …) — `type` + `minimum` already carry the
+    // constraint and no validator knows those format strings.
+    strip_redundant_numeric_formats(&mut root);
     root
 }
