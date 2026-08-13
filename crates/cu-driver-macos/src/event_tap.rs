@@ -214,6 +214,22 @@ fn run_tap_thread<F>(
     F: Fn(u64) + Send + Sync + 'static,
 {
     unsafe {
+        // Preflight: a HID event tap requires Accessibility trust. On some
+        // macOS versions `CGEventTapCreate` BLOCKS (rather than returning NULL)
+        // when the calling process is not trusted, which would leave the daemon
+        // stuck in `starting` forever with no surfaced error — the runtime then
+        // silently runs on the pointer-delta heuristic while reporting the tap
+        // as merely "starting". Fail fast instead: report `Failed` (surfaced as
+        // "unavailable") so the degraded state is explicit in `daemon.log` and
+        // `health`, never a half-reported pending.
+        if !crate::ffi::is_process_trusted_for_accessibility() {
+            tracing::error!(
+                "event tap unavailable: Accessibility permission not granted to this binary \
+                 (AXIsProcessTrusted = false); human-input monitor degraded to pointer-delta heuristic"
+            );
+            *state.lock().unwrap() = EventTapState::Failed;
+            return;
+        }
         let tap = CGEventTapCreate(
             TAP_HID,
             KCG_EVENT_TAP_HEAD_INSERT_EVENT,
